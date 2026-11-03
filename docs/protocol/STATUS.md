@@ -71,12 +71,21 @@
    the real client on `md.local` is blocked: Mission Control consumes the local
    three-finger swipe before `Screen Sharing.app` sees it, and the client then
    sends nothing.
-2. Add clipboard (standard `ClientCutText` + Apple `0x1f`/`0x15`), keepalive,
-   and mid-session rekey handling.
+2. Keepalive and mid-session rekey handling; clipboard duplex on one
+   connection (see `docs/protocol/clipboard.md` §4).
 3. Test `ss-gui --evdev` on a real Wayland host; add udev/permission docs and
    calibrate the evdev scroll/zoom feel constants.
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
+
+### Verified 2026-11-03 — text clipboard
+
+Remote→local and local→remote text sync both work, via `0x0b ClipboardFetch`
+(no AutoPasteboard) for reads and `0x06 ClientCutText` + `0x15
+AutoPasteboard(1)` for writes. Enabling AutoPasteboard puts the session into
+*promise* mode, so the two directions cannot currently share one connection;
+`ss-gui` defaults to read mode and offers `--send-clipboard` for write mode.
+Full framing in `docs/protocol/clipboard.md`.
 
 ### Verified 2026-11-03 — two-finger scroll
 

@@ -7,9 +7,9 @@
 use anyhow::Result;
 use gesture_input::{Gesture, Phase};
 use rfb_proto::{
-    framebuffer_update_request, gesture_begin_end, gesture_magnify,
-    gesture_mouse_scroll, gesture_rotate, gesture_scroll, gesture_smart_magnify, gesture_swipe,
-    key_event, pointer_event, AppleSession, Update,
+    client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
+    gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_scroll, gesture_smart_magnify,
+    gesture_swipe, key_event, pasteboard_text, pointer_event, AppleSession, Update,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -104,6 +104,43 @@ fn named_keysym(key: &NamedKey) -> Option<u32> {
         NamedKey::F12 => 0xffc9,
         _ => return None,
     })
+}
+
+/// Read the local text clipboard. Uses the platform clipboard tools so the
+/// crate stays dependency-free; returns `None` when unavailable.
+fn local_clipboard_text() -> Option<String> {
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, &[&str]) = ("pbpaste", &[]);
+    #[cfg(not(target_os = "macos"))]
+    let (cmd, args): (&str, &[&str]) = ("wl-paste", &["--no-newline"]);
+
+    let out = std::process::Command::new(cmd).args(args).output().ok()?;
+    let _ = std::io::stdout().flush();
+    if !out.status.success() {
+        return None;
+    }
+    Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Replace the local text clipboard.
+fn set_local_clipboard(text: &str) {
+    use std::io::Write;
+    #[cfg(target_os = "macos")]
+    let (cmd, args): (&str, &[&str]) = ("pbcopy", &[]);
+    #[cfg(not(target_os = "macos"))]
+    let (cmd, args): (&str, &[&str]) = ("wl-copy", &[]);
+
+    if let Ok(mut child) = std::process::Command::new(cmd)
+        .args(args)
+        .stdin(std::process::Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        let _ = child.wait();
+    }
 }
 
 fn write_png(path: &str, width: u16, height: u16, bgrx: &[u8]) -> Result<()> {
@@ -800,6 +837,10 @@ fn main() -> Result<()> {
     let mut exit_after_dump = false;
     let mut scale = 1.0f64;
     let mut debug_input = false;
+    let mut clipboard = true;
+    // Writing the clipboard needs AutoPasteboard, which puts the server into
+    // promise mode and stops it sending real remote clipboard data.
+    let mut clipboard_send = false;
     let mut ime = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -846,6 +887,14 @@ fn main() -> Result<()> {
                 debug_input = true;
                 i += 1;
             }
+            "--no-clipboard" => {
+                clipboard = false;
+                i += 1;
+            }
+            "--send-clipboard" => {
+                clipboard_send = true;
+                i += 1;
+            }
             "--ime" => {
                 ime = true;
                 i += 1;
@@ -875,6 +924,10 @@ fn main() -> Result<()> {
     if (scale - 1.0).abs() > 0.001 {
         eprintln!("warning: --scale {scale} is experimental; this server build may stop incremental updates");
         session.set_scale(scale)?;
+    }
+    if clipboard_send {
+        session.send_message(&rfb_proto::auto_pasteboard(1))?;
+        eprintln!("clipboard write mode: AutoPasteboard enabled (remote reads become promises)");
     }
     let (reader, writer) = session.split()?;
     let req_w = reader.info.width;
@@ -918,15 +971,72 @@ fn main() -> Result<()> {
         }
     });
 
+    // Text most recently applied from the remote, so we do not echo it back.
+    let clip_echo: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    if clipboard && clipboard_send {
+        let tx_clip = tx_out.clone();
+        let debug_clip = debug_input;
+        let clip_echo = clip_echo.clone();
+        thread::spawn(move || {
+            let mut last = String::new();
+            loop {
+                thread::sleep(Duration::from_millis(700));
+                let Some(text) = local_clipboard_text() else { continue };
+                if text.is_empty() || text == last {
+                    continue;
+                }
+                if clip_echo.lock().map(|e| e.as_deref() == Some(text.as_str())).unwrap_or(false) {
+                    // We just wrote this into the local clipboard; do not send
+                    // it straight back to the server.
+                    last = text;
+                    continue;
+                }
+                last = text.clone();
+                if debug_clip {
+                    eprintln!("clipboard -> {:?}", text);
+                }
+                if tx_clip.send(client_cut_text(text.as_bytes())).is_err() {
+                    break;
+                }
+            }
+        });
+    }
+
+    let clip_echo_reader = clip_echo.clone();
     let tx_reader = tx_out.clone();
     let reader_proxy = proxy.clone();
     let debug_reader = debug_input;
     thread::spawn(move || {
         let mut reader = reader;
         let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
+        let clip_wanted = clipboard && !clipboard_send;
+        if clip_wanted {
+            let _ = tx_reader.send(clipboard_fetch());
+        }
         loop {
             match reader.read_update() {
                 Ok(update) => {
+                    if clip_wanted {
+                        if update.clipboard_changed {
+                            let _ = tx_reader.send(clipboard_fetch());
+                        }
+                        for send in &update.clipboard {
+                            match send.archive().and_then(|a| pasteboard_text(&a)) {
+                                Ok(Some(text)) => {
+                                    if debug_reader {
+                                        eprintln!("clipboard <- {:?}", text);
+                                    }
+                                    if let Ok(mut e) = clip_echo_reader.lock() {
+                                        *e = Some(text.clone());
+                                    }
+                                    set_local_clipboard(&text);
+                                }
+                                Ok(None) => {}
+                                Err(e) => eprintln!("clipboard decode: {e:#}"),
+                            }
+                        }
+                    }
                     if debug_reader {
                         let desc: Vec<_> = update
                             .rects

@@ -449,6 +449,8 @@ pub struct AppleSession {
     pub info: ServerInfo,
     pub send: RecordCipher,
     pub recv: RecordCipher,
+    /// Log non-framebuffer server messages (clipboard, display, control).
+    pub debug_control: bool,
     wrap: [u8; 16],
 }
 
@@ -552,6 +554,7 @@ impl AppleSession {
             info: ServerInfo { width, height, pixel_format, name },
             send: RecordCipher::new(&[0u8; 16], &[0u8; 16]),
             recv: RecordCipher::new(&[0u8; 16], &[0u8; 16]),
+            debug_control: false,
             wrap,
         })
     }
@@ -761,6 +764,107 @@ pub struct RectUpdate {
 #[derive(Debug, Clone)]
 pub struct Update {
     pub rects: Vec<RectUpdate>,
+    /// Raw 0x1f ClipboardSend payloads (compressed pasteboard archives).
+    pub clipboard: Vec<ClipboardSend>,
+    /// A 0x14 MiscStatus with cmd = 2 said the remote pasteboard changed; the
+    /// viewer should answer with a 0x0b ClipboardFetch.
+    pub clipboard_changed: bool,
+}
+
+/// Apple `0x1f` ClipboardSend: a zlib-compressed pasteboard archive.
+#[derive(Debug, Clone)]
+pub struct ClipboardSend {
+    /// The server only promises the data; the bytes are not materialised yet.
+    pub promise: bool,
+    pub uncompressed_size: u32,
+    pub compressed: Vec<u8>,
+}
+
+impl ClipboardSend {
+    pub fn archive(&self) -> Result<Vec<u8>> {
+        if self.uncompressed_size == 0 {
+            return Ok(Vec::new());
+        }
+        // Apple frames the payload with Z_SYNC_FLUSH, so the deflate stream has
+        // no final block and a strict reader reports "incomplete stream".
+        let mut out = vec![0u8; self.uncompressed_size as usize + 64];
+        let mut dec = flate2::Decompress::new(true);
+        dec.decompress(&self.compressed, &mut out, flate2::FlushDecompress::Sync)
+            .context("inflate clipboard archive")?;
+        out.truncate(dec.total_out() as usize);
+        if out.len() as u32 != self.uncompressed_size {
+            bail!(
+                "clipboard archive decoded {} bytes, header says {}",
+                out.len(),
+                self.uncompressed_size
+            );
+        }
+        Ok(out)
+    }
+}
+
+/// The text flavour of a decoded pasteboard archive, if any.
+pub fn pasteboard_text(archive: &[u8]) -> Result<Option<String>> {
+    if archive.is_empty() {
+        return Ok(None);
+    }
+    let mut p = 0usize;
+    let count = read_be32_at(archive, &mut p)?;
+    let mut utf8 = None;
+    let mut utf16 = None;
+    let mut latin1 = None;
+    for _ in 0..count {
+        let uti_len = read_be32_at(archive, &mut p)? as usize;
+        if p + uti_len > archive.len() {
+            bail!("pasteboard uti out of range");
+        }
+        let uti = String::from_utf8_lossy(&archive[p..p + uti_len]).to_string();
+        p += uti_len;
+        let _reserved = read_be32_at(archive, &mut p)?;
+        let aliases = read_be32_at(archive, &mut p)?;
+        for _ in 0..aliases {
+            let nlen = read_be32_at(archive, &mut p)? as usize;
+            if p + nlen > archive.len() {
+                bail!("pasteboard alias name out of range");
+            }
+            p += nlen;
+            let vlen = read_be32_at(archive, &mut p)? as usize;
+            if p + vlen > archive.len() {
+                bail!("pasteboard alias value out of range");
+            }
+            p += vlen;
+        }
+        let dlen = read_be32_at(archive, &mut p)? as usize;
+        if p + dlen > archive.len() {
+            bail!("pasteboard data out of range");
+        }
+        let data = &archive[p..p + dlen];
+        p += dlen;
+        match uti.as_str() {
+            "public.utf8-plain-text" => utf8 = Some(String::from_utf8_lossy(data).to_string()),
+            "public.utf16-plain-text" => {
+                let units: Vec<u16> = data
+                    .chunks_exact(2)
+                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                    .collect();
+                utf16 = Some(String::from_utf16_lossy(&units));
+            }
+            "com.apple.traditional-mac-plain-text" => {
+                latin1 = Some(data.iter().map(|&b| b as char).collect::<String>())
+            }
+            _ => {}
+        }
+    }
+    Ok(utf8.or(utf16).or(latin1))
+}
+
+fn read_be32_at(buf: &[u8], p: &mut usize) -> Result<u32> {
+    if *p + 4 > buf.len() {
+        bail!("pasteboard archive truncated at {p}");
+    }
+    let v = be32(&buf[*p..*p + 4]);
+    *p += 4;
+    Ok(v)
 }
 
 pub struct SessionReader {
@@ -770,6 +874,12 @@ pub struct SessionReader {
     /// RFB Zlib uses one continuous stream for the whole session: the first
     /// rectangle carries the zlib header, later rectangles are continuations.
     zlib: flate2::Decompress,
+    /// Log non-framebuffer server messages (clipboard, display, control).
+    pub debug_control: bool,
+    /// Clipboard payloads seen while skipping control messages.
+    pending_clipboard: Vec<ClipboardSend>,
+    /// Set when the server reports the remote pasteboard changed.
+    clipboard_changed: bool,
 }
 
 pub struct SessionWriter {
@@ -793,6 +903,9 @@ impl AppleSession {
                 recv: self.recv,
                 info: self.info.clone(),
                 zlib: flate2::Decompress::new(true),
+                debug_control: self.debug_control,
+                pending_clipboard: Vec::new(),
+                clipboard_changed: false,
             },
             SessionWriter {
                 stream: writer_stream,
@@ -849,18 +962,46 @@ impl SessionReader {
             t => bail!("unexpected server message type 0x{t:02x}"),
         };
         self.ensure(pending, total)?;
+        if self.debug_control {
+            let shown = total.min(96);
+            eprintln!(
+                "control type=0x{:02x} len={total} bytes={:02x?}",
+                pending[0],
+                &pending[..shown]
+            );
+        }
+        if pending[0] == 0x14 && total >= 8 && be16(&pending[6..8]) == 2 {
+            self.clipboard_changed = true;
+        }
+        if pending[0] == 0x1f {
+            let promise = pending[2] != 0;
+            let uncompressed_size = be32(&pending[8..12]);
+            let compressed = pending[16..total].to_vec();
+            self.pending_clipboard.push(ClipboardSend {
+                promise,
+                uncompressed_size,
+                compressed,
+            });
+        }
         pending.drain(..total);
         Ok(())
     }
-
-    /// Read one complete FramebufferUpdate (possibly spanning multiple
-    /// record-layer records) and return its rectangles.
+    /// Read one complete FramebufferUpdate (possibly spanning several
+    /// record-layer records). Control messages collected along the way are
+    /// returned in `Update::clipboard`.
     pub fn read_update(&mut self) -> Result<Update> {
         let mut pending: Vec<u8> = Vec::new();
         loop {
             self.ensure(&mut pending, 4)?;
             if pending[0] != 0 {
                 self.skip_control(&mut pending)?;
+                if !self.pending_clipboard.is_empty() || self.clipboard_changed {
+                    return Ok(Update {
+                        rects: Vec::new(),
+                        clipboard: std::mem::take(&mut self.pending_clipboard),
+                        clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+                    });
+                }
                 continue;
             }
             let nrects = be16(&pending[2..4]);
@@ -919,7 +1060,11 @@ impl SessionReader {
                     other => bail!("unsupported framebuffer encoding 0x{other:x}"),
                 }
             }
-            return Ok(Update { rects });
+            return Ok(Update {
+                rects,
+                clipboard: std::mem::take(&mut self.pending_clipboard),
+                clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+            });
         }
     }
 }

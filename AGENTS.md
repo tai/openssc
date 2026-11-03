@@ -582,10 +582,14 @@ client plus a pcap and experiment note.
   image; input coordinates stay in the server's original backing space.
 - **Gesture input:** `gesture-input` has a tested pure-Rust recognizer and a
   Linux evdev MT-protocol-B reader (`--evdev`, input group required).
+- **Clipboard:** text sync is verified in both directions
+  (`docs/protocol/clipboard.md`). Reads need no AutoPasteboard; writes require
+  `0x15 AutoPasteboard(1)`, which puts the session in promise mode, so `ss-gui`
+  defaults to read and offers `--send-clipboard` for write.
 - **Next:** capture a real swipe's CGEvent fields for swipe calibration (local
   Mission Control steals the gesture, so this needs a suppressing tap or a
-  parameter sweep); add clipboard, keepalive/rekey; verify horizontal scroll;
-  package on a Linux Wayland host.
+  parameter sweep); clipboard duplex on one connection; keepalive/rekey;
+  verify horizontal scroll; package on a Linux Wayland host.
 - **Blockers:** none. Debugging/DTrace restrictions force the
   re-signed-copy/shim route; the in-process `dlopen` + `ndisasm` method is
   already working and documented in `tools/instrument/`.

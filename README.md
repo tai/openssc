@@ -25,7 +25,8 @@ This repository contains:
 | Gesture message 0x17 | ✅ wire format verified; **magnify and two-finger scroll verified live**; swipe calibration ongoing |
 | Live window (winit + softbuffer) | ✅ built, macOS-tested; Wayland build pending |
 | Linux evdev gesture backend | ✅ implemented + type-checked; hardware test pending |
-| Clipboard / audio / MultiVariant | 🚧 later |
+| Clipboard (text) | ✅ both directions verified; single-connection duplex is an open question |
+| Audio / MultiVariant | 🚧 later |
 
 ## Quick start (macOS lab)
 
@@ -101,6 +102,13 @@ headless dump completes in ~1.3–1.6 s in an optimized debug build.
   `key Pressed logical=Character("a") …` for real events.
 - For Japanese/CJK IME input, add `--ime`. Non-ASCII characters are sent as
   X11 Unicode keysyms (`0x01000000 | codepoint`).
+- **Text clipboard is on by default (remote → local).** `--no-clipboard`
+  disables it. Local → remote needs `--send-clipboard`, because Apple only
+  accepts `ClientCutText` while `AutoPasteboard` is enabled, and that puts the
+  session into promise mode (remote → local reads then return metadata only).
+  See `docs/protocol/clipboard.md`. When checking the remote pasteboard use
+  `osascript -e "the clipboard as text"` rather than `pbpaste`, which cannot
+  resolve promises.
 - If the title changes to `ss-clone — disconnected`, the reader thread hit a
   protocol/socket error; the terminal shows the reason. Re-run with
   `--scale 1.0` to rule out a server-side scaling issue.

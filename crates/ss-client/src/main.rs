@@ -1,9 +1,9 @@
 use anyhow::{Context, Result};
 use rfb_proto::{
-    auto_framebuffer_update_custom, auto_pasteboard, client_cut_text, framebuffer_update_request,
-    gesture_begin_end, gesture_magnify, gesture_mouse_scroll, gesture_quicklook, gesture_rotate,
-    gesture_scroll, gesture_smart_magnify, gesture_swipe, key_event, pointer_event, AppleSession,
-    Update,
+    auto_framebuffer_update_custom, auto_pasteboard, client_cut_text, clipboard_fetch,
+    framebuffer_update_request, gesture_begin_end, gesture_magnify, gesture_mouse_scroll,
+    gesture_quicklook, gesture_rotate, gesture_scroll, gesture_smart_magnify, gesture_swipe,
+    key_event, pasteboard_text, pointer_event, AppleSession, Update,
 };
 use std::collections::HashMap;
 use std::fs::File;
@@ -114,6 +114,7 @@ fn main() -> Result<()> {
     let password = get(&opts, "password").map(str::to_string).or_else(|| std::env::var("SS_PASSWORD").ok()).unwrap_or_default();
 
     let mut session = AppleSession::connect(&host, port, &user, &password)?;
+    session.debug_control = opts.contains_key("debug-controls");
     println!(
         "connected: {}x{} name={:?}",
         session.info.width,
@@ -133,7 +134,106 @@ fn main() -> Result<()> {
             let text = get(&opts, "text").unwrap_or("ss-clone clipboard test");
             writer.send(&client_cut_text(text.as_bytes()))?;
             println!("sent clipboard text: {text:?}");
-            std::thread::sleep(Duration::from_millis(1000));
+            // The server installs the text as a *promise* on the remote
+            // pasteboard, so the data is only readable while we stay
+            // connected. --hold-ms keeps the session open for inspection.
+            let hold: u64 = num(&opts, "hold-ms", 1000u64);
+            std::thread::sleep(Duration::from_millis(hold));
+            Ok(())
+        }
+        "clipboard-sync" => {
+            // Send text with AutoPasteboard enabled, then disable it and read
+            // the resulting remote pasteboard back.
+            session.start_streaming()?;
+            let (mut reader, mut writer) = session.split()?;
+            let text = get(&opts, "text").unwrap_or("ss-clone sync test");
+            writer.send(&auto_pasteboard(1))?;
+            std::thread::sleep(Duration::from_millis(300));
+            writer.send(&client_cut_text(text.as_bytes()))?;
+            std::thread::sleep(Duration::from_millis(600));
+            writer.send(&auto_pasteboard(2))?;
+            std::thread::sleep(Duration::from_millis(300));
+            writer.send(&clipboard_fetch())?;
+            let deadline = std::time::Instant::now()
+                + Duration::from_millis(num(&opts, "wait-ms", 3000u64));
+            while std::time::Instant::now() < deadline {
+                writer.send(&framebuffer_update_request(
+                    reader.info.width,
+                    reader.info.height,
+                    true,
+                ))?;
+                match reader.read_update() {
+                    Ok(update) => {
+                        for send in update.clipboard {
+                            let archive = send.archive()?;
+                            println!(
+                                "readback promise={} uncompressed={}",
+                                send.promise, send.uncompressed_size
+                            );
+                            if let Some(t) = pasteboard_text(&archive)? {
+                                println!("remote text: {t:?}");
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("read: {e:#}");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(4));
+            }
+            Ok(())
+        }
+        "clipboard-read" => {
+            session.start_streaming()?;
+            let (mut reader, mut writer) = session.split()?;
+            if !opts.contains_key("no-auto") {
+                // selector 1 = start monitoring the remote pasteboard.
+                writer.send(&auto_pasteboard(1))?;
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            writer.send(&clipboard_fetch())?;
+            let deadline = std::time::Instant::now()
+                + Duration::from_millis(num(&opts, "wait-ms", 4000u64));
+            let (fw, fh) = (reader.info.width, reader.info.height);
+            let poll_fetch = opts.contains_key("poll-fetch");
+            let mut next_fetch = std::time::Instant::now();
+            while std::time::Instant::now() < deadline {
+                if poll_fetch && std::time::Instant::now() >= next_fetch {
+                    writer.send(&clipboard_fetch())?;
+                    next_fetch = std::time::Instant::now() + Duration::from_millis(250);
+                }
+                writer.send(&framebuffer_update_request(fw, fh, true))?;
+                match reader.read_update() {
+                    Ok(update) => {
+                        if update.clipboard_changed {
+                            println!("pasteboard changed; fetching");
+                            writer.send(&clipboard_fetch())?;
+                        }
+                        for send in update.clipboard {
+                            let archive = send.archive()?;
+                            println!(
+                                "clipboard promise={} uncompressed={} archive={} bytes",
+                                send.promise,
+                                send.uncompressed_size,
+                                archive.len()
+                            );
+                            if opts.contains_key("dump") {
+                                let _ = std::fs::write("artifacts/clipboard-archive.bin", &archive);
+                            }
+                            match pasteboard_text(&archive)? {
+                                Some(text) => println!("text: {text:?}"),
+                                None => println!("(no text flavour)"),
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("read: {e:#}");
+                        break;
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(4));
+            }
             Ok(())
         }
         "stream" => {
