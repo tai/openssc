@@ -203,8 +203,21 @@ n >  15 : 5 bits, value 0x1f, then base-128 varint of (n-16)
 Payload widths recovered so far: **Solid = 24 bits**, **Cache6 = 16 bits**
 (tile-cache index), Skip / MatchPrevious / MatchAbove / Cache7 = 0 bits,
 TwoColor presumed 8-byte mask + two 24-bit colours, **DCT = variable** (see
-below). Verified by parsing a real 2560×1600 frame: the first command is
-Solid with a **216-tile run**, followed by a DCT exactly where expected.
+below).
+
+Partial parses of a real 2560×1600 frame are self-consistent but not yet
+confirmed:
+
+- reading a 4-bit first code gives `Solid`, a 216-tile run, then `DCT` at bit
+  52;
+- reading a 4-bit header then 3-bit codes gives `Skip×10, Cache6×15,
+  MatchPrevious×9`, then desynchronises at bit 52.
+
+Both hypotheses reach the **same bit position** and fail at the same place, and
+the first Solid colour (0x19d841) does **not** match the reference menu-bar grey
+(218,218,218), so the colour packing is still unconfirmed. The consistent
+failure point is the first DCT payload, i.e. the coefficient coder is the single
+blocker for both parsing and decoding.
 
 **DCT payloads are inline in the same stream** (stream A): the coefficient
 coder writes luma coefficients to it and chroma to the second stream, which
