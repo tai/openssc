@@ -114,9 +114,60 @@ Tooling: `lipo -thin x86_64`, `otool -l` for `__TEXT` (`vmaddr 0x100000000`,
 `fileoff 0`, so file offset == vmaddr − 0x100000000), `objdump -d`, then scan
 for `leaq disp(%rip)` whose target lands on a known string address.
 
-Next: walk `EncodePartialUpdateMVS` for the header writes and the
-`BitWriteStoreBits` accumulator, recover the Huffman code tables, then port the
-decoder into `rfb-proto` and validate against a `screencapture` reference.
+### 2.4 Encoder internals recovered (2026-11-04)
+
+**Bit writer** — `BitWriteStoreBits` at `0x10003c89c`
+(listing: `artifacts/bin/BitWriter.asm`). Signature `(state, value: u32,
+bits: u32)`, state = `{ u8 *ptr; u32 acc; int free; }`:
+
+```
+free -= bits;
+if (free <= 0) {
+    ptr[0] = acc >> 24;      // top byte
+    ptr[1] = byte2(acc);     // next byte  (movb 10(%rdi) is inside acc!)
+    ptr += 2;
+    acc <<= 16;
+    free += 16;
+}
+acc |= value << (free & 31);
+```
+
+So the command/data bitstreams are **16-bit big-endian units, MSB-first**:
+read a `u16` big-endian, then consume bits from the most significant end. This
+corrects the earlier "byte-oriented MSB-first" assumption and is the single most
+important detail for the decoder.
+
+**Tile cache** — `0x10003c9d0` (listing `artifacts/bin/BitWriter.asm` tail):
+
+- 65536-entry `u16` index table, hashed with `(x * 0xF69A2ED1) >> 49` and
+  `% 136067`;
+- entries are **104 bytes**: a `u32` key followed by 100 bytes of tile data;
+- the tile copy is 96 bytes of pixels plus the key, and 96 = **64 luma + 16 Cb +
+  16 Cr**, i.e. chroma is **4:2:0 subsampled** on 8×8 tiles;
+- a per-viewer counter at `+2474` allocates cache slots, incrementing and
+  wrapping at 65000 — that is the 16-bit index used by the Cache6 command.
+
+**Encoder buffer / geometry** — `EncodePartialUpdateMVS` at `0x10003b539`:
+
+- the rectangle argument is `{i16 left, top, right, bottom}` (the encoder
+  computes `right-left` and `bottom-top`), not `x,y,w,h`;
+- the working buffer is `((2*w + 14) & ~15) * ((h + 7) & ~7) + 520` bytes, i.e.
+  **2 bytes per pixel**, tile height rounded to 8, row stride rounded to 16
+  bytes;
+- the first `callq 0x10003c377` allocates/returns the codec state; the
+  quantisation-table message is emitted separately (`EncodeMVSQuantizationTables`).
+
+**Tile loop** (around `0x10003b9e0`–`0x10003bb20`): the loop first writes a
+**6-bit value** `(n == -1 ? 63 : n - 1)`, then per tile writes a **3-bit code**
+taken from a runtime-built byte table at `-240(%rbp)` (a negative byte is an
+escape and selects a different bit width), followed by 1-, 2- and 8-bit fields
+and calls to `0x10003cc71` for the coefficient bits. This is the Huffman/escape
+machinery; its table is built per call, not stored statically, so it has to be
+derived from the algorithm rather than lifted from the binary.
+
+Next: finish decoding the loop above (the 6-bit prefix and the escape widths),
+then port the decoder into `rfb-proto` and validate tile-by-tile against a
+`screencapture` reference.
 
 ## 3. Repro
 
