@@ -78,6 +78,42 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-03 — why a window raise takes ~500 ms
+
+The user's sharpest observation: raising a window is instant on the real
+monitor but takes 300–1000 ms in the mirror. Measured by timing
+`read_update()` (which includes waiting for the server plus our decode) with
+pipeline 1:
+
+| Update | `read_update` time |
+|---|---|
+| 296x104 (small) | 60–88 ms |
+| 1896x584 (~4.4 MB) | 500–620 ms |
+| 1662x236 (~1.5 MB) | 360–420 ms |
+
+Our decode of a 4 MB Zlib rect is ~30 ms and the whole `draw()` is 6–7 ms, so
+~90% of that time is the server producing the update. `screensharingd` sits at
+**0.4% CPU** during the wait, so it is not CPU-bound: it is the server's
+encode/scan path, and the cost scales with the changed area.
+
+Mitigations tried and their outcome:
+
+- **Sub-region ("band") requests**: a band arrives in ~40 ms instead of 500 ms,
+  but the server stops answering after the first pass, whatever the pipeline
+  depth. Recorded as a server-side limitation.
+- **Raw encoding**: some large rects arrived quickly, but frames reach 10 MB and
+  the cadence is inconsistent; not a win on this link.
+- **`0x44c`/`0x44d` (MultiVariant)**: advertising only 1100/1101 makes the
+  server fall back to Raw, so MVS is gated behind the AVConference `0x1c`
+  media-stream handshake — it is not reachable by encoding advertisement alone.
+- **AutoFrameBufferUpdate**: the CLI free-runs indefinitely (60 frames over
+  18 s), the GUI still stalls after the initial burst even when the arming
+  bytes are sent pre-split (byte-identical messages). Unresolved.
+
+Also fixed: `read_update()` used to swallow zero-rect updates, which deadlocks
+any client that waits for a response before issuing the next request (this is
+what stalled sub-region requests).
+
 ### 2026-11-03 — mirror latency measurements (the real bottleneck)
 
 User observation: the remote monitor reacts instantly while the mirrored image

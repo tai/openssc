@@ -1031,7 +1031,14 @@ impl SessionReader {
             let nrects = be16(&pending[2..4]);
             pending.drain(..4);
             if nrects == 0 {
-                continue;
+                // An empty update is still a *response*: return it so the
+                // caller can issue the next request. Swallowing it deadlocks
+                // any client that requests sub-regions or waits for replies.
+                return Ok(Update {
+                    rects: Vec::new(),
+                    clipboard: std::mem::take(&mut self.pending_clipboard),
+                    clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+                });
             }
             let mut rects = Vec::with_capacity(nrects as usize);
             for _ in 0..nrects {

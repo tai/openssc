@@ -702,6 +702,10 @@ impl ApplicationHandler<UserEvent> for App {
                     self.buttons &= !bit;
                 }
                 let (x, y) = self.cursor;
+                if self.debug_input {
+                    let ms = START.get_or_init(Instant::now).elapsed().as_millis() as u64;
+                    eprintln!("[{ms:6} ms] mouse {button:?} {state:?} at ({x},{y})");
+                }
                 self.pending_pointer = Some((x, y, self.buttons));
                 self.flush_pointer(true);
             }
@@ -1046,13 +1050,23 @@ fn main() -> Result<()> {
         session.send_message(&rfb_proto::auto_pasteboard(1))?;
         eprintln!("clipboard write mode: AutoPasteboard enabled (remote reads become promises)");
     }
-    let (reader, writer) = session.split()?;
-    let req_w = reader.info.width;
-    let req_h = reader.info.height;
+    let req_w = session.info.width;
+    let req_h = session.info.height;
     let fb_w = ((req_w as f64 * scale).round() as u16).max(1);
     let fb_h = ((req_h as f64 * scale).round() as u16).max(1);
     let input_w = req_w;
     let input_h = req_h;
+    // Arm the framebuffer sender on the pre-split connection. Sending this
+    // through the writer thread after split leaves the GUI without
+    // server-pushed updates, while the same messages work from the CLI.
+    if auto_updates {
+        session.send_message(&rfb_proto::auto_framebuffer_update(fb_w, fb_h))?;
+    }
+    session.send_message(&framebuffer_update_request(fb_w, fb_h, false))?;
+    for _ in 1..pipeline {
+        session.send_message(&framebuffer_update_request(fb_w, fb_h, true))?;
+    }
+    let (reader, writer) = session.split()?;
 
     let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>();
     // Bounded: if the GUI cannot keep up, apply backpressure instead of
@@ -1145,11 +1159,6 @@ fn main() -> Result<()> {
                 );
             });
         }
-        // Order matters: arm server-push first, then send the initial
-        // non-incremental request (this is the sequence that free-runs).
-        if auto_updates {
-            let _ = tx_reader.send(rfb_proto::auto_framebuffer_update(fb_w, fb_h));
-        }
         let band_h = ((fb_h as usize + bands - 1) / bands).max(1);
         let band_rect = |i: usize| -> (u16, u16, u16, u16) {
             let y = i * band_h;
@@ -1157,33 +1166,15 @@ fn main() -> Result<()> {
             (0, y as u16, fb_w, h)
         };
         let mut next_band = 0usize;
-        if bands > 1 {
-            // Prime the pipe with the first bands, non-incremental for band 0
-            // so we get a complete frame.
-            let (bx, by, bw, bh) = band_rect(0);
-            let _ = tx_reader.send(rfb_proto::framebuffer_update_request_rect(
-                bx, by, bw, bh, false,
-            ));
-            next_band = 1;
-            for _ in 1..pipeline {
-                let (bx, by, bw, bh) = band_rect(next_band % bands);
-                let _ = tx_reader.send(rfb_proto::framebuffer_update_request_rect(
-                    bx, by, bw, bh, true,
-                ));
-                next_band += 1;
-            }
-        } else {
-            let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
-            for _ in 1..pipeline {
-                let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
-            }
-        }
         let clip_wanted = clipboard && !clipboard_send;
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
         }
         loop {
-            match reader.read_update() {
+            let read_started = Instant::now();
+            let upd = reader.read_update();
+            let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+            match upd {
                 Ok(update) => {
                     if clip_wanted {
                         if update.clipboard_changed {
@@ -1206,12 +1197,17 @@ fn main() -> Result<()> {
                         }
                     }
                     if debug_reader {
+                        let ms = START
+                            .get_or_init(Instant::now)
+                            .elapsed()
+                            .as_millis() as u64;
+                        eprintln!("[{ms:6} ms] read took {read_ms:.1} ms");
                         let desc: Vec<_> = update
                             .rects
                             .iter()
                             .map(|r| (r.x, r.y, r.w, r.h, r.encoding, r.pixels.len()))
                             .collect();
-                        eprintln!("update rects={desc:?}");
+                        eprintln!("[{ms:6} ms] update rects={desc:?}");
                     }
                     READER_UPDATES.fetch_add(1, Ordering::Relaxed);
                     READER_ALIVE_MS.store(
