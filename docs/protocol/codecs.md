@@ -243,9 +243,55 @@ the rest the code, and the low bit of the code carries the sign.
 Larger magnitudes use an escape (`0x10003cd26`): 8-bit groups with a
 continuation bit.
 
-Next: implement the coefficient coder (stream A luma, stream B chroma) so DCT
-tiles can be skipped/decoded, then validate a full frame against
-`screencapture`.
+## 2.7 Client decoder — FOUND (2026-11-04)
+
+Earlier searches of `ScreenSharing.framework` were invalid: shared-cache images
+must be read at `vmaddr + slide` (slide `0x8fae000` this boot).
+`tools/instrument/framework_image.py` now applies it, and with correct
+addresses the client decoder is present:
+
+| Symbol | Address |
+|---|---|
+| `DecodeMVSUpdate` | `0x7ff9223b85e4` |
+| `DecodeMVSPartialUpdate` (state/quant setup) | `0x7ff9223bb400` |
+| Huffman table builder | `0x7ff9223bb724` |
+| per-update tile driver | `0x7ff9223bbad6` |
+| SIMD IDCT | `0x7ff9223bc67d`, `0x7ff9223bcb21` |
+| bit reader | `0x7ff9223bc1bf` |
+
+`DecodeMVSUpdate` reads a `u32` BE length, rejects `> 0x5f5e101`, allocates
+`len + 0x7d0`, reads the body, then switches on `body[0]`: `2` = quantisation
+update, `1` = full, else partial. The full path takes `body[1]`/`body[2]` as
+parameters and starts the bitstream at **`body+3`**, so the 6-byte
+`type/p1/p2/data_off` header inferred from the encoder is at least partly wrong
+for captured type-0 frames.
+
+**The codec is JPEG-shaped.** Tables extracted from the framework:
+
+| Table | Counts | Symbols |
+|---|---|---|
+| luma DC | `0,0,1,5,1,1,1,1,1,1` | 0–11 |
+| luma AC | `0,0,2,1,3,3,2,4,3,5,5,4,4,0,0,1` | `01 02 03 00 04 11 05 12 21 31 41 …` |
+| chroma DC | `0,0,3,1,1,1,1,1,1,1,1,1` | 0–11 |
+| chroma AC | `0,0,2,1,2,4,4,3,4,7,5,4,4,0,1,2` | `00 01 02 03 11 04 05 21 31 …` |
+
+AC symbols are `(run << 4) | size` including EOB `0x00` and ZRL `0xF0` — exactly
+baseline JPEG. Quantisation tables are the standard JPEG luma
+(`16,11,11,14,24,22,24,33,…`) and chroma (`19,19,24,47,76,99,…`) tables.
+`tools/instrument/dump_mvs_tables.py` extracts all six at runtime (`--json`).
+
+**Bit reader** (`0x7ff9223bc1bf`): state `+0xa8` accumulator, `+0xac` available
+bits, `+0xb0` byte pointer. Refills one **byte** at a time, big-endian
+(`eax = *ptr++; acc |= eax << (24 - avail); avail += 8`), consuming from the MSB.
+A loop then shifts the accumulator one bit at a time while the sign bit is clear
+(up to 39 bits, error at 40) — some codes are **unary-prefixed**, which is why
+the fixed 3-bit command assumption failed.
+
+**Remaining gap**: the framing between command codes, the 6-bit first-non-zero
+prefix and the JPEG blocks. Decoding a block at the offset the command parse
+predicts does not land on a valid repeat, so either the prefix belongs to the
+block grammar or the payload widths differ. Recorded next step: read the command
+dispatch inside `0x7ff9223bbad6` instead of inferring it.
 
 ## 3. Repro
 
