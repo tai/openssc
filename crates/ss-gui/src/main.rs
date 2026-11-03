@@ -15,6 +15,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZeroU32;
 use std::sync::mpsc::{self, Receiver, Sender};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -108,6 +109,28 @@ fn named_keysym(key: &NamedKey) -> Option<u32> {
 
 /// Read the local text clipboard. Uses the platform clipboard tools so the
 /// crate stays dependency-free; returns `None` when unavailable.
+/// Milliseconds since the first input, updated on every input event. The
+/// reader thread polls the framebuffer faster while this is recent so input
+/// feedback arrives without the round-trip latency of the idle cadence.
+static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
+static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+
+fn note_input() {
+    let start = *START.get_or_init(Instant::now);
+    LAST_INPUT_MS.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+}
+
+fn input_is_hot() -> bool {
+    match START.get() {
+        Some(start) => {
+            let last = LAST_INPUT_MS.load(Ordering::Relaxed) as u128;
+            let now = start.elapsed().as_millis();
+            now.saturating_sub(last) < 250
+        }
+        None => false,
+    }
+}
+
 fn local_clipboard_text() -> Option<String> {
     use std::io::Write;
     #[cfg(target_os = "macos")]
@@ -627,6 +650,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::CursorMoved { position, .. } => {
+                note_input();
                 let (x, y) = self.to_fb(position);
                 if self.debug_input && self.buttons != 0 {
                     eprintln!("cursor fb=({x},{y}) buttons={}", self.buttons);
@@ -638,6 +662,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
+                note_input();
                 if self.debug_input {
                     eprintln!("mouse {button:?} {state:?}");
                 }
@@ -664,6 +689,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.flush_pointer(true);
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                note_input();
                 // Trackpads report pixel deltas on Wayland, line deltas on
                 // macOS. Convert both to scroll *lines*; the server only
                 // honours the line-delta field (see queue_scroll).
@@ -676,6 +702,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.queue_scroll(dx, dy);
             }
             WindowEvent::PinchGesture { delta, .. } => {
+                note_input();
                 // VERIFIED shape: begin(1) -> change(2) with mask 31 -> end(4).
                 let (x, y) = self.cursor;
                 self.pinch_x = x;
@@ -688,6 +715,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pinch_last = Some(Instant::now());
             }
             WindowEvent::RotationGesture { delta, .. } => {
+                note_input();
                 let (x, y) = self.cursor;
                 self.pinch_x = x;
                 self.pinch_y = y;
@@ -703,6 +731,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.send(gesture_smart_magnify(x, y));
             }
             WindowEvent::PanGesture { delta, .. } => {
+                note_input();
                 // Two-finger pan is scrolling: use the verified subtype 11.
                 self.queue_scroll(delta.x / 60.0, delta.y / 60.0);
             }
@@ -710,6 +739,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.modifiers = m.state();
             }
             WindowEvent::KeyboardInput { event, .. } => {
+                note_input();
                 let pressed = event.state == ElementState::Pressed;
                 if event.repeat {
                     return;
@@ -1092,7 +1122,8 @@ fn main() -> Result<()> {
                     // This server build does not reliably free-run after the
                     // first auto frame. Poll with the *scaled* geometry so
                     // post-input dirty rectangles are always delivered.
-                    thread::sleep(Duration::from_millis(16));
+                    let idle_ms = if input_is_hot() { 4 } else { 16 };
+                    thread::sleep(Duration::from_millis(idle_ms));
                     let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
                 }
                 Err(e) => {

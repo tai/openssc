@@ -1265,6 +1265,10 @@ pub fn gesture_mouse_scroll(
     x: u16,
     y: u16,
 ) -> Vec<u8> {
+    // Layout per docs/protocol/input-and-gestures.md §2.6. Two 4-byte words at
+    // +0x1a and +0x2a are unlabelled; getting them right matters because every
+    // field after +0x1a (pointDeltas, scrollPhase, momentumPhase, x, y) then
+    // lands on its documented offset.
     let mut b = Vec::with_capacity(58);
     b.push(0x17);
     b.push(0);
@@ -1274,17 +1278,16 @@ pub fn gesture_mouse_scroll(
     b.extend_from_slice(&dx.to_be_bytes());
     b.extend_from_slice(&dy.to_be_bytes());
     b.extend_from_slice(&dz.to_be_bytes());
-    for v in [fixed.0, fixed.1, fixed.2, point.0, point.1, point.2] {
+    for v in [fixed.0, fixed.1, fixed.2] {
         b.extend_from_slice(&v.to_be_bytes());
     }
+    b.extend_from_slice(&0u32.to_be_bytes()); // +0x1a
+    for v in [point.0, point.1, point.2] {
+        b.extend_from_slice(&v.to_be_bytes());
+    }
+    b.extend_from_slice(&0u32.to_be_bytes()); // +0x2a
     b.extend_from_slice(&phase.to_be_bytes());
     b.extend_from_slice(&momentum.to_be_bytes());
-    // HYPOTHESIS: the documented 58-byte frame has eight bytes between
-    // momentumPhase and the coordinates (probably count/flags). Sending too
-    // few bytes desynchronises the server, so keep the declared length and the
-    // real payload in agreement while the field names are unknown.
-    b.extend_from_slice(&0u32.to_be_bytes());
-    b.extend_from_slice(&0u32.to_be_bytes());
     b.extend_from_slice(&x.to_be_bytes());
     b.extend_from_slice(&y.to_be_bytes());
     debug_assert_eq!(b.len(), 58);

@@ -154,25 +154,32 @@ exactly **58 bytes**; a short frame hangs the session. See §5.1.
 Emitted by `-[SSSession stSendMouseScrollEvent:]` (the `scrollWheel:` path).
 
 ```
-+0x00 u8 0x17
-+0x01 u8 0
-+0x02 u16 0x0036
++0x00 u8  0x17
++0x01 u8  0
++0x02 u16 0x0036          # payload length (54) => 58 bytes total
 +0x04 u16 1
 +0x06 u16 11
 +0x08 s16 deltaX
-+0x0a s16 deltaY
++0x0a s16 deltaY          # the operative field
 +0x0c s16 deltaZ
 +0x0e i32 fixedDeltaX
 +0x12 i32 fixedDeltaY
 +0x16 i32 fixedDeltaZ
++0x1a u32 unlabelled (0)
 +0x1e i32 pointDeltaX
 +0x22 i32 pointDeltaY
 +0x26 i32 pointDeltaZ
++0x2a u32 unlabelled (0)
 +0x2e u32 scrollPhase
 +0x32 u32 momentumPhase
-+0x36 u16 x               # note: count/flags fields are still being mapped
++0x36 u16 x
 +0x38 u16 y
 ```
+
+The two 4-byte words at `+0x1a` and `+0x2a` are unlabelled. Their position
+matters: filling them shifts `pointDelta*`, `scrollPhase`, `momentumPhase` and
+`x`/`y` into the wrong places. An earlier build appended both words at the end
+instead, which left every field after `+0x1a` misaligned.
 
 The sender reads the private CGEvent fields 118/119/120 (gesture scroll X/Y/Z),
 135 (natural), 132 (phase), 133 (mask) for subtype 8; and the standard
@@ -222,13 +229,13 @@ The working path is **subtype 11 (MouseScroll)**, not subtype 8.
 
 | Question | Result |
 |---|---|
-| Which delta field scrolls? | **`dy` (the 16-bit line delta), offsets +0x08..+0x0d.** `pointDelta*` was set to 0 in the winning tests and had no effect in the losing ones. |
+| Which delta field scrolls? | **`dy` (the 16-bit line delta), offsets +0x08..+0x0d.** `pointDelta*` (set with the documented offsets) and `fixedDelta*` (16.16 pt) both produced **no** movement on their own. `pointDelta` at most contributes ~1 line when `dy` is also non-zero, so scrolling is inherently line-granular. |
 | Is the phase series required? | **No.** A single `phase = 2` frame with `dy = +10` scrolled TextEdit up ~8 lines. `phase = 1/4` frames are harmless but optional. |
 | Sign | **`dy > 0` scrolls up (earlier content), `dy < 0` scrolls down.** |
 | Magnitude | ≈ **1 line of content per unit**: `dy=-10` moved 15 lines, `dy=+10` moved ~8, `dy=+5` moved ~4. |
 | Frame length | Must be **58 bytes** (length field `0x36`). Our earlier 50-byte frame desynchronised the server: it waited for 8 bytes that never came and the session hung. |
-| Unknown bytes | Eight bytes between `momentumPhase` and the coordinates are still unlabelled (probably count/flags); zero is accepted. |
-| Where does it land? | HYPOTHESIS: the event only takes effect when the message's `x,y` fall inside the **frontmost** window. Sending to a background window's coordinates produced no scroll. |
+| Unknown bytes | Two 4-byte words at `+0x1a` and `+0x2a`; zero is accepted. |
+| Where does it land? | HYPOTHESIS: the event only takes effect when the message's `x,y` fall inside the **frontmost** window. Earlier tests that appeared to confirm this had `x,y` at the wrong offsets, so re-test with the corrected layout. |
 
 Evidence: `artifacts/scroll-after-wheel.png` (001→032), `artifacts/dy-only.png`
 (032→047), `artifacts/dy-single-up.png` (047→039), `artifacts/gui-after.png`

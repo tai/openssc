@@ -374,11 +374,12 @@ fn main() -> Result<()> {
                     let dy: i16 = num(&opts, "dy", -10i16);
                     for &phase in phases {
                         let (dy, point_y) = if phase == 2 { (dy, point_y) } else { (0, 0) };
+                        let fixed_y: i32 = num(&opts, "fixed-y", 0i32);
                         let body = gesture_mouse_scroll(
                             num(&opts, "dx", 0i16),
                             dy,
                             num(&opts, "dz", 0i16),
-                            (0, 0, 0),
+                            (0, if phase == 2 { fixed_y } else { 0 }, 0),
                             (0, point_y, 0),
                             phase,
                             0,
