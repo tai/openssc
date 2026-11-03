@@ -10,9 +10,9 @@ contradicts this document, update this document in the same change.
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
 - **Current phase:** live GUI + input + Linux evdev gesture backend working;
-  magnify verified live; performance pass done (auto dirty rects, 0.5 scaling,
-  coalesced input). Swipe/scroll semantic calibration, clipboard, and rekey
-  handling are next.
+  magnify and **two-finger scroll verified live**; performance pass done (auto
+  dirty rects, 0.5 scaling, coalesced input). Swipe semantic calibration,
+  clipboard, and rekey handling are next.
 - **Last verified:** 2026-11-03 against `md.local` and `mm.local`.
 
 ---
@@ -563,10 +563,13 @@ client plus a pcap and experiment note.
 - **M2:** complete in Rust, CLI and GUI. `ss-client demo-input` and a local
   click/keystrokes into the `ss-gui` window both type into remote TextEdit.
 - **M4 (gestures):** message 0x17 implemented. **Magnify is verified live**
-  (phase series 1/2/2/4, mask 31 zoomed Preview on `mm.local`). Swipe reaches
-  the agent but has no visible action on this host (vertical Mission Control
-  swipes disabled; possibly a single desktop space). Rotate/scroll still need
-  app-level calibration.
+  (phase series 1/2/2/4, mask 31 zoomed Preview on `mm.local`) and
+  **two-finger scroll is verified live** via subtype 11: the 16-bit `dy` line
+  delta is the operative field (`+` up, `-` down, ≈1 line/unit), one `phase=2`
+  frame suffices, and the frame must be exactly 58 bytes or the server
+  desynchronises. Swipe reaches the agent but has no visible action on this
+  host (vertical Mission Control swipes disabled; possibly a single desktop
+  space). Rotate still needs app-level calibration.
 - **M5 (GUI):** `ss-gui` (winit + softbuffer) runs on macOS and uses the
   native Wayland backend on Linux. It presents BGRX frames, forwards keyboard
   and pointer input, handles pinch/rotate/pan/smart-zoom, and has a headless
@@ -579,9 +582,10 @@ client plus a pcap and experiment note.
   image; input coordinates stay in the server's original backing space.
 - **Gesture input:** `gesture-input` has a tested pure-Rust recognizer and a
   Linux evdev MT-protocol-B reader (`--evdev`, input group required).
-- **Next:** capture a real swipe's CGEvent fields for swipe calibration;
-  settle subtype-8/11 scroll; add clipboard, keepalive/rekey; package on a
-  Linux Wayland host.
+- **Next:** capture a real swipe's CGEvent fields for swipe calibration (local
+  Mission Control steals the gesture, so this needs a suppressing tap or a
+  parameter sweep); add clipboard, keepalive/rekey; verify horizontal scroll;
+  package on a Linux Wayland host.
 - **Blockers:** none. Debugging/DTrace restrictions force the
   re-signed-copy/shim route; the in-process `dlopen` + `ndisasm` method is
   already working and documented in `tools/instrument/`.

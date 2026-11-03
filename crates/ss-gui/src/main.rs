@@ -157,17 +157,25 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
                 out.push(gesture_begin_end(2, 0, px, py));
             }
         }
-        Gesture::Scroll { dx, dy, phase } => {
-            out.push(gesture_scroll(
-                dx * 2000.0,
-                dy * 2000.0,
-                0.0,
-                1,
-                phase.code(),
-                0,
-                fb_w / 2,
-                fb_h / 2,
-            ));
+        Gesture::Scroll { dx, dy, phase: _ } => {
+            // Normalized trackpad motion (fraction of the pad) -> scroll lines.
+            // The scale is a feel constant, to be calibrated on a Linux pad.
+            const SCROLL_LINES_PER_UNIT: f32 = 600.0;
+            let lx = (dx * SCROLL_LINES_PER_UNIT).clamp(-40.0, 40.0) as i16;
+            let ly = (dy * SCROLL_LINES_PER_UNIT).clamp(-40.0, 40.0) as i16;
+            if lx != 0 || ly != 0 {
+                out.push(gesture_mouse_scroll(
+                    lx,
+                    ly,
+                    0,
+                    (0, 0, 0),
+                    (0, 0, 0),
+                    2,
+                    0,
+                    fb_w / 2,
+                    fb_h / 2,
+                ));
+            }
         }
         Gesture::Magnify { factor, phase, x, y } => {
             let px = (x * fb_w as f32).clamp(0.0, fb_w as f32 - 1.0) as u16;
@@ -241,6 +249,8 @@ struct App {
     ime: bool,
     focused_once: bool,
     deadline: Option<Instant>,
+    /// Sub-line scroll remainder, so small pixel deltas still accumulate.
+    scroll_acc: (f32, f32),
 }
 
 impl App {
@@ -296,6 +306,7 @@ impl App {
             ime,
             focused_once: false,
             deadline,
+            scroll_acc: (0.0, 0.0),
         })
     }
 
@@ -316,8 +327,41 @@ impl App {
         }
     }
 
-    fn send_swipe(&self, motion: u32, mask: u32) {
+    /// Queue a two-finger scroll. macOS acts on the 16-bit line delta in the
+    /// Apple MouseScroll message (subtype 11); the pixel deltas are ignored by
+    /// this server build, and phase 2 alone is sufficient (VERIFIED live:
+    /// `dy=-10` moved TextEdit 15 lines, `dy=+10` moved it back 8).
+    fn queue_scroll(&mut self, dx: f32, dy: f32) {
+        self.scroll_acc.0 += dx;
+        self.scroll_acc.1 += dy;
+        let lines_x = self.scroll_acc.0.trunc();
+        let lines_y = self.scroll_acc.1.trunc();
+        if lines_x == 0.0 && lines_y == 0.0 {
+            return;
+        }
+        self.scroll_acc.0 -= lines_x;
+        self.scroll_acc.1 -= lines_y;
+        // Stay inside i16 and avoid one absurd event after a burst.
+        let lx = lines_x.clamp(-40.0, 40.0) as i16;
+        let ly = lines_y.clamp(-40.0, 40.0) as i16;
         let (x, y) = self.cursor;
+        if self.debug_input {
+            eprintln!("scroll lines=({lx},{ly}) at ({x},{y})");
+        }
+        self.send(gesture_mouse_scroll(
+            lx,
+            ly,
+            0,
+            (0, 0, 0),
+            (0, 0, 0),
+            2,
+            0,
+            x,
+            y,
+        ));
+    }
+
+    fn send_swipe(&self, motion: u32, mask: u32) {        let (x, y) = self.cursor;
         self.send(gesture_begin_end(1, 0, x, y));
         self.send(gesture_swipe(
             motion, mask, 1.0, 0.5, 0.5, 0.0, 0.0, 0.0, 0, 0, x, y,
@@ -569,23 +613,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.flush_pointer(true);
             }
             WindowEvent::MouseWheel { delta, .. } => {
+                // Trackpads report pixel deltas on Wayland, line deltas on
+                // macOS. Convert both to scroll *lines*; the server only
+                // honours the line-delta field (see queue_scroll).
                 let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x * 10.0, y * 10.0),
-                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32),
+                    MouseScrollDelta::LineDelta(x, y) => (x, y),
+                    MouseScrollDelta::PixelDelta(p) => {
+                        (p.x as f32 / 12.0, p.y as f32 / 12.0)
+                    }
                 };
-                let (x, y) = self.cursor;
-                self.send(gesture_mouse_scroll(
-                    0,
-                    (-dy) as i16,
-                    0,
-                    (0, 0, 0),
-                    (0, (-dy) as i32, 0),
-                    2,
-                    0,
-                    x,
-                    y,
-                ));
-                let _ = dx;
+                self.queue_scroll(dx, dy);
             }
             WindowEvent::PinchGesture { delta, .. } => {
                 let (x, y) = self.cursor;

@@ -147,6 +147,10 @@ the server converts to logical points (`640,400`).
 
 ### 2.6 Mouse scroll (11) — normal wheel / two-finger scroll
 
+**VERIFIED live** (2026-11-03): this is the subtype that actually scrolls a
+macOS app, and the `dy` line delta is the operative field. Total length is
+exactly **58 bytes**; a short frame hangs the session. See §5.1.
+
 Emitted by `-[SSSession stSendMouseScrollEvent:]` (the `scrollWheel:` path).
 
 ```
@@ -212,6 +216,38 @@ posting.
 
 ## 5. Calibration notes / open questions
 
+### 5.1 Two-finger scroll — VERIFIED (2026-11-03, `mm.local` TextEdit)
+
+The working path is **subtype 11 (MouseScroll)**, not subtype 8.
+
+| Question | Result |
+|---|---|
+| Which delta field scrolls? | **`dy` (the 16-bit line delta), offsets +0x08..+0x0d.** `pointDelta*` was set to 0 in the winning tests and had no effect in the losing ones. |
+| Is the phase series required? | **No.** A single `phase = 2` frame with `dy = +10` scrolled TextEdit up ~8 lines. `phase = 1/4` frames are harmless but optional. |
+| Sign | **`dy > 0` scrolls up (earlier content), `dy < 0` scrolls down.** |
+| Magnitude | ≈ **1 line of content per unit**: `dy=-10` moved 15 lines, `dy=+10` moved ~8, `dy=+5` moved ~4. |
+| Frame length | Must be **58 bytes** (length field `0x36`). Our earlier 50-byte frame desynchronised the server: it waited for 8 bytes that never came and the session hung. |
+| Unknown bytes | Eight bytes between `momentumPhase` and the coordinates are still unlabelled (probably count/flags); zero is accepted. |
+| Where does it land? | HYPOTHESIS: the event only takes effect when the message's `x,y` fall inside the **frontmost** window. Sending to a background window's coordinates produced no scroll. |
+
+Evidence: `artifacts/scroll-after-wheel.png` (001→032), `artifacts/dy-only.png`
+(032→047), `artifacts/dy-single-up.png` (047→039), `artifacts/gui-after.png`
+(GUI path, `+5` → 039→035).
+
+Reproduce:
+
+```sh
+# One complete scroll gesture on a single connection
+cargo run -p ss-client -- gesture --host mm.local --kind wheel \
+    --dy -10 --point-y 0 --x 1200 --y 800 --out artifacts/s.png
+```
+
+`ss-gui` now maps `MouseWheel` and the evdev recogniser to subtype 11, converts
+pixel deltas to lines (`/12`), accumulates sub-line remainders, and clamps a
+single event to ±40 lines.
+
+### 5.2 Swipe — still uncalibrated
+
 - `mm.local` has **vertical** three/four-finger Mission Control swipes
   **disabled** (`TrackpadThreeFingerVertSwipeGesture = 0`,
   `TrackpadFourFingerVertSwipeGesture = 0`) and horizontal swipes enabled
@@ -223,8 +259,14 @@ posting.
   `(motion, swipeMask, progress)` combinations tried so far. The remaining
   variables are the `motion` enum, `flags`, `flavor`, and whether macOS requires
   a valid begin/end series or a physical HID source.
-- A one-time capture of a real trackpad swipe's CGEvent fields (via an event tap
-  on `md.local`) will settle the values; the wire format itself is known.
+- Capturing the real client's swipe values is blocked on `md.local`: with
+  three-finger Mission Control swipes enabled, the local window server consumes
+  the gesture before `Screen Sharing.app` sees it, and the client then sends
+  nothing (verified: the agent log shows no `PostGestureEvent`). Rewriting
+  `TrackpadThreeFinger*SwipeGesture` in `com.apple.*MultitouchTrackpad` and
+  restarting Dock did **not** change the local behaviour.
+- Next options: a suppressing CGHID event tap plus re-post into the session, or
+  parameter sweeps against `mm.local` using subtype 6 directly.
 - Standard keyboard/pointer input still needs a capture; the native client uses
   ordinary RFB KeyEvent/PointerEvent plus the Apple 0x10 encrypted-input variant
   when keystroke-only encryption is selected.

@@ -67,15 +67,27 @@
 
 ### Next
 
-1. Capture a real trackpad swipe's CGEvent fields on `md.local` (event tap) and
-   replay them; settle `motion`/`flags`/`flavor`/series.
-2. Settle subtype-8/11 scroll (subtype 11 desynced this server build; mark
-   experimental until the field mapping is recovered).
-3. Add clipboard (standard `ClientCutText` + Apple `0x1f`/`0x15`), keepalive,
+1. Settle subtype-6 swipe values (`motion`/`flags`/`flavor`/series). Capturing
+   the real client on `md.local` is blocked: Mission Control consumes the local
+   three-finger swipe before `Screen Sharing.app` sees it, and the client then
+   sends nothing.
+2. Add clipboard (standard `ClientCutText` + Apple `0x1f`/`0x15`), keepalive,
    and mid-session rekey handling.
-4. Test `ss-gui --evdev` on a real Wayland host; add udev/permission docs.
-5. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
-6. Add a `--scale`/quality control to the GUI UI (currently CLI-only).
+3. Test `ss-gui --evdev` on a real Wayland host; add udev/permission docs and
+   calibrate the evdev scroll/zoom feel constants.
+4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
+5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
+
+### Verified 2026-11-03 — two-finger scroll
+
+Subtype 11 (MouseScroll), exactly 58 bytes, **`dy` = line delta is what macOS
+honours**: `dy > 0` scrolls up, `dy < 0` scrolls down, ≈1 line per unit, and a
+lone `phase = 2` frame is enough. `pointDelta*` had no visible effect. The
+previous 50-byte frame desynchronised the server (hang), now fixed. `ss-gui`
+uses this path for both winit wheel events and the evdev recogniser.
+
+Evidence: `artifacts/scroll-after-wheel.png`, `artifacts/dy-only.png`,
+`artifacts/dy-single-up.png`, `artifacts/gui-after.png`.
 
 ### Lab state
 

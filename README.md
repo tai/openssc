@@ -22,7 +22,7 @@ This repository contains:
 | Rekey + AES-128-CBC/SHA-1 record layer | ✅ verified, Rust + Python |
 | ServerInit / Zlib framebuffer | ✅ verified, Rust + Python |
 | Keyboard / pointer input | ✅ verified via CLI and GUI (click + type on `mm.local`) |
-| Gesture message 0x17 | ✅ wire format verified; **magnify verified live**; swipe/scroll calibration ongoing |
+| Gesture message 0x17 | ✅ wire format verified; **magnify and two-finger scroll verified live**; swipe calibration ongoing |
 | Live window (winit + softbuffer) | ✅ built, macOS-tested; Wayland build pending |
 | Linux evdev gesture backend | ✅ implemented + type-checked; hardware test pending |
 | Clipboard / audio / MultiVariant | 🚧 later |
@@ -194,18 +194,23 @@ On `mm.local`, vertical three/four-finger Mission Control swipes are disabled
 (`TrackpadThreeFingerVertSwipeGesture = 0`), while horizontal swipes are
 enabled. Synthetic subtype-6 swipes reach the agent and are logged, but have
 not produced a visible action; the host may have a single desktop space.
-Subtype 11 wheel scroll desynced this server build and is marked experimental;
-standard button-4/5 scroll has not yet been observed to scroll.
+
+**Two-finger scroll is verified working** (2026-11-03): gesture message 0x17
+subtype 11 carries a 16-bit line delta at `+0x08`; `dy > 0` scrolls up,
+`dy < 0` scrolls down, ≈1 line per unit, and a single `phase = 2` frame is
+enough. The frame must be exactly 58 bytes — a short frame desynchronises the
+server and hangs the session. `pointDelta*` fields appear unused by this build
+and subtype 8 (gesture scroll) produced no movement at all.
 
 Remaining calibration work:
 
-- capture a real trackpad swipe's CGEvent fields on `md.local` (event tap) and
-  replay those values;
+- capture a real trackpad swipe's CGEvent fields on `md.local` — blocked
+  because the local window server consumes three-finger swipes before
+  `Screen Sharing.app` sees them (the client then sends nothing);
 - determine the required `motion` enum, `flags`, `flavor`, and whether a valid
-  begin/end series or HID source is required;
-- settle the subtype-11 wheel field order (`scrollCount`/`flags` vs
-  phase/momentum) or implement subtype 8 scroll with a correct phase series;
-- test subtype 11 (wheel) field order for normal scrolling.
+  begin/end series or HID source is required for subtype 6;
+- verify horizontal scroll (`dx`) and name the eight unlabelled tail bytes of
+  subtype 11.
 
 ## Layout
 

@@ -223,8 +223,8 @@ fn main() -> Result<()> {
                 let height = session.info.height;
                 let kind = get(&opts, "kind").unwrap_or("swipe");
                 let series = opts.contains_key("series");
-                let cx = width / 2;
-                let cy = height / 2;
+                let cx: u16 = num(&opts, "x", width / 2);
+                let cy: u16 = num(&opts, "y", height / 2);
                 if kind == "magnify" || kind == "rotate" {
                     let value = if kind == "magnify" {
                         num(&opts, "value", 0.2f64)
@@ -263,18 +263,27 @@ fn main() -> Result<()> {
                         std::thread::sleep(Duration::from_millis(30));
                     }
                 } else if kind == "wheel" {
-                    let body = gesture_mouse_scroll(
-                        num(&opts, "dx", 0i16),
-                        num(&opts, "dy", -10i16),
-                        num(&opts, "dz", 0i16),
-                        (0, 0, 0),
-                        (0, num(&opts, "point-y", -10i32), 0),
-                        num(&opts, "phase", 2u32),
-                        num(&opts, "momentum", 0u32),
-                        cx,
-                        cy,
-                    );
-                    session.send_gesture(&body)?;
+                    // Subtype 11 (MouseScroll). macOS only acts on a complete
+                    // gesture: began(1) -> changed(2)... -> ended(4).
+                    let phases: &[u32] = if series { &[1, 2, 2, 4] } else { &[num(&opts, "phase", 2u32)] };
+                    let point_y: i32 = num(&opts, "point-y", -10i32);
+                    let dy: i16 = num(&opts, "dy", -10i16);
+                    for &phase in phases {
+                        let (dy, point_y) = if phase == 2 { (dy, point_y) } else { (0, 0) };
+                        let body = gesture_mouse_scroll(
+                            num(&opts, "dx", 0i16),
+                            dy,
+                            num(&opts, "dz", 0i16),
+                            (0, 0, 0),
+                            (0, point_y, 0),
+                            phase,
+                            0,
+                            cx,
+                            cy,
+                        );
+                        session.send_gesture(&body)?;
+                        std::thread::sleep(Duration::from_millis(16));
+                    }
                 } else if kind == "swipe" {
                     let body = gesture_swipe(
                         num(&opts, "motion", 1u32),

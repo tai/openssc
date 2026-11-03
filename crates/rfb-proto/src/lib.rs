@@ -1122,8 +1122,15 @@ pub fn gesture_mouse_scroll(
     }
     b.extend_from_slice(&phase.to_be_bytes());
     b.extend_from_slice(&momentum.to_be_bytes());
+    // HYPOTHESIS: the documented 58-byte frame has eight bytes between
+    // momentumPhase and the coordinates (probably count/flags). Sending too
+    // few bytes desynchronises the server, so keep the declared length and the
+    // real payload in agreement while the field names are unknown.
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&0u32.to_be_bytes());
     b.extend_from_slice(&x.to_be_bytes());
     b.extend_from_slice(&y.to_be_bytes());
+    debug_assert_eq!(b.len(), 58);
     b
 }
 
