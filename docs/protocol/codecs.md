@@ -165,9 +165,20 @@ and calls to `0x10003cc71` for the coefficient bits. This is the Huffman/escape
 machinery; its table is built per call, not stored statically, so it has to be
 derived from the algorithm rather than lifted from the binary.
 
-Next: finish decoding the loop above (the 6-bit prefix and the escape widths),
-then port the decoder into `rfb-proto` and validate tile-by-tile against a
-`screencapture` reference.
+The 64-entry table built just before the loop (`0x10003b91d`–`0x10003b9d1`)
+is a per-call run-length/Huffman description of the 64 DCT coefficients: it
+walks the array at `4(%r12)` and for each entry derives a code in `-239(%rbp,…)`,
+marks zeros with `0x80`, and records the first non-zero index in `r15`, which is
+then emitted as the 6-bit `(n == -1 ? 63 : n - 1)` prefix. Coefficients beyond
+the first non-zero use a second 3-bit code path. This is a custom (not JPEG)
+run-length scheme fused with the escape table, and it is the remaining piece
+that must be reproduced exactly.
+
+Next: either finish the loop above, or — cheaper — extract the *client's*
+Huffman tables from `ScreenSharing.framework` in the dyld shared cache. The
+framework loads via `dlopen`, so its Mach-O header can be reached with
+`_dyld_get_image_header`, then `__DATA`/`__CONST` scanned for a
+`(bits[16], values[…])` pair, which is the usual shape of such tables.
 
 ## 3. Repro
 
