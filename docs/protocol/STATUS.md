@@ -78,6 +78,27 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-04 — banded refresh: big reported latency win without MVS
+
+Full-screen requests are answered in one 700-880 ms block, which is what made a
+window raise feel stalled. Sub-region requests are answered promptly **as long
+as they are non-incremental**; incremental sub-region requests stall as soon as
+a band has no changes (the server does not reply at all).
+
+Measured with 8 horizontal bands on `mm.local`:
+
+| Scheme | First content | Full screen |
+|---|---|---|
+| one full request | 700–880 ms | 700–880 ms |
+| 8 bands, non-incremental | ~80 ms | ~400 ms |
+| 8 bands, incremental | stalls after 2–3 bands | — |
+
+`ss-gui` now sweeps non-incremental bands while input was seen in the last
+250 ms (observed: 204-row bands arriving **~35 ms apart**, whole screen in
+~180 ms), and falls back to cheap incremental full-screen polling when idle
+(41 small updates over 13 s idle, no bandwidth spike). `--bands N` overrides,
+`--bands 1` restores the old behaviour.
+
 ### 2026-11-03 — codec survey: MVS is the only fast path
 
 Full-screen update production time on `mm.local`: Raw 1590 ms, Zlib 880 ms,

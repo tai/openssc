@@ -265,6 +265,42 @@ fn main() -> Result<()> {
             let auto_w = if logical { width / 2 } else { width };
             let auto_h = if logical { height / 2 } else { height };
             let mut fb = vec![0u8; width as usize * height as usize * 4];
+            if let Some(nb) = get(&opts, "bands") {
+                let nb: usize = nb.parse()?;
+                let band_h = (height as usize + nb - 1) / nb;
+                let mut total = 0f64;
+                for i in 0..nb {
+                    let y = (i * band_h) as u16;
+                    let h = ((height as usize - y as usize).min(band_h)) as u16;
+                    let t0 = std::time::Instant::now();
+                    writer.send(&rfb_proto::framebuffer_update_request_rect(
+                        0, y, width, h, false,
+                    ))?;
+                    let upd = reader.read_update()?;
+                    let dt = t0.elapsed().as_secs_f64() * 1000.0;
+                    let bytes: usize = upd.rects.iter().map(|r| r.pixels.len()).sum();
+                    println!("band {i}/{nb} y={y} h={h}: {dt:.1} ms, {} rect(s), {bytes} bytes", upd.rects.len());
+                    total += dt;
+                }
+                println!("bands pass1 total {total:.1} ms");
+                let passes: usize = get(&opts, "passes").map(|v| v.parse()).transpose()?.unwrap_or(2);
+                for pass in 2..=passes {
+                    let mut tot = 0f64;
+                    for i in 0..nb {
+                        let y = (i * band_h) as u16;
+                        let h = ((height as usize - y as usize).min(band_h)) as u16;
+                        let t0 = std::time::Instant::now();
+                        writer.send(&rfb_proto::framebuffer_update_request_rect(0, y, width, h, false))?;
+                        let upd = reader.read_update()?;
+                        let dt = t0.elapsed().as_secs_f64() * 1000.0;
+                        let bytes: usize = upd.rects.iter().map(|r| r.pixels.len()).sum();
+                        println!("pass{pass} band {i}: {dt:.1} ms {bytes} bytes");
+                        tot += dt;
+                    }
+                    println!("pass{pass} total {tot:.1} ms");
+                }
+                return Ok(());
+            }
             if auto {
                 writer.send(&auto_framebuffer_update_custom(
                     auto_version,

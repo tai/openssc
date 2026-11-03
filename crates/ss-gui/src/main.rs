@@ -932,9 +932,10 @@ fn main() -> Result<()> {
     // Framebuffer requests kept in flight so a frame is already encoding while
     // we render the previous one (no request/response stall per frame).
     let mut pipeline: usize = 3;
-    // Banded requests: the server stops answering after a few sub-region
-    // requests on this build, so this stays off by default (--bands N).
-    let mut bands: usize = 1;
+    // Banded refresh: only *non-incremental* sub-region requests are answered
+    // reliably (incremental ones stall when a band has no changes). Sweeping
+    // bands during input turns one 700-880 ms full repaint into ~80 ms steps.
+    let mut bands: usize = 8;
     // Encoding experiment: 0 = raw, 16 = ZRLE, 6 = Zlib (default list).
     let mut encoding: Option<i32> = None;
     let mut ime = false;
@@ -1235,12 +1236,18 @@ fn main() -> Result<()> {
                         }
                         continue;
                     }
-                    if bands > 1 {
+                    if bands > 1 && input_is_hot() {
+                        // Progressive refresh: re-request the next band in full.
                         let (bx, by, bw, bh) = band_rect(next_band % bands);
                         next_band += 1;
                         let _ = tx_reader.send(
-                            rfb_proto::framebuffer_update_request_rect(bx, by, bw, bh, true),
+                            rfb_proto::framebuffer_update_request_rect(bx, by, bw, bh, false),
                         );
+                    } else if bands > 1 {
+                        // Idle: fall back to cheap incremental polling.
+                        thread::sleep(Duration::from_millis(16));
+                        let _ = tx_reader
+                            .send(framebuffer_update_request(fb_w, fb_h, true));
                     } else if pipeline > 1 {
                         // Keep the pipe full: one new request per update.
                         let _ = tx_reader

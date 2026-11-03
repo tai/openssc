@@ -110,6 +110,11 @@ headless dump completes in ~1.3–1.6 s in an optimized debug build.
   enough to leave running. See `docs/protocol/clipboard.md`. When checking the
   remote pasteboard use `osascript -e "the clipboard as text"` rather than
   `pbpaste`, which cannot resolve promise items.
+- **Banded refresh.** While you are interacting, the GUI re-requests the screen
+  in 8 horizontal bands instead of one full frame. The server answers a full
+  frame in one 700–880 ms block but answers 200-row bands in ~35 ms each, so a
+  window raise now paints progressively in ~180 ms. Idle behaviour is unchanged
+  (cheap incremental polling). Tune with `--bands N`; `--bands 1` disables it.
 - Pinch and rotate send a full gesture series (`begin → change, mask 31 → end`)
   because a lone `phase 2` frame is ignored by macOS, and two-finger pan is
   routed through the same verified scroll path as the wheel.
