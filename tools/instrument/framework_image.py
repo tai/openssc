@@ -26,7 +26,14 @@ def load() -> None:
     ctypes.CDLL(FRAMEWORK, mode=ctypes.RTLD_GLOBAL)
 
 
-def image_header() -> int:
+def image_slide(index: int) -> int:
+    dyld = ctypes.CDLL(None)
+    dyld._dyld_get_image_vmaddr_slide.restype = ctypes.c_long
+    dyld._dyld_get_image_vmaddr_slide.argtypes = [ctypes.c_uint32]
+    return dyld._dyld_get_image_vmaddr_slide(index) & 0xFFFF_FFFF_FFFF_FFFF
+
+
+def image_index() -> int:
     dyld = ctypes.CDLL(None)
     dyld._dyld_image_count.restype = ctypes.c_uint32
     dyld._dyld_get_image_name.restype = ctypes.c_char_p
@@ -36,8 +43,15 @@ def image_header() -> int:
     for i in range(dyld._dyld_image_count()):
         name = dyld._dyld_get_image_name(i) or b""
         if b"ScreenSharing.framework" in name and b"/ScreenSharing" in name:
-            return dyld._dyld_get_image_header(i)
+            return i
     raise SystemExit("ScreenSharing.framework image not found")
+
+
+def image_header() -> int:
+    dyld = ctypes.CDLL(None)
+    dyld._dyld_get_image_header.restype = ctypes.c_void_p
+    dyld._dyld_get_image_header.argtypes = [ctypes.c_uint32]
+    return dyld._dyld_get_image_header(image_index())
 
 
 def cstr(buf: bytes) -> str:
@@ -79,8 +93,10 @@ def main() -> int:
 
     load()
     base = image_header()
-    print(f"image header @ 0x{base:x}")
-    segs = segments(base)
+    slide = image_slide(image_index())
+    print(f"image header @ 0x{base:x} (slide 0x{slide:x})")
+    segs = [(n, v + slide, sz, [(a, b, c + slide, d) for a, b, c, d in sects])
+            for n, v, sz, sects in segments(base)]
 
     if args.list:
         for segname, vmaddr, vmsize, sects in segs:
