@@ -8,8 +8,8 @@ use anyhow::Result;
 use gesture_input::{Gesture, Phase};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
-    gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_scroll, gesture_smart_magnify,
-    gesture_swipe, key_event, pasteboard_text, pointer_event, AppleSession, Update,
+    gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
+    key_event, pasteboard_text, pointer_event, AppleSession, Update,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -240,6 +240,7 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
     out
 }
 
+#[allow(dead_code)]
 fn touch_phase(phase: TouchPhase) -> u32 {
     match phase {
         TouchPhase::Started => 1,
@@ -288,6 +289,13 @@ struct App {
     deadline: Option<Instant>,
     /// Sub-line scroll remainder, so small pixel deltas still accumulate.
     scroll_acc: (f32, f32),
+    /// Open pinch/rotate gesture and when it last saw input.
+    pinch_active: bool,
+    pinch_last: Option<Instant>,
+    rotate_active: bool,
+    rotate_last: Option<Instant>,
+    pinch_x: u16,
+    pinch_y: u16,
 }
 
 impl App {
@@ -344,6 +352,12 @@ impl App {
             focused_once: false,
             deadline,
             scroll_acc: (0.0, 0.0),
+            pinch_active: false,
+            pinch_last: None,
+            rotate_active: false,
+            rotate_last: None,
+            pinch_x: 0,
+            pinch_y: 0,
         })
     }
 
@@ -662,29 +676,35 @@ impl ApplicationHandler<UserEvent> for App {
                 self.queue_scroll(dx, dy);
             }
             WindowEvent::PinchGesture { delta, .. } => {
+                // VERIFIED shape: begin(1) -> change(2) with mask 31 -> end(4).
                 let (x, y) = self.cursor;
-                self.send(gesture_magnify(delta, 2, 0, x, y));
+                self.pinch_x = x;
+                self.pinch_y = y;
+                if !self.pinch_active {
+                    self.send(gesture_magnify(0.0, 1, 31, x, y));
+                    self.pinch_active = true;
+                }
+                self.send(gesture_magnify(delta, 2, 31, x, y));
+                self.pinch_last = Some(Instant::now());
             }
             WindowEvent::RotationGesture { delta, .. } => {
                 let (x, y) = self.cursor;
-                self.send(gesture_rotate(delta as f64, 2, 0, x, y));
+                self.pinch_x = x;
+                self.pinch_y = y;
+                if !self.rotate_active {
+                    self.send(gesture_rotate(0.0, 1, 31, x, y));
+                    self.rotate_active = true;
+                }
+                self.send(gesture_rotate(delta as f64, 2, 31, x, y));
+                self.rotate_last = Some(Instant::now());
             }
             WindowEvent::DoubleTapGesture { .. } => {
                 let (x, y) = self.cursor;
                 self.send(gesture_smart_magnify(x, y));
             }
-            WindowEvent::PanGesture { delta, phase, .. } => {
-                let (x, y) = self.cursor;
-                self.send(gesture_scroll(
-                    delta.x,
-                    delta.y,
-                    0.0,
-                    1,
-                    touch_phase(phase),
-                    0,
-                    x,
-                    y,
-                ));
+            WindowEvent::PanGesture { delta, .. } => {
+                // Two-finger pan is scrolling: use the verified subtype 11.
+                self.queue_scroll(delta.x / 60.0, delta.y / 60.0);
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -771,6 +791,18 @@ impl ApplicationHandler<UserEvent> for App {
             self.focused_once = true;
         }
         self.flush_pointer(false);
+        if self.pinch_active
+            && self.pinch_last.map_or(true, |t| t.elapsed() > Duration::from_millis(150))
+        {
+            self.send(gesture_magnify(0.0, 4, 31, self.pinch_x, self.pinch_y));
+            self.pinch_active = false;
+        }
+        if self.rotate_active
+            && self.rotate_last.map_or(true, |t| t.elapsed() > Duration::from_millis(150))
+        {
+            self.send(gesture_rotate(0.0, 4, 31, self.pinch_x, self.pinch_y));
+            self.rotate_active = false;
+        }
         let mut got_pixels = false;
         while let Ok(update) = self.rx.try_recv() {
             let had_pixels = update.rects.iter().any(|r| !r.pixels.is_empty());
@@ -837,7 +869,10 @@ fn main() -> Result<()> {
     let mut exit_after_dump = false;
     let mut scale = 1.0f64;
     let mut debug_input = false;
-    let mut clipboard = true;
+    // Off by default until the fetch round-trip is proven stable; the 0x0b
+    // ClipboardFetch makes this server build close the viewer right after it
+    // answers (observed "going to close 5").
+    let mut clipboard = false;
     // Writing the clipboard needs AutoPasteboard, which puts the server into
     // promise mode and stops it sending real remote clipboard data.
     let mut clipboard_send = false;
@@ -891,8 +926,13 @@ fn main() -> Result<()> {
                 clipboard = false;
                 i += 1;
             }
+            "--clipboard" => {
+                clipboard = true;
+                i += 1;
+            }
             "--send-clipboard" => {
                 clipboard_send = true;
+                clipboard = true;
                 i += 1;
             }
             "--ime" => {

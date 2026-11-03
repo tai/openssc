@@ -203,7 +203,11 @@ fn main() -> Result<()> {
                     writer.send(&clipboard_fetch())?;
                     next_fetch = std::time::Instant::now() + Duration::from_millis(250);
                 }
-                writer.send(&framebuffer_update_request(fw, fh, true))?;
+                if !opts.contains_key("quiet") {
+                    writer.send(&framebuffer_update_request(fw, fh, true))?;
+                } else {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
                 match reader.read_update() {
                     Ok(update) => {
                         if update.clipboard_changed {

@@ -73,12 +73,22 @@ it". Verified both ways:
 
 Consequences for the client:
 
-- `ss-gui` default = **read mode**: no AutoPasteboard, fetch on connect, apply
-  the decoded text to the local clipboard.
+- `ss-gui --clipboard` = **read mode**: no AutoPasteboard, fetch on connect,
+  apply the decoded text to the local clipboard. Off by default: see §3.1.
 - `ss-gui --send-clipboard` = **write mode**: AutoPasteboard(1) at connect, push
   local clipboard changes with `0x06`. Remote→local reads are disabled in this
   mode on purpose, because they would only ever yield promises.
 - Both directions at once on a single connection is an **open question** (§4).
+
+### 3.1 The fetch closes the viewer (open bug)
+
+`0x0b ClipboardFetch` gets a correct answer — the server logs
+`HandleViewerClipboardRequest`, `uncompressed size 96 pasteboardDataCnt 87` —
+and then closes the session ~13 ms later (`closing 0`, `going to close 5`).
+The client sees `failed to fill whole buffer`. Requesting frames after the
+fetch does not prevent it, and issuing no framebuffer requests at all makes the
+answer never arrive. Until this is understood, `ss-gui` leaves clipboard sync
+off and exposes it only through `--clipboard` / `--send-clipboard`.
 
 ## 4. Open questions
 

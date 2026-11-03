@@ -880,6 +880,8 @@ pub struct SessionReader {
     pending_clipboard: Vec<ClipboardSend>,
     /// Set when the server reports the remote pasteboard changed.
     clipboard_changed: bool,
+    /// Leftover bytes from a partially consumed record.
+    pending: Vec<u8>,
 }
 
 pub struct SessionWriter {
@@ -906,6 +908,7 @@ impl AppleSession {
                 debug_control: self.debug_control,
                 pending_clipboard: Vec::new(),
                 clipboard_changed: false,
+                pending: Vec::new(),
             },
             SessionWriter {
                 stream: writer_stream,
@@ -990,11 +993,20 @@ impl SessionReader {
     /// record-layer records). Control messages collected along the way are
     /// returned in `Update::clipboard`.
     pub fn read_update(&mut self) -> Result<Update> {
-        let mut pending: Vec<u8> = Vec::new();
+        // `pending` must survive across calls: one record can carry a control
+        // message and the start of a FramebufferUpdate, and returning early
+        // for the control message must not discard the remaining bytes.
+        let mut pending = std::mem::take(&mut self.pending);
+        let result = self.read_update_inner(&mut pending);
+        self.pending = pending;
+        result
+    }
+
+    fn read_update_inner(&mut self, pending: &mut Vec<u8>) -> Result<Update> {
         loop {
-            self.ensure(&mut pending, 4)?;
+            self.ensure(pending, 4)?;
             if pending[0] != 0 {
-                self.skip_control(&mut pending)?;
+                self.skip_control(pending)?;
                 if !self.pending_clipboard.is_empty() || self.clipboard_changed {
                     return Ok(Update {
                         rects: Vec::new(),
@@ -1011,7 +1023,7 @@ impl SessionReader {
             }
             let mut rects = Vec::with_capacity(nrects as usize);
             for _ in 0..nrects {
-                self.ensure(&mut pending, 12)?;
+                self.ensure(pending, 12)?;
                 let x = be16(&pending[0..2]);
                 let y = be16(&pending[2..4]);
                 let w = be16(&pending[4..6]);
@@ -1020,15 +1032,15 @@ impl SessionReader {
                 match enc {
                     0 => {
                         let n = w as usize * h as usize * 4;
-                        self.ensure(&mut pending, 12 + n)?;
+                        self.ensure(pending, 12 + n)?;
                         let pixels = pending[12..12 + n].to_vec();
                         pending.drain(..12 + n);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels });
                     }
                     6 => {
-                        self.ensure(&mut pending, 16)?;
+                        self.ensure(pending, 16)?;
                         let clen = be32(&pending[12..16]) as usize;
-                        self.ensure(&mut pending, 16 + clen)?;
+                        self.ensure(pending, 16 + clen)?;
                         let z = &pending[16..16 + clen];
                         let expected = w as usize * h as usize * 4;
                         let before = self.zlib.total_out();
@@ -1044,16 +1056,16 @@ impl SessionReader {
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: out });
                     }
                     0x450 => {
-                        self.ensure(&mut pending, 20)?;
+                        self.ensure(pending, 20)?;
                         let clen = be32(&pending[16..20]) as usize;
-                        self.ensure(&mut pending, 20 + clen)?;
+                        self.ensure(pending, 20 + clen)?;
                         pending.drain(..20 + clen);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: Vec::new() });
                     }
                     0x451 | 0x453 => {
-                        self.ensure(&mut pending, 14)?;
+                        self.ensure(pending, 14)?;
                         let plen = be16(&pending[12..14]) as usize;
-                        self.ensure(&mut pending, 14 + plen)?;
+                        self.ensure(pending, 14 + plen)?;
                         pending.drain(..14 + plen);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: Vec::new() });
                     }

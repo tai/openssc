@@ -83,9 +83,11 @@
 Remote→local and local→remote text sync both work, via `0x0b ClipboardFetch`
 (no AutoPasteboard) for reads and `0x06 ClientCutText` + `0x15
 AutoPasteboard(1)` for writes. Enabling AutoPasteboard puts the session into
-*promise* mode, so the two directions cannot currently share one connection;
-`ss-gui` defaults to read mode and offers `--send-clipboard` for write mode.
-Full framing in `docs/protocol/clipboard.md`.
+*promise* mode, so the two directions cannot share one connection; and this
+server build closes the viewer right after answering a fetch
+(`going to close 5`). Clipboard is therefore opt-in (`--clipboard` /
+`--send-clipboard`) and off by default. Full framing in
+`docs/protocol/clipboard.md`.
 
 ### Verified 2026-11-03 — two-finger scroll
 
