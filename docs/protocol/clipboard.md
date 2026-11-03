@@ -85,10 +85,20 @@ Consequences for the client:
 `0x0b ClipboardFetch` gets a correct answer — the server logs
 `HandleViewerClipboardRequest`, `uncompressed size 96 pasteboardDataCnt 87` —
 and then closes the session ~13 ms later (`closing 0`, `going to close 5`).
-The client sees `failed to fill whole buffer`. Requesting frames after the
-fetch does not prevent it, and issuing no framebuffer requests at all makes the
-answer never arrive. Until this is understood, `ss-gui` leaves clipboard sync
-off and exposes it only through `--clipboard` / `--send-clipboard`.
+The client sees `failed to fill whole buffer`.
+
+What we ruled out:
+
+- **Padding the fetch.** Sending `0x0b` padded to 1/4/8/12 bytes behaves
+  identically. Zero padding is actively harmful: the server then reads `0x00`
+  as SetPixelFormat and logs `bitsperpixel 1 … Only 16 or 32 bit pixels
+  supported`, `viewer result -2`, `going to close 9`.
+- **Pacing.** Issuing no framebuffer requests at all means the answer never
+  arrives (the reply seems to be piggybacked on framebuffer traffic), so the
+  close cannot be avoided by idling.
+
+Until the request framing is recovered, `ss-gui` leaves clipboard sync off and
+exposes it only through `--clipboard` / `--send-clipboard`.
 
 ## 4. Open questions
 

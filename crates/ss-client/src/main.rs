@@ -200,7 +200,10 @@ fn main() -> Result<()> {
             let mut next_fetch = std::time::Instant::now();
             while std::time::Instant::now() < deadline {
                 if poll_fetch && std::time::Instant::now() >= next_fetch {
-                    writer.send(&clipboard_fetch())?;
+                    let mut f = clipboard_fetch();
+                    let want: usize = num(&opts, "fetch-len", 1usize);
+                    f.resize(want, 0);
+                    writer.send(&f)?;
                     next_fetch = std::time::Instant::now() + Duration::from_millis(250);
                 }
                 if !opts.contains_key("quiet") {
@@ -266,6 +269,9 @@ fn main() -> Result<()> {
                 ))?;
             }
             writer.send(&framebuffer_update_request(width, height, false))?;
+            if opts.contains_key("move") {
+                writer.send(&pointer_event(0, 300, 300))?;
+            }
             let frames: u32 = num(&opts, "frames", 3u32);
             for i in 0..frames {
                 let update = reader.read_update()?;

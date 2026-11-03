@@ -906,6 +906,8 @@ fn main() -> Result<()> {
     // Writing the clipboard needs AutoPasteboard, which puts the server into
     // promise mode and stops it sending real remote clipboard data.
     let mut clipboard_send = false;
+    // Experimental: server-pushed dirty rectangles instead of polling.
+    let mut auto_updates = false;
     let mut ime = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -954,6 +956,10 @@ fn main() -> Result<()> {
             }
             "--no-clipboard" => {
                 clipboard = false;
+                i += 1;
+            }
+            "--auto" => {
+                auto_updates = true;
                 i += 1;
             }
             "--clipboard" => {
@@ -1031,9 +1037,14 @@ fn main() -> Result<()> {
         }
     }
 
+    let debug_writer = debug_input;
     thread::spawn(move || {
         let mut writer = writer;
         while let Ok(body) = rx_out.recv() {
+            if debug_writer && body.first() != Some(&0) {
+                let shown = body.len().min(20);
+                eprintln!("send type=0x{:02x} len={} {:02x?}", body[0], body.len(), &body[..shown]);
+            }
             if let Err(e) = writer.send(&body) {
                 eprintln!("write error: {e:#}");
                 break;
@@ -1079,6 +1090,11 @@ fn main() -> Result<()> {
     let debug_reader = debug_input;
     thread::spawn(move || {
         let mut reader = reader;
+        // Order matters: arm server-push first, then send the initial
+        // non-incremental request (this is the sequence that free-runs).
+        if auto_updates {
+            let _ = tx_reader.send(rfb_proto::auto_framebuffer_update(fb_w, fb_h));
+        }
         let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
         let clip_wanted = clipboard && !clipboard_send;
         if clip_wanted {
@@ -1115,6 +1131,7 @@ fn main() -> Result<()> {
                             .collect();
                         eprintln!("update rects={desc:?}");
                     }
+                    let layout = update.rects.iter().any(|r| r.encoding == 0x451);
                     if tx_upd.send(update).is_err() {
                         break;
                     }
@@ -1122,6 +1139,19 @@ fn main() -> Result<()> {
                     // This server build does not reliably free-run after the
                     // first auto frame. Poll with the *scaled* geometry so
                     // post-input dirty rectangles are always delivered.
+                    if auto_updates {
+                        // Server-push mode. The stream drains on a display
+                        // layout change; re-arm 0x09 *and* a non-incremental
+                        // 0x03 exactly like the native client.
+                        if layout {
+                            let _ = tx_reader
+                                .send(rfb_proto::auto_framebuffer_update(fb_w, fb_h));
+                            let _ = tx_reader.send(framebuffer_update_request(
+                                fb_w, fb_h, false,
+                            ));
+                        }
+                        continue;
+                    }
                     let idle_ms = if input_is_hot() { 4 } else { 16 };
                     thread::sleep(Duration::from_millis(idle_ms));
                     let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));

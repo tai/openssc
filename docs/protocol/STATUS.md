@@ -78,6 +78,22 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-03 — stability and smoothness pass
+
+- **5-minute continuous session, zero read errors** (683 framebuffer updates,
+  polling at the idle cadence). No keepalive message is required by the client
+  for at least this long; `0x14 cmd=12` heartbeats are simply skipped.
+- The GUI polls every **4 ms while input was seen in the last 250 ms** and
+  every 16 ms when idle, cutting the input→frame round trip during scrolling
+  without raising idle traffic.
+- `--auto` (server push, `0x09`) still free-runs from `ss-client stream --auto`
+  (30-frame run, small dirty tiles, no polling) but **stalls after the initial
+  burst in `ss-gui`** even though the GUI sends the byte-identical sequence.
+  Root cause unknown; polling remains the shipping path.
+- Subtype-11 offsets corrected: two 4-byte words sit at `+0x1a` and `+0x2a`.
+  With the corrected layout, `pointDelta*` and `fixedDelta*` (16.16) still do
+  not scroll, so the wire format is line-granular.
+
 ### Verified 2026-11-03 — text clipboard
 
 Remote→local and local→remote text sync both work, via `0x0b ClipboardFetch`
