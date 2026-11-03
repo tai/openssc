@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=ss-clone
+Comment=Apple Screen Sharing client (RFB 003.889 + Apple gestures)
+Exec=sh -c 'SS_HOST=${SS_HOST:-mm.local}; exec ss-gui --host "$SS_HOST"'
+Icon=computer
+Terminal=false
+Categories=Network;RemoteAccess;
+StartupWMClass=ss-gui

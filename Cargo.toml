@@ -1,0 +1,33 @@
+[workspace]
+members = ["crates/rfb-proto", "crates/ss-client", "crates/ss-gui", "crates/gesture-input"]
+resolver = "2"
+
+[workspace.package]
+edition = "2021"
+version = "0.1.0"
+license = "MIT"
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.dev.package.rfb-proto]
+opt-level = 3
+
+[profile.dev.package.flate2]
+opt-level = 3
+
+[profile.dev.package.miniz_oxide]
+opt-level = 3
+
+[profile.dev.package.aes]
+opt-level = 3
+
+[profile.dev.package.sha1]
+opt-level = 3
+
+[profile.release]
+lto = "thin"
+codegen-units = 1

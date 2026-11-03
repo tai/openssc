@@ -1,0 +1,10 @@
+[package]
+name = "ss-client"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow = "1"
+png = "0.17"
+rfb-proto = { path = "../rfb-proto" }
