@@ -174,11 +174,65 @@ the first non-zero use a second 3-bit code path. This is a custom (not JPEG)
 run-length scheme fused with the escape table, and it is the remaining piece
 that must be reproduced exactly.
 
-Next: either finish the loop above, or — cheaper — extract the *client's*
-Huffman tables from `ScreenSharing.framework` in the dyld shared cache. The
-framework loads via `dlopen`, so its Mach-O header can be reached with
-`_dyld_get_image_header`, then `__DATA`/`__CONST` scanned for a
-`(bits[16], values[…])` pair, which is the usual shape of such tables.
+### 2.5 Command stream — framing VERIFIED (2026-11-04)
+
+The command writer (`0x100041e89`) keeps, per viewer, the *last code*
+(`+2366`) and a run counter (`+2368`):
+
+```
+if (code == last_code)  count++;
+else {
+    if (count != 0) { write_repeat(count); write_3bits(code); count = 0; }
+    else            { write_4bits(code); }        // only the very first command
+    last_code = code;
+}
+```
+
+so the stream is `code, payload, repeat, code, payload, repeat, …`, i.e. each
+run's length is emitted just before the next code. Only the **first** code is
+4 bits wide; every later code is 3 bits.
+
+`write_repeat` (`0x10003fe11`):
+
+```
+n <= 15 : 5 bits, value 0x10 | (n-1)        // 16..30
+n >  15 : 5 bits, value 0x1f, then base-128 varint of (n-16)
+          (8 bits per group; high bit 0x80 = continuation)
+```
+
+Payload widths recovered so far: **Solid = 24 bits**, **Cache6 = 16 bits**
+(tile-cache index), Skip / MatchPrevious / MatchAbove / Cache7 = 0 bits,
+TwoColor presumed 8-byte mask + two 24-bit colours, **DCT = variable** (see
+below). Verified by parsing a real 2560×1600 frame: the first command is
+Solid with a **216-tile run**, followed by a DCT exactly where expected.
+
+**DCT payloads are inline in the same stream** (stream A): the coefficient
+coder writes luma coefficients to it and chroma to the second stream, which
+begins at `data_off`. That is why a command parse desynchronises at the first
+DCT unless the coefficient coder is implemented.
+
+### 2.6 Coefficient VLC table — recovered
+
+The coefficient writer (`0x10003cc71`) looks up `magnitude (1..63)` in a static
+**256-entry `u32` table at `0x100085b90`**: the top 4 bits are the code length,
+the rest the code, and the low bit of the code carries the sign.
+
+| magnitude | bits | code |
+|---|---|---|
+| 1 | 4 | 0x8 |
+| 2 | 4 | 0xa |
+| 3–6 | 6 | 0x30,0x32,0x34,0x36 |
+| 7–14 | 8 | 0xe0…0xee (step 2) |
+| 15–22 | 9 | 0x1e0… |
+| … | 10,11,12,13,14 bits ×8 each | |
+| | 15 bits ×1 | |
+
+Larger magnitudes use an escape (`0x10003cd26`): 8-bit groups with a
+continuation bit.
+
+Next: implement the coefficient coder (stream A luma, stream B chroma) so DCT
+tiles can be skipped/decoded, then validate a full frame against
+`screencapture`.
 
 ## 3. Repro
 
