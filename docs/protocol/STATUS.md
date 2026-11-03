@@ -78,6 +78,20 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-03 — codec survey: MVS is the only fast path
+
+Full-screen update production time on `mm.local`: Raw 1590 ms, Zlib 880 ms,
+`0x3ea`/`0x3e9`/`0x3e8` all ~700 ms (33 KB and 632 KB payloads take the same
+time, so the cost is per-pixel conversion, not compression), **MVS `0x3f3`
+60 ms**. MVS is GPU-encoded by the server and is 12x faster; the deflate tiers
+only reduce bandwidth.
+
+Implemented meanwhile: `0x3ea` (RGB555 **big-endian**, verified pixel-exact
+against `screencapture`), `0x3e8`/`0x3e9` passthrough, and a 0x3f3 container
+parser that captures MVS bodies for analysis. MVS container layout and the
+quantisation-table message are verified; the tile bitstream (command codes,
+field order, LSB/MSB) is still open. See `docs/protocol/codecs.md`.
+
 ### 2026-11-03 — why a window raise takes ~500 ms
 
 The user's sharpest observation: raising a window is instant on the real

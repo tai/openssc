@@ -251,6 +251,11 @@ fn main() -> Result<()> {
                 println!("requested scale {scale}");
             }
             let (mut reader, mut writer) = session.split()?;
+            if let Some(enc) = get(&opts, "encoding") {
+                let enc: i32 = enc.parse()?;
+                writer.send(&rfb_proto::set_encodings(&[enc]))?;
+                println!("advertised encoding {enc} only");
+            }
             let width = reader.info.width;
             let height = reader.info.height;
             let logical = opts.contains_key("logical");
@@ -282,6 +287,16 @@ fn main() -> Result<()> {
                     .map(|r| (r.x, r.y, r.w, r.h, r.encoding, r.pixels.len()))
                     .collect();
                 println!("frame {}/{}: {} rect(s) {:?}", i + 1, frames, update.rects.len(), desc);
+                if let Some(r) = update.rects.iter().find(|r| matches!(r.encoding, 0x3e8 | 0x3e9 | 0x3ea)) {
+                    let path = format!("artifacts/tier-{}-{}.bin", i + 1, r.encoding);
+                    let _ = std::fs::write(&path, &r.pixels);
+                    println!("  saved {path} ({} bytes, {}x{})", r.pixels.len(), r.w, r.h);
+                }
+                if let Some(r) = update.rects.iter().find(|r| r.encoding == 0x3f3) {
+                    let path = format!("artifacts/mvs-{}.bin", i + 1);
+                    let _ = std::fs::write(&path, &r.pixels);
+                    println!("  wrote {path} ({} bytes, {}x{})", r.pixels.len(), r.w, r.h);
+                }
                 let layout = update.rects.iter().any(|r| r.encoding == 0x451);
                 if auto && layout {
                     writer.send(&auto_framebuffer_update_custom(

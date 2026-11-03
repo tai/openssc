@@ -25,6 +25,7 @@ This repository contains:
 | Gesture message 0x17 | ✅ wire format verified; **magnify and two-finger scroll verified live**; swipe calibration ongoing |
 | Live window (winit + softbuffer) | ✅ built, macOS-tested; Wayland build pending |
 | Linux evdev gesture backend | ✅ implemented + type-checked; hardware test pending |
+| Apple codecs | ✅ `0x3ea` RGB555 pixel-exact; MVS `0x3f3` 12× faster, decoder in progress |
 | Clipboard (text) | ✅ both directions verified, but opt-in: the fetch currently closes the viewer |
 | Audio / MultiVariant | 🚧 later |
 

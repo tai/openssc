@@ -894,6 +894,9 @@ pub struct SessionReader {
     clipboard_changed: bool,
     /// Leftover bytes from a partially consumed record.
     pending: Vec<u8>,
+    /// Persistent zlib stream for the 0x3ea (RGB555) codec: the server keeps
+    /// one stream across rectangles, exactly like 0x06.
+    tier_zlib: Option<flate2::Decompress>,
 }
 
 pub struct SessionWriter {
@@ -921,6 +924,7 @@ impl AppleSession {
                 pending_clipboard: Vec::new(),
                 clipboard_changed: false,
                 pending: Vec::new(),
+                tier_zlib: None,
             },
             SessionWriter {
                 stream: writer_stream,
@@ -1073,6 +1077,85 @@ impl SessionReader {
                         }
                         pending.drain(..16 + clen);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: out });
+                    }
+                    // Apple quality tiers: same deflate framing as 0x06 but
+                    // with cheaper pre-processing / deflate level.
+                    //   0x3e8 4-bit/16 colours, 0x3e9 8-bit YCoCg, 0x3ea RGB565
+                    0x3ea => {
+                        self.ensure(pending, 16)?;
+                        let clen = be32(&pending[12..16]) as usize;
+                        self.ensure(pending, 16 + clen)?;
+                        let payload = &pending[16..16 + clen];
+                        // Persistent Z_SYNC_FLUSH stream across rectangles.
+                        let npx = w as usize * h as usize;
+                        let want = npx * 2;
+                        let mut raw = vec![0u8; want + 64];
+                        let mut got = 0usize;
+                        for attempt in 0..2 {
+                            let dec = self
+                                .tier_zlib
+                                .get_or_insert_with(|| flate2::Decompress::new(true));
+                            let before = dec.total_out();
+                            let res = dec.decompress(
+                                payload,
+                                &mut raw[..],
+                                flate2::FlushDecompress::Sync,
+                            );
+                            got = (dec.total_out() - before) as usize;
+                            if res.is_ok() && got >= want {
+                                break;
+                            }
+                            if attempt == 0 {
+                                // The server may have restarted the stream;
+                                // retry this rectangle from a fresh state.
+                                self.tier_zlib = Some(flate2::Decompress::new(true));
+                                raw.fill(0);
+                            } else {
+                                bail!(
+                                    "0x3ea rect {}x{}+{}+{} failed after reset ({:?}, {got}/{want} bytes)",
+                                    w, h, x, y, res
+                                );
+                            }
+                        }
+                        if got < want {
+                            bail!("0x3ea rect decoded {got} bytes, expected {want}");
+                        }
+                        // RGB555, big-endian words (bit 15 unused). Verified
+                        // against a reference capture: white = 0x7fdf,
+                        // (255,95,87) red = 0x7d8b, (85,19,125) purple =
+                        // 0x284f. NOT 5-6-5 as the notes claimed.
+                        let mut px = vec![0u8; npx * 4];
+                        for (i, out) in px.chunks_exact_mut(4).enumerate() {
+                            let v = u16::from_be_bytes([raw[i * 2], raw[i * 2 + 1]]);
+                            let r = ((v >> 10) & 0x1f) as u8;
+                            let g = ((v >> 5) & 0x1f) as u8;
+                            let b = (v & 0x1f) as u8;
+                            out[0] = (b << 3) | (b >> 2);
+                            out[1] = (g << 3) | (g >> 2);
+                            out[2] = (r << 3) | (r >> 2);
+                            out[3] = 0;
+                        }
+                        pending.drain(..16 + clen);
+                        rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: px });
+                    }
+                    0x3e8 | 0x3e9 => {
+                        self.ensure(pending, 16)?;
+                        let clen = be32(&pending[12..16]) as usize;
+                        self.ensure(pending, 16 + clen)?;
+                        let payload = pending[16..16 + clen].to_vec();
+                        pending.drain(..16 + clen);
+                        rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: payload });
+                    }
+                    0x3f3 => {
+                        // Multi-Variant Scaled (MVS): u32 body length, then a
+                        // self-described tile codec body. Keep it raw here; the
+                        // GUI/CLI layer decides what to do with it.
+                        self.ensure(pending, 16)?;
+                        let n = be32(&pending[12..16]) as usize;
+                        self.ensure(pending, 16 + n)?;
+                        let body = pending[16..16 + n].to_vec();
+                        pending.drain(..16 + n);
+                        rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: body });
                     }
                     0x450 => {
                         self.ensure(pending, 20)?;
