@@ -93,9 +93,30 @@ What has been established empirically:
 - our captured full frame does **not** end with `6d 76 73`, so either the
   marker applies to a different stream shape or this build omits it.
 
-Next step is to disassemble the encoder (`EncodeMVS`/`EncodePartialUpdateMVS`)
-in the lab build of `screensharingd` rather than guessing field order, then port
-the decoder into `rfb-proto` and validate against a `screencapture` reference.
+### 2.3 Encoder map (lab build, macOS 12 `screensharingd` 3.9.8)
+
+The daemon is stripped, so entry points were recovered from RIP-relative
+references to its own `__cstring` symbols. Working copy:
+`artifacts/bin/screensharingd` (universal), x86_64 slice
+`artifacts/bin/ssd-x86`, full listing `artifacts/bin/ssd.asm`, and focused
+extracts in `artifacts/bin/{MVSSetup,EncodePartialUpdateMVS,EncodeMVS}.asm`.
+
+| Address | Role |
+|---|---|
+| `0x10002080c` | `cmpl $1011, 140(%r13)` — encoding dispatch, calls the MVS setup on match |
+| `0x10003b128` | MVS setup: logs `reset the multi variant info`, `AllocateMultiVariantCodecMemoryBuffers` |
+| `0x10003b539` | `EncodePartialUpdateMVS` (string ref at `0x10003c2f1`) |
+| `0x10003d0f7` | `EncodeMVS` (string ref at `0x10003e796`) |
+| `0x10003d0a7` | codec selection: logs `higher quality DCT codec`, `DetermineEncodingParameters` |
+| `0x10001b56a` | reference to `DCTHuffmanEncodePartialUpdate` |
+
+Tooling: `lipo -thin x86_64`, `otool -l` for `__TEXT` (`vmaddr 0x100000000`,
+`fileoff 0`, so file offset == vmaddr − 0x100000000), `objdump -d`, then scan
+for `leaq disp(%rip)` whose target lands on a known string address.
+
+Next: walk `EncodePartialUpdateMVS` for the header writes and the
+`BitWriteStoreBits` accumulator, recover the Huffman code tables, then port the
+decoder into `rfb-proto` and validate against a `screencapture` reference.
 
 ## 3. Repro
 
