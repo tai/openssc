@@ -115,6 +115,9 @@ fn named_keysym(key: &NamedKey) -> Option<u32> {
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+/// Framebuffer row of the last click, so the band containing it is requested
+/// first. `u32::MAX` means "no pending focus".
+static FOCUS_Y: AtomicU64 = AtomicU64::new(u64::MAX);
 static READER_UPDATES: AtomicU64 = AtomicU64::new(0);
 static READER_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
 
@@ -680,6 +683,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::MouseInput { state, button, .. } => {
                 note_input();
+                if state == ElementState::Pressed {
+                    FOCUS_Y.store(self.cursor.1 as u64, Ordering::Relaxed);
+                }
                 if self.debug_input {
                     eprintln!("mouse {button:?} {state:?}");
                 }
@@ -1238,6 +1244,10 @@ fn main() -> Result<()> {
                     }
                     if bands > 1 && input_is_hot() {
                         // Progressive refresh: re-request the next band in full.
+                        let focus = FOCUS_Y.swap(u64::MAX, Ordering::Relaxed);
+                        if focus != u64::MAX {
+                            next_band = (focus as usize / band_h).min(bands - 1);
+                        }
                         let (bx, by, bw, bh) = band_rect(next_band % bands);
                         next_band += 1;
                         let _ = tx_reader.send(
