@@ -78,6 +78,35 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-03 — mirror latency measurements (the real bottleneck)
+
+User observation: the remote monitor reacts instantly while the mirrored image
+lags, so input delivery is fine and the framebuffer path is at fault. Measured
+on a 2560x1600 host with a remote terminal printing continuously:
+
+| Configuration | Updates in 4–5 s | Notes |
+|---|---|---|
+| polling, pipeline 1 | 82 / 5 s (~16 fps) | old default |
+| polling, pipeline 3 | 104 / 5 s (~21 fps) | **new default** |
+| polling, pipeline 8 | 77 / 4 s (~19 fps) | throughput plateau |
+| Zlib only (6) | 90 / 4 s | best of the encodings |
+| Raw only (0) | 18 / 4 s | far worse on the wire |
+| ZRLE only (16) | 0 | server ignores/produces nothing |
+| `--scale 0.5` | 0 pixel updates | scaled mode still stalls after the first frame |
+| `--bands 8` | 0 | server stops answering sub-region requests |
+
+Client render cost was a second, independent problem: `draw()` took **15–28 ms**
+per frame because the framebuffer was byte-addressed and the window
+(2560x1548) never matched the framebuffer 1:1, so every frame went through the
+per-pixel scalar scaling loop. Rewritten to a `Vec<u32>` framebuffer with a
+row-`memcpy` fast path and `opt-level = 3` for `ss-gui`: **~6–7 ms**, i.e. the
+copy is now memory-bandwidth bound rather than interpreter bound.
+
+Conclusion: with Zlib at full resolution the server's per-request screen scan
+and encode cap the mirror at roughly 20 fps; pipeline depth no longer helps.
+The remaining route to SS.app-like smoothness is **MultiVariant** (tiles, far
+less data per update) or making `AutoFrameBufferUpdate` work from the GUI.
+
 ### 2026-11-03 — stability and smoothness pass
 
 - **5-minute continuous session, zero read errors** (683 framebuffer updates,

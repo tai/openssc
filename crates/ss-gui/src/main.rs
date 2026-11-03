@@ -115,6 +115,9 @@ fn named_keysym(key: &NamedKey) -> Option<u32> {
 static LAST_INPUT_MS: AtomicU64 = AtomicU64::new(0);
 static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 
+static READER_UPDATES: AtomicU64 = AtomicU64::new(0);
+static READER_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
+
 fn note_input() {
     let start = *START.get_or_init(Instant::now);
     LAST_INPUT_MS.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
@@ -166,12 +169,15 @@ fn set_local_clipboard(text: &str) {
     }
 }
 
-fn write_png(path: &str, width: u16, height: u16, bgrx: &[u8]) -> Result<()> {
+fn write_png(path: &str, width: u16, height: u16, bgrx: &[u32]) -> Result<()> {
     let mut rgb = Vec::with_capacity(width as usize * height as usize * 3);
-    for px in bgrx.chunks_exact(4) {
-        rgb.push(px[2]);
-        rgb.push(px[1]);
-        rgb.push(px[0]);
+    for &px in bgrx {
+        let b = px as u8;
+        let g = (px >> 8) as u8;
+        let r = (px >> 16) as u8;
+        rgb.push(r);
+        rgb.push(g);
+        rgb.push(b);
     }
     let file = File::create(path)?;
     let w = BufWriter::new(file);
@@ -283,7 +289,7 @@ struct App {
     context: softbuffer::Context<DisplayHandle<'static>>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>>,
-    fb: Vec<u8>,
+    fb: Vec<u32>,
     fb_w: u16,
     fb_h: u16,
     /// Input coordinates stay in the server's original (backing) space even
@@ -349,7 +355,7 @@ impl App {
             context,
             window: None,
             surface: None,
-            fb: vec![0u8; fb_w as usize * fb_h as usize * 4],
+            fb: vec![0u32; fb_w as usize * fb_h as usize],
             fb_w,
             fb_h,
             input_w,
@@ -473,7 +479,7 @@ impl App {
             {
                 self.fb_w = r.w;
                 self.fb_h = r.h;
-                self.fb = vec![0u8; r.w as usize * r.h as usize * 4];
+                self.fb = vec![0u32; r.w as usize * r.h as usize];
             }
             let dst_w = self.fb_w as usize;
             let src_row = r.w as usize * 4;
@@ -488,14 +494,20 @@ impl App {
                 if src + src_row > r.pixels.len() {
                     break;
                 }
-                let dst = (dy * dst_w + x) * 4;
-                self.fb[dst..dst + src_row].copy_from_slice(&r.pixels[src..src + src_row]);
+                let dst = dy * dst_w + x;
+                // Convert BGRX bytes to words once, here, so presentation is a
+                // straight memcpy per row.
+                let out = &mut self.fb[dst..dst + r.w as usize];
+                for (px, chunk) in out.iter_mut().zip(r.pixels[src..src + src_row].chunks_exact(4)) {
+                    *px = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
+                }
             }
             self.dirty = true;
         }
     }
 
     fn draw(&mut self) -> Result<()> {
+        let started = Instant::now();
         let Some(window) = self.window.clone() else {
             return Ok(());
         };
@@ -524,26 +536,31 @@ impl App {
             .map_err(|e| anyhow::anyhow!("softbuffer buffer: {e:?}"))?;
 
         if self.fb_w as u32 == w && self.fb_h as u32 == h {
-            // 1:1 fast path.
-            for (dst, src) in buffer.iter_mut().zip(self.fb.chunks_exact(4)) {
-                *dst = u32::from_le_bytes([src[0], src[1], src[2], 0]);
-            }
+            // 1:1: one memcpy for the whole frame.
+            buffer.copy_from_slice(&self.fb[..w as usize * h as usize]);
         } else {
             let fw = self.fb_w as usize;
             let fh = self.fb_h as u64;
+            // Row-copy fast path when the x mapping is the identity (the usual
+            // "window is the same width, slightly different height" case).
+            let identity_x = w == self.fb_w as u32;
             for y in 0..h as usize {
                 let sy = (y as u64 * fh / h as u64) as usize;
-                let row = sy * fw;
+                let row = &self.fb[sy * fw..sy * fw + fw];
                 let out = &mut buffer[y * w as usize..(y + 1) * w as usize];
-                for (x, dst) in out.iter_mut().enumerate() {
-                    let off = (row + self.xmap[x]) * 4;
-                    *dst = u32::from_le_bytes([
-                        self.fb[off],
-                        self.fb[off + 1],
-                        self.fb[off + 2],
-                        0,
-                    ]);
+                if identity_x {
+                    out.copy_from_slice(row);
+                } else {
+                    for (x, dst) in out.iter_mut().enumerate() {
+                        *dst = row[self.xmap[x]];
+                    }
                 }
+            }
+        }
+        if self.debug_input {
+            let ms = started.elapsed().as_secs_f64() * 1000.0;
+            if ms > 5.0 {
+                eprintln!("draw took {ms:.1} ms ({}x{} -> {}x{})", self.fb_w, self.fb_h, w, h);
             }
         }
         window.pre_present_notify();
@@ -908,6 +925,14 @@ fn main() -> Result<()> {
     let mut clipboard_send = false;
     // Experimental: server-pushed dirty rectangles instead of polling.
     let mut auto_updates = false;
+    // Framebuffer requests kept in flight so a frame is already encoding while
+    // we render the previous one (no request/response stall per frame).
+    let mut pipeline: usize = 3;
+    // Banded requests: the server stops answering after a few sub-region
+    // requests on this build, so this stays off by default (--bands N).
+    let mut bands: usize = 1;
+    // Encoding experiment: 0 = raw, 16 = ZRLE, 6 = Zlib (default list).
+    let mut encoding: Option<i32> = None;
     let mut ime = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -962,6 +987,18 @@ fn main() -> Result<()> {
                 auto_updates = true;
                 i += 1;
             }
+            "--encoding" if i + 1 < args.len() => {
+                encoding = Some(args[i + 1].parse::<i32>()?);
+                i += 2;
+            }
+            "--bands" if i + 1 < args.len() => {
+                bands = args[i + 1].parse::<usize>()?.clamp(1, 64);
+                i += 2;
+            }
+            "--pipeline" if i + 1 < args.len() => {
+                pipeline = args[i + 1].parse::<usize>()?.clamp(1, 8);
+                i += 2;
+            }
             "--clipboard" => {
                 clipboard = true;
                 i += 1;
@@ -1000,6 +1037,10 @@ fn main() -> Result<()> {
     if (scale - 1.0).abs() > 0.001 {
         eprintln!("warning: --scale {scale} is experimental; this server build may stop incremental updates");
         session.set_scale(scale)?;
+    }
+    if let Some(enc) = encoding {
+        session.send_message(&rfb_proto::set_encodings(&[enc]))?;
+        eprintln!("advertised encoding {enc} only");
     }
     if clipboard_send {
         session.send_message(&rfb_proto::auto_pasteboard(1))?;
@@ -1090,12 +1131,53 @@ fn main() -> Result<()> {
     let debug_reader = debug_input;
     thread::spawn(move || {
         let mut reader = reader;
+        if debug_reader {
+            thread::spawn(|| loop {
+                thread::sleep(Duration::from_secs(2));
+                eprintln!(
+                    "reader alive: updates={} last_read_ms_ago={}",
+                    READER_UPDATES.load(Ordering::Relaxed),
+                    {
+                        let start = *START.get_or_init(Instant::now);
+                        start.elapsed().as_millis() as u64
+                            - READER_ALIVE_MS.load(Ordering::Relaxed)
+                    }
+                );
+            });
+        }
         // Order matters: arm server-push first, then send the initial
         // non-incremental request (this is the sequence that free-runs).
         if auto_updates {
             let _ = tx_reader.send(rfb_proto::auto_framebuffer_update(fb_w, fb_h));
         }
-        let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
+        let band_h = ((fb_h as usize + bands - 1) / bands).max(1);
+        let band_rect = |i: usize| -> (u16, u16, u16, u16) {
+            let y = i * band_h;
+            let h = (fb_h as usize - y).min(band_h) as u16;
+            (0, y as u16, fb_w, h)
+        };
+        let mut next_band = 0usize;
+        if bands > 1 {
+            // Prime the pipe with the first bands, non-incremental for band 0
+            // so we get a complete frame.
+            let (bx, by, bw, bh) = band_rect(0);
+            let _ = tx_reader.send(rfb_proto::framebuffer_update_request_rect(
+                bx, by, bw, bh, false,
+            ));
+            next_band = 1;
+            for _ in 1..pipeline {
+                let (bx, by, bw, bh) = band_rect(next_band % bands);
+                let _ = tx_reader.send(rfb_proto::framebuffer_update_request_rect(
+                    bx, by, bw, bh, true,
+                ));
+                next_band += 1;
+            }
+        } else {
+            let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
+            for _ in 1..pipeline {
+                let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
+            }
+        }
         let clip_wanted = clipboard && !clipboard_send;
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
@@ -1131,6 +1213,11 @@ fn main() -> Result<()> {
                             .collect();
                         eprintln!("update rects={desc:?}");
                     }
+                    READER_UPDATES.fetch_add(1, Ordering::Relaxed);
+                    READER_ALIVE_MS.store(
+                        START.get_or_init(Instant::now).elapsed().as_millis() as u64,
+                        Ordering::Relaxed,
+                    );
                     let layout = update.rects.iter().any(|r| r.encoding == 0x451);
                     if tx_upd.send(update).is_err() {
                         break;
@@ -1152,9 +1239,22 @@ fn main() -> Result<()> {
                         }
                         continue;
                     }
-                    let idle_ms = if input_is_hot() { 4 } else { 16 };
-                    thread::sleep(Duration::from_millis(idle_ms));
-                    let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
+                    if bands > 1 {
+                        let (bx, by, bw, bh) = band_rect(next_band % bands);
+                        next_band += 1;
+                        let _ = tx_reader.send(
+                            rfb_proto::framebuffer_update_request_rect(bx, by, bw, bh, true),
+                        );
+                    } else if pipeline > 1 {
+                        // Keep the pipe full: one new request per update.
+                        let _ = tx_reader
+                            .send(framebuffer_update_request(fb_w, fb_h, true));
+                    } else {
+                        let idle_ms = if input_is_hot() { 4 } else { 16 };
+                        thread::sleep(Duration::from_millis(idle_ms));
+                        let _ = tx_reader
+                            .send(framebuffer_update_request(fb_w, fb_h, true));
+                    }
                 }
                 Err(e) => {
                     eprintln!("read error: {e:#}");

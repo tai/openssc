@@ -30,6 +30,18 @@ pub const SET_ENCODINGS: &[u8] = &[
     0x04, 0x4d, 0x00, 0x00, 0x04, 0x51, 0x00, 0x00, 0x04, 0x53, 0x00, 0x00, 0x04, 0x55,
 ];
 
+/// Build a SetEncodings message with an explicit preference order.
+pub fn set_encodings(encodings: &[i32]) -> Vec<u8> {
+    let mut b = Vec::with_capacity(4 + encodings.len() * 4);
+    b.push(2);
+    b.push(0);
+    b.extend_from_slice(&(encodings.len() as u16).to_be_bytes());
+    for e in encodings {
+        b.extend_from_slice(&e.to_be_bytes());
+    }
+    b
+}
+
 #[derive(Debug, Clone)]
 pub struct ServerInfo {
     pub width: u16,
@@ -1114,13 +1126,25 @@ pub fn auto_framebuffer_update_custom(
 }
 
 pub fn framebuffer_update_request(width: u16, height: u16, incremental: bool) -> Vec<u8> {
+    framebuffer_update_request_rect(0, 0, width, height, incremental)
+}
+
+/// Request a sub-region. The server only sends updates inside it, which lets a
+/// client split a large framebuffer into cheaper bands.
+pub fn framebuffer_update_request_rect(
+    x: u16,
+    y: u16,
+    w: u16,
+    h: u16,
+    incremental: bool,
+) -> Vec<u8> {
     let mut b = Vec::with_capacity(10);
     b.push(3);
     b.push(if incremental { 1 } else { 0 });
-    b.extend_from_slice(&0u16.to_be_bytes());
-    b.extend_from_slice(&0u16.to_be_bytes());
-    b.extend_from_slice(&width.to_be_bytes());
-    b.extend_from_slice(&height.to_be_bytes());
+    b.extend_from_slice(&x.to_be_bytes());
+    b.extend_from_slice(&y.to_be_bytes());
+    b.extend_from_slice(&w.to_be_bytes());
+    b.extend_from_slice(&h.to_be_bytes());
     b
 }
 
