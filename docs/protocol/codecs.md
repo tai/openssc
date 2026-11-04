@@ -364,3 +364,39 @@ values), but the third command desynchronises. The remaining discrepancy is a
 the handler implies lands the repeat on an impossible value 15, while 23 bits
 lands it on a valid 30. So the encoder's 5-bit repeat field is right, but one
 bit is being consumed (or not consumed) before it.
+
+### 2.10 Corrected framing: run comes BEFORE the payload (2026-11-04)
+
+Reading the client loop at `0x7ff9223ba24c` settles it:
+
+```
+call bit_reader(state, 3)      -> command code (always 3 bits, every tile)
+store [rsp+0xa0] = code
+call 0x7ff92248090c            -> run length  (no arguments, uses state)
+store [rsp+0x9c] = run
+... then dispatch through the jump table and read the payload
+```
+
+So the layout is **`[3-bit command][run][payload]`** — every earlier model that
+put the payload first, or used a 4-bit first code, was wrong, which is why the
+parse always desynchronised at the same place.
+
+`0x7ff92248090c` decodes the run as:
+
+```
+flag = read(1)
+if flag == 0            -> run = 0            (single tile)
+else
+    v = read(4)
+    if v != 15          -> run = v + 1        (1..15 extra tiles)
+    else                -> escape: read 8 bits b0, then a continuation bit;
+                           b0 + 16, then further 8-bit groups shifted by 7
+```
+
+This matches the encoder's `0x10 | (n-1)` short form exactly (the high bit is
+the flag, the low nibble is n-1), and the escape's `n - 16` base.
+
+With this framing the parser consumes the **entire command stream** for the
+first time instead of desynchronising; only the long-run escape is still
+mismatched, which inflates the tile total. That is the last remaining piece
+before a full decoder.
