@@ -337,3 +337,30 @@ a few commands, and inserting the `[6-bit][3-bit * n]` DCT payload does not fix
 it. So the *command* grammar remains the one unknown; the coefficient grammar,
 container layout, Huffman tables, quant tables, IDCT and bit reader are all
 identified.
+
+### 2.9 Command dispatch and payloads — VERIFIED (2026-11-04)
+
+The command code is a 16-bit field consumed before dispatch; the decoder
+range-checks it (`cmp dil,7`, `0x7ff9223ba34b`) and jumps through a table of
+**8 signed 32-bit relative offsets at `0x7ff9223bb3bc`**:
+
+| code | handler | payload |
+|---|---|---|
+| 0 | `0x7ff9223ba37b` | none — fills the tile with `0xFF` bytes |
+| 1 | `0x7ff9223ba3b2` | none — copies the tile **above** |
+| 2 | `0x7ff9223ba423` | none — copies the **previous** tile |
+| 3 | `0x7ff9223ba4b9` | 8 × 8-bit mask, then two colours |
+| 4 | `0x7ff9223ba589` | 1-bit flag, 1-bit flag, then `Y(8) Cb(6) Cr(6)` |
+| 5 | `0x7ff9223ba76d` | DCT block via `0x7ff922480b28` |
+| 6 | `0x7ff9223ba819` | 16-bit index: hi byte then lo byte |
+| 7 | `0x7ff9223babd6` | none — implicit previous index + 1 |
+
+The decode-side bit reader is `0x7ff922480895(state, nbits) -> eax`.
+
+Closed-form parsing still drifts: with a 4-bit first code and a 23-bit code-4
+payload the first two commands align (their repeats decode to valid 16..30
+values), but the third command desynchronises. The remaining discrepancy is a
+**one-bit shift** somewhere in the command/repeat framing — the 22-bit payload
+the handler implies lands the repeat on an impossible value 15, while 23 bits
+lands it on a valid 30. So the encoder's 5-bit repeat field is right, but one
+bit is being consumed (or not consumed) before it.
