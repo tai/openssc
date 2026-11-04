@@ -1544,7 +1544,13 @@ fn copy_tile_at(fb: &[u8], stride: usize, x: usize, y: usize, tile: &mut [u8; TI
 mod tests {
     use super::*;
 
+    /// Captured fixtures live under the gitignored `artifacts/` tree. Set
+    /// `SS_MVS_ARTIFACTS_OFF=1` to simulate a clean checkout: those tests then
+    /// return early and only the synthetic fixtures run.
     fn artifact(name: &str) -> Option<Vec<u8>> {
+        if std::env::var_os("SS_MVS_ARTIFACTS_OFF").is_some() {
+            return None;
+        }
         let path = format!("{}/../../artifacts/{name}", env!("CARGO_MANIFEST_DIR"));
         std::fs::read(path).ok()
     }
@@ -1588,7 +1594,7 @@ mod tests {
 
     #[test]
     fn recorded_quant_tables_parse() {
-        let q = quant().expect("artifacts/mvs-fixture-quant.bin");
+        let Some(q) = quant() else { return };
         assert_eq!(&q.luma[..6], &[12, 9, 9, 11, 18, 17]);
         assert_eq!(&q.chroma[..6], &[15, 15, 18, 36, 57, 75]);
         assert_ne!(q.luma, DEFAULT_QUANT_LUMA);
@@ -1826,4 +1832,410 @@ mod tests {
             }
         }
     }
+    // ---------------------------------------------------------------------
+    // Synthetic fixtures. Deterministic, content-free, no `artifacts/`.
+    // ---------------------------------------------------------------------
+
+    /// MSB-first bit writer with the bit-aligned `0x6d` marker helper.
+    struct BitWriter {
+        bytes: Vec<u8>,
+        pos: usize,
+    }
+
+    impl BitWriter {
+        fn new() -> Self {
+            Self {
+                bytes: Vec::new(),
+                pos: 0,
+            }
+        }
+
+        fn bit(&mut self, one: bool) {
+            if self.pos % 8 == 0 {
+                self.bytes.push(0);
+            }
+            if one {
+                self.bytes[self.pos / 8] |= 0x80 >> (self.pos % 8);
+            }
+            self.pos += 1;
+        }
+
+        fn bits(&mut self, value: u32, n: u32) {
+            for i in (0..n).rev() {
+                self.bit((value >> i) & 1 == 1);
+            }
+        }
+
+        /// Bit-aligned end-of-stream marker plus zero padding.
+        fn marker(&mut self) {
+            self.bits(STREAM_MARKER as u32, 8);
+            while self.pos % 8 != 0 {
+                self.bit(false);
+            }
+        }
+
+        fn take(&mut self) -> Vec<u8> {
+            std::mem::take(&mut self.bytes)
+        }
+    }
+
+    /// Builder for a type-0 body: stream A (commands) plus stream B (payloads).
+    struct Type0Body {
+        commands: BitWriter,
+        payload: BitWriter,
+    }
+
+    impl Type0Body {
+        fn new() -> Self {
+            let mut commands = BitWriter::new();
+            commands.bit(false); // leading flag bit
+            Self {
+                commands,
+                payload: BitWriter::new(),
+            }
+        }
+
+        /// One single-tile command (run flag 0).
+        fn command(&mut self, code: u32) {
+            self.commands.bits(code, 3);
+            self.commands.bit(false);
+        }
+
+        /// Command 4, solid colour (not a bitmap, no reuse).
+        fn solid(&mut self, y: u8, cb6: u8, cr6: u8) {
+            self.command(4);
+            self.payload.bit(false);
+            self.payload.bit(false);
+            self.payload.bits(y as u32, 8);
+            self.payload.bits(cb6 as u32, 6);
+            self.payload.bits(cr6 as u32, 6);
+        }
+
+        /// Command 5: reuse 0, chroma copied from the reference, luma DC delta 0,
+        /// optional AC coefficient 1 with magnitude `m` (2..=5, sign positive;
+        /// at param 15 the stored coefficient is `2 * m`), then an
+        /// end-of-block token.
+        fn dct(&mut self, ac1_magnitude: Option<u32>) {
+            self.command(5);
+            self.payload.bit(false); // not a reuse
+            self.payload.bit(true); // copy chroma DC
+            self.payload.bit(false); // param = p1
+            self.payload.bit(false); // predictor k = 0
+            self.payload.bit(false); // suffix 0 -> delta 0
+            if let Some(m) = ac1_magnitude {
+                assert!((2..=5).contains(&m), "magnitude 2..=5");
+                self.payload.bit(true); // magnitude token
+                self.payload.bit(false); // k = 0
+                self.payload.bits(2 * (m - 2), 3); // suffix, positive sign
+            }
+            self.payload.bit(false); // not a magnitude token
+            self.payload.bits(0b01, 2); // run/EOB code
+            self.payload.bit(false); // end of block
+        }
+
+        /// Command 6 with a 16-bit cache index.
+        fn cache16(&mut self, index: u16) {
+            self.command(6);
+            self.payload.bits(index as u32, 16);
+        }
+
+        /// Any command with no payload (0, 1, 2, 7).
+        fn bare(&mut self, code: u32) {
+            self.command(code);
+        }
+
+        fn body(mut self, p1: u8, p2: u8) -> Vec<u8> {
+            self.commands.marker();
+            self.payload.marker();
+            let commands = self.commands.take();
+            let payload = self.payload.take();
+            let data_off = 6 + commands.len();
+            let mut body = vec![
+                0u8,
+                p1,
+                p2,
+                (data_off >> 16) as u8,
+                ((data_off >> 8) & 0xff) as u8,
+                (data_off & 0xff) as u8,
+            ];
+            body.extend_from_slice(&commands);
+            body.extend_from_slice(&payload);
+            body
+        }
+    }
+
+    /// Builder for a type-1 (refinement) body: one interleaved bit stream.
+    struct Type1Body {
+        bits: BitWriter,
+    }
+
+    impl Type1Body {
+        fn new() -> Self {
+            Self {
+                bits: BitWriter::new(),
+            }
+        }
+
+        fn code(&mut self, code: u32) {
+            self.bits.bits(code, 2);
+        }
+
+        /// Code 1. The fixtures only refine luma index 1 on a record whose
+        /// `y[1] == 4` at `param >= 15` (width 1) and whose chroma DCs are 0,
+        /// with zero AC counts in the header.
+        fn refine(&mut self, n: u32, ac1_bit: bool) {
+            self.code(1);
+            self.bits.bits(n - 1, 6);
+            for j in 1..n {
+                if j == 1 {
+                    self.bits.bit(ac1_bit);
+                } else {
+                    self.bits.bit(false);
+                }
+            }
+            self.bits.bit(false); // Cr DC step: old 0 -> 0
+            self.bits.bit(false); // Cb DC step: old 0 -> 0
+        }
+
+        /// Code 3 with an absolute 16-bit ring index.
+        fn cache_index(&mut self, index: u16) {
+            self.code(3);
+            self.bits.bit(false);
+            self.bits.bits(index as u32, 16);
+        }
+
+        /// Code 3 reading `last_read + 1`.
+        fn cache_next(&mut self) {
+            self.code(3);
+            self.bits.bit(true);
+        }
+
+        /// Code 2: copy from the spatial record's source tile.
+        fn copy(&mut self) {
+            self.code(2);
+        }
+
+        fn skip(&mut self) {
+            self.code(0);
+        }
+
+        fn body(mut self, cr_ac: u8, cb_ac: u8) -> Vec<u8> {
+            self.bits.bits(b'm' as u32, 8);
+            self.bits.bits(b'v' as u32, 8);
+            self.bits.bits(b's' as u32, 8);
+            while self.bits.pos % 8 != 0 {
+                self.bits.bit(false);
+            }
+            let stream = self.bits.take();
+            let mut body = vec![1u8, cr_ac, cb_ac];
+            body.extend_from_slice(&stream);
+            body
+        }
+    }
+
+    fn solid_tile(rgb: [u8; 3]) -> [u8; 256] {
+        let mut tile = [0u8; 256];
+        for px in tile.chunks_exact_mut(4) {
+            px[0] = rgb[2];
+            px[1] = rgb[1];
+            px[2] = rgb[0];
+            px[3] = 0;
+        }
+        tile
+    }
+
+    fn tile_of(fb: &[u8], width: usize, tx: usize, ty: usize) -> [u8; 256] {
+        let stride = width * 4;
+        let mut tile = [0u8; 256];
+        for row in 0..8 {
+            let src = (ty * 8 + row) * stride + tx * 8 * 4;
+            tile[row * 32..row * 32 + 32].copy_from_slice(&fb[src..src + 32]);
+        }
+        tile
+    }
+
+    /// Command set of a type-0 body: solid, copy-previous, copy-above, DCT,
+    /// cache16, cache17 and fill all parse and paint.
+    #[test]
+    fn synthetic_type0_command_set() {
+        let mut dec = MvsDecoder::new(64, 32);
+        let mut fb = vec![0u8; 64 * 32 * 4];
+        let mut b = Type0Body::new();
+        b.solid(255, 32, 32); // tile 0: white
+        b.bare(1); // tile 1: copy previous -> tile 0
+        b.dct(Some(2)); // tile 2: DCT with AC 1 (+4)
+        b.cache16(9999); // tile 3: cache read with an invalid index
+        b.bare(2); // tile 4: copy above -> tile 0
+        b.bare(7); // tile 5: cache17 (invalid)
+        b.bare(0); // tile 6: fill -> white
+        b.solid(128, 32, 32); // tile 7: grey 128
+        let stats = dec
+            .apply(&b.body(15, 25), Rect::new(0, 0, 32, 16), &mut fb)
+            .unwrap()
+            .expect("type-0 body");
+        assert_eq!(stats.tiles, 8);
+        assert_eq!(stats.commands, 8);
+
+        let white = solid_tile([255, 255, 255]);
+        assert_eq!(tile_of(&fb, 64, 0, 0), white, "solid white");
+        assert_eq!(tile_of(&fb, 64, 1, 0), white, "copy previous");
+        assert_eq!(tile_of(&fb, 64, 0, 1), white, "copy above");
+        assert_eq!(tile_of(&fb, 64, 2, 1), white, "fill");
+        assert_eq!(tile_of(&fb, 64, 3, 1), solid_tile([128, 128, 128]), "solid grey");
+
+        // The DCT tile carries AC coefficient 1, so it is not a flat colour.
+        let dct = tile_of(&fb, 64, 2, 0);
+        assert!(
+            dct.chunks_exact(4).any(|px| px != &dct[0..4]),
+            "DCT tile is not uniform"
+        );
+    }
+
+    /// Refinement, same-generation copy and both ring read paths.
+    #[test]
+    fn synthetic_refine_copy_and_ring_reads() {
+        let mut dec = MvsDecoder::new(64, 32);
+        let mut fb = vec![0u8; 64 * 32 * 4];
+
+        // Body A (type-0, generation 1): two DCT tiles, each copied to its right.
+        let mut a = Type0Body::new();
+        a.dct(Some(2)); // t0: record y[1] = 4
+        a.bare(1); // t1: copy previous, source 0
+        a.dct(Some(4)); // t2: record y[1] = 8 (distinct from t0)
+        a.bare(1); // t3: copy previous, source 2
+        for _ in 0..4 {
+            a.bare(0); // t4..t7 fill
+        }
+        dec.apply(&a.body(15, 25), Rect::new(0, 0, 32, 16), &mut fb)
+            .unwrap();
+        let t0_base = tile_of(&fb, 64, 0, 0);
+        assert_eq!(tile_of(&fb, 64, 1, 0), t0_base, "type-0 copy");
+
+        // Body B (type-1): refine t0 (ring entry 1), then copy it to t1.
+        let mut b = Type1Body::new();
+        b.refine(2, true); // y[1]: 4 -> 5, insert entry 1
+        b.copy(); // t1: source 0, same generation
+        dec.apply(&b.body(0, 0), Rect::new(0, 0, 16, 8), &mut fb)
+            .unwrap();
+        let t0_refined = tile_of(&fb, 64, 0, 0);
+        assert_ne!(t0_refined, t0_base, "refined tile differs from its base");
+        assert_eq!(
+            tile_of(&fb, 64, 1, 0),
+            t0_refined,
+            "same-generation copy equals the refined source"
+        );
+        assert_eq!(dec.cache.total_insertions, 1);
+
+        // Body C (type-1): refine t2 (entry 2), then read entry 1 via code 3.
+        let mut c = Type1Body::new();
+        c.refine(2, false); // y[1] stays 8; inserts ring entry 2
+        c.cache_index(1);
+        dec.apply(&c.body(0, 0), Rect::new(16, 0, 16, 8), &mut fb)
+            .unwrap();
+        let t2_refined = tile_of(&fb, 64, 2, 0);
+        assert_ne!(t2_refined, t0_refined);
+        assert_eq!(
+            tile_of(&fb, 64, 3, 0),
+            t0_refined,
+            "cache read equals the insert-time render"
+        );
+        assert_eq!(dec.cache.total_insertions, 2);
+
+        // Body D (type-1): last_read is 1, so code 3 + flag 1 reads entry 2.
+        let mut d = Type1Body::new();
+        d.skip();
+        d.cache_next();
+        dec.apply(&d.body(0, 0), Rect::new(16, 0, 16, 8), &mut fb)
+            .unwrap();
+        assert_eq!(
+            tile_of(&fb, 64, 3, 0),
+            t2_refined,
+            "last_read+1 resolves the second entry"
+        );
+
+        // Body E (type-0): the same two entries read through commands 6 and 7.
+        let mut e = Type0Body::new();
+        e.cache16(1);
+        e.bare(7);
+        dec.apply(&e.body(15, 25), Rect::new(0, 0, 16, 8), &mut fb)
+            .unwrap();
+        assert_eq!(
+            tile_of(&fb, 64, 0, 0),
+            t0_refined,
+            "type-0 code 6 renders ring entry 1"
+        );
+        assert_eq!(
+            tile_of(&fb, 64, 1, 0),
+            t2_refined,
+            "type-0 code 7 renders last_read+1"
+        );
+    }
+
+    /// A type-1 copy only fires when the destination and source records share
+    /// a generation; otherwise the destination keeps its pixels.
+    #[test]
+    fn synthetic_type1_copy_requires_matching_generation() {
+        let mut dec = MvsDecoder::new(64, 32);
+        let mut fb = vec![0u8; 64 * 32 * 4];
+
+        // Generation 1: tile 0 gets a DCT record.
+        let mut a = Type0Body::new();
+        a.dct(Some(2));
+        dec.apply(&a.body(15, 25), Rect::new(0, 0, 8, 8), &mut fb)
+            .unwrap();
+        let t0_base = tile_of(&fb, 64, 0, 0);
+
+        // Generation 2: tile 1 copies the tile to its left (generation 1), so
+        // its record points at an older generation.
+        let mut b = Type0Body::new();
+        b.bare(1); // rect starts at x = 8: "previous" is the left neighbour
+        dec.apply(&b.body(15, 25), Rect::new(8, 0, 8, 8), &mut fb)
+            .unwrap();
+        assert_eq!(
+            tile_of(&fb, 64, 1, 0),
+            t0_base,
+            "type-0 copy previous reads the left neighbour"
+        );
+
+        // Type-1 refines tile 0; type-1 never bumps the record generation.
+        let mut c = Type1Body::new();
+        c.refine(2, true);
+        dec.apply(&c.body(0, 0), Rect::new(0, 0, 8, 8), &mut fb)
+            .unwrap();
+        let t0_refined = tile_of(&fb, 64, 0, 0);
+        assert_ne!(t0_refined, t0_base);
+
+        // Type-1 copy at tile 1: generations differ (2 vs 1), so it is skipped.
+        let mut d = Type1Body::new();
+        d.copy();
+        dec.apply(&d.body(0, 0), Rect::new(8, 0, 8, 8), &mut fb)
+            .unwrap();
+        assert_eq!(
+            tile_of(&fb, 64, 1, 0),
+            t0_base,
+            "mismatched generation leaves the destination untouched"
+        );
+        assert_ne!(tile_of(&fb, 64, 1, 0), t0_refined);
+    }
+
+    /// The ring write cursor wraps 65000 -> 1 and entry 0 is never valid.
+    #[test]
+    fn synthetic_cache_ring_wraps_at_capacity() {
+        let mut dec = MvsDecoder::new(8, 8);
+        for i in 0..CACHE_ENTRIES {
+            let mut entry = [0u8; CACHE_STRIDE];
+            entry[0] = (i & 0xff) as u8;
+            dec.cache.insert(entry);
+        }
+        assert_eq!(dec.cache.total_insertions, CACHE_ENTRIES as u32);
+        assert_eq!(dec.cache.write_cursor(), 1, "cursor wraps 65000 -> 1");
+        assert!(dec.cache.read(0).is_none(), "index 0 is never valid");
+        assert!(
+            dec.cache.read(CACHE_ENTRIES as u16).is_none(),
+            "index 65000 is outside the allocation"
+        );
+        let last = dec.cache.read(1).expect("slot 1 holds the last insert");
+        assert_eq!(last[0], ((CACHE_ENTRIES - 1) & 0xff) as u8);
+    }
+
 }
