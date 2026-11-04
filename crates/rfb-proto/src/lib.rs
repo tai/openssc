@@ -13,6 +13,7 @@ use num_bigint::BigUint;
 use rand::RngCore;
 use sha1::Sha1;
 use sha2::{Digest, Sha256, Sha512};
+use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
 
@@ -749,6 +750,17 @@ impl AppleSession {
                     pending.drain(..total);
                     return Ok(pixels);
                 }
+                // RichCursor (-239): consume it in the single-frame reader
+                // too, so a caller that advertises it never desynchronises.
+                0xffff_ff11 => {
+                    let mask = ((w + 7) / 8) * h;
+                    let total = 16 + w * h * 4 + mask;
+                    while pending.len() < total {
+                        let body = self.recv_message()?;
+                        pending.extend_from_slice(&body);
+                    }
+                    pending.drain(..total);
+                }
                 other => bail!("unsupported framebuffer encoding 0x{other:x}"),
             }
         }
@@ -776,9 +788,44 @@ pub struct RectUpdate {
     pub pixels: Vec<u8>,
 }
 
+/// A decoded cursor bitmap framebuffer rectangle.
+///
+/// Apple `0x450` carries straight-alpha RGBA (inflated from a BGRX plane plus
+/// an 8-bit alpha plane); RichCursor `-239` carries BGRX pixels plus a 1-bit
+/// row-padded mask instead. The rect's x/y are the cursor hotspot and w/h the
+/// bitmap size in both cases.
+#[derive(Debug, Clone)]
+pub struct CursorUpdate {
+    pub hotspot: (u16, u16),
+    pub width: u16,
+    pub height: u16,
+    /// `width * height * 4` RGBA8 bytes; alpha is 255, use `mask` for shape.
+    pub rgba: Vec<u8>,
+    /// `((width + 7) / 8) * height` bytes, MSB-first rows.
+    pub mask: Option<Vec<u8>>,
+}
+
+/// Apple 0x451 display geometry. `point_*` is the logical desktop size (the
+/// units cursor bitmaps and hotspots use); `pixel_*` is the backing size.
+/// Measured on mm.local: 1280x800 points / 2560x1600 pixels (2x backing).
+#[derive(Debug, Clone, Copy)]
+pub struct DisplayLayout {
+    pub point_width: u16,
+    pub point_height: u16,
+    pub pixel_width: u16,
+    pub pixel_height: u16,
+}
+
 #[derive(Debug, Clone)]
 pub struct Update {
     pub rects: Vec<RectUpdate>,
+    /// Latest AppleDisplayLayout (`0x451`), when the server sent one.
+    pub display: Option<DisplayLayout>,
+    /// A cursor bitmap update (Apple 0x450, or RichCursor `-239` for callers
+    /// that advertise it), if the server sent one with this update.
+    pub cursor: Option<CursorUpdate>,
+    /// Apple 0x44c pointer position, when the server reported a warp.
+    pub cursor_position: Option<(u16, u16)>,
     /// Raw 0x1f ClipboardSend payloads (compressed pasteboard archives).
     pub clipboard: Vec<ClipboardSend>,
     /// A 0x14 MiscStatus with cmd = 2 said the remote pasteboard changed; the
@@ -900,6 +947,10 @@ pub struct SessionReader {
     /// Persistent zlib stream for the 0x3ea (RGB555) codec: the server keeps
     /// one stream across rectangles, exactly like 0x06.
     tier_zlib: Option<flate2::Decompress>,
+    /// Apple 0x450 cursor bitmaps keyed by the server's monotonic cache id.
+    /// The encoder never recycles ids, so entries live for the connection and
+    /// a fresh `SessionReader` (reconnect) starts with an empty cache.
+    cursor_cache: HashMap<u32, CursorUpdate>,
 }
 
 pub struct SessionWriter {
@@ -928,6 +979,7 @@ impl AppleSession {
                 clipboard_changed: false,
                 pending: Vec::new(),
                 tier_zlib: None,
+                cursor_cache: HashMap::new(),
             },
             SessionWriter {
                 stream: writer_stream,
@@ -1038,6 +1090,9 @@ impl SessionReader {
                 if !self.pending_clipboard.is_empty() || self.clipboard_changed {
                     return Ok(Update {
                         rects: Vec::new(),
+                        display: None,
+                        cursor: None,
+                        cursor_position: None,
                         clipboard: std::mem::take(&mut self.pending_clipboard),
                         clipboard_changed: std::mem::take(&mut self.clipboard_changed),
                     });
@@ -1052,11 +1107,17 @@ impl SessionReader {
                 // any client that requests sub-regions or waits for replies.
                 return Ok(Update {
                     rects: Vec::new(),
+                    display: None,
+                    cursor: None,
+                    cursor_position: None,
                     clipboard: std::mem::take(&mut self.pending_clipboard),
                     clipboard_changed: std::mem::take(&mut self.clipboard_changed),
                 });
             }
             let mut rects = Vec::with_capacity(nrects as usize);
+            let mut cursor: Option<CursorUpdate> = None;
+            let mut cursor_position: Option<(u16, u16)> = None;
+            let mut display: Option<DisplayLayout> = None;
             for _ in 0..nrects {
                 self.ensure(pending, 12)?;
                 let x = be16(&pending[0..2]);
@@ -1169,25 +1230,135 @@ impl SessionReader {
                         pending.drain(..16 + n);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: body });
                     }
+                    // Apple 0x450 alpha cursor: u32 cache id, u32 zlib length,
+                    // then a (Z_SYNC_FLUSH-terminated) stream that inflates to
+                    // w*h 32-bit BGRX pixels followed by a w*h alpha plane.
+                    // Cache hits repeat the id with length 0 and w=h=0.
                     0x450 => {
                         self.ensure(pending, 20)?;
-                        let clen = be32(&pending[16..20]) as usize;
-                        self.ensure(pending, 20 + clen)?;
-                        pending.drain(..20 + clen);
+                        let cache_id = be32(&pending[12..16]);
+                        let zlen = be32(&pending[16..20]) as usize;
+                        self.ensure(pending, 20 + zlen)?;
+                        let z = pending[20..20 + zlen].to_vec();
+                        pending.drain(..20 + zlen);
+                        if zlen == 0 {
+                            if let Some(c) = self.cursor_cache.get(&cache_id) {
+                                cursor = Some(c.clone());
+                            } else if self.debug_control {
+                                eprintln!(
+                                    "cursor: cache hit for unknown id {cache_id} (ignored)"
+                                );
+                            }
+                        } else {
+                            let npx = w as usize * h as usize;
+                            let expected = npx * 5;
+                            let mut raw = vec![0u8; expected + 64];
+                            let mut dec = flate2::Decompress::new(true);
+                            let status = dec.decompress(
+                                &z,
+                                &mut raw,
+                                flate2::FlushDecompress::Sync,
+                            )?;
+                            let inflated = dec.total_out() as usize;
+                            if inflated != expected {
+                                bail!(
+                                    "0x450 cursor {w}x{h} inflated {inflated} bytes, expected {expected} ({status:?})"
+                                );
+                            }
+                            // BGRX plane then an 8-bit alpha plane.
+                            let mut rgba = Vec::with_capacity(npx * 4);
+                            for i in 0..npx {
+                                rgba.push(raw[i * 4 + 2]);
+                                rgba.push(raw[i * 4 + 1]);
+                                rgba.push(raw[i * 4]);
+                                rgba.push(raw[npx * 4 + i]);
+                            }
+                            let c = CursorUpdate {
+                                hotspot: (x, y),
+                                width: w,
+                                height: h,
+                                rgba,
+                                mask: None,
+                            };
+                            self.cursor_cache.insert(cache_id, c.clone());
+                            cursor = Some(c);
+                        }
+                    }
+                    // Apple 0x44c: the server moved the pointer. Header only.
+                    0x44c => {
+                        pending.drain(..12);
+                        cursor_position = Some((x, y));
+                    }
+                    // AppleDisplayLayout: u16 payload length, then
+                    // u16 version, u16 point_w, u16 point_h, u16 pixel_w,
+                    // u16 pixel_h, ... Cursor bitmaps/hotspots are in points.
+                    0x451 => {
+                        self.ensure(pending, 14)?;
+                        let plen = be16(&pending[12..14]) as usize;
+                        self.ensure(pending, 14 + plen)?;
+                        let body = &pending[14..14 + plen];
+                        if body.len() >= 10 {
+                            let pw = be16(&body[2..4]);
+                            let ph = be16(&body[4..6]);
+                            let dw = be16(&body[6..8]);
+                            let dh = be16(&body[8..10]);
+                            // Validate the geometry before trusting it: a
+                            // backing/framebuffer pair is >= 1x and <= 4x.
+                            let sane = pw > 0
+                                && ph > 0
+                                && dw >= pw
+                                && dh >= ph
+                                && dw as u32 <= pw as u32 * 4
+                                && dh as u32 <= ph as u32 * 4;
+                            if sane {
+                                display = Some(DisplayLayout {
+                                    point_width: pw,
+                                    point_height: ph,
+                                    pixel_width: dw,
+                                    pixel_height: dh,
+                                });
+                            }
+                        }
+                        pending.drain(..14 + plen);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: Vec::new() });
                     }
-                    0x451 | 0x453 => {
+                    0x453 => {
                         self.ensure(pending, 14)?;
                         let plen = be16(&pending[12..14]) as usize;
                         self.ensure(pending, 14 + plen)?;
                         pending.drain(..14 + plen);
                         rects.push(RectUpdate { x, y, w, h, encoding: enc, pixels: Vec::new() });
                     }
+                    // RichCursor (-239): pixels in the negotiated format
+                    // (BGRX here) followed by a row-padded MSB-first mask.
+                    0xffff_ff11 => {
+                        let npx = w as usize * h as usize;
+                        let mask_len = ((w as usize + 7) / 8) * h as usize;
+                        self.ensure(pending, 12 + npx * 4 + mask_len)?;
+                        let mut rgba = Vec::with_capacity(npx * 4);
+                        for px in pending[12..12 + npx * 4].chunks_exact(4) {
+                            // BGRX -> RGBA.
+                            rgba.extend_from_slice(&[px[2], px[1], px[0], 255]);
+                        }
+                        let mask =
+                            pending[12 + npx * 4..12 + npx * 4 + mask_len].to_vec();
+                        pending.drain(..12 + npx * 4 + mask_len);
+                        cursor = Some(CursorUpdate {
+                            hotspot: (x, y),
+                            width: w,
+                            height: h,
+                            rgba,
+                            mask: Some(mask),
+                        });
+                    }
                     other => bail!("unsupported framebuffer encoding 0x{other:x}"),
                 }
             }
             return Ok(Update {
                 rects,
+                display,
+                cursor,
+                cursor_position,
                 clipboard: std::mem::take(&mut self.pending_clipboard),
                 clipboard_changed: std::mem::take(&mut self.clipboard_changed),
             });

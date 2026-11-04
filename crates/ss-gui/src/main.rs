@@ -10,7 +10,7 @@ use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
     gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
-    key_event, pasteboard_text, pointer_event, AppleSession, Update,
+    key_event, pasteboard_text, pointer_event, AppleSession, CursorUpdate, Update,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -317,6 +317,21 @@ struct App {
     tx: Sender<Vec<u8>>,
     rx: Receiver<Update>,
     cursor: (u16, u16),
+    /// Remote cursor bitmap (0x450 alpha, or -239 mask), once received.
+    cursor_shape: Option<CursorUpdate>,
+    /// Logical desktop size in points from 0x451. Cursor bitmaps and hotspots
+    /// are in points, so the compositor needs this to size them correctly.
+    point_size: Option<(u16, u16)>,
+    /// Whether the OS pointer is currently over our window (we only draw the
+    /// remote cursor then, and only hide the local one when we can replace it).
+    pointer_inside: bool,
+    /// Set once the local pointer is hidden in favour of the decoded bitmap.
+    cursor_hidden: bool,
+    /// `--demo-cursor`: scripted remote pointer tour to exercise cursor shapes.
+    demo_cursor: bool,
+    demo_step: usize,
+    demo_next: Option<Instant>,
+    demo_dump_at: Option<(Instant, String)>,
     buttons: u8,
     dirty: bool,
     modifiers: ModifiersState,
@@ -369,6 +384,7 @@ impl App {
         ime: bool,
         deadline: Option<Instant>,
         mvs: bool,
+        demo_cursor: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -389,6 +405,14 @@ impl App {
             tx,
             rx,
             cursor: (input_w / 2, input_h / 2),
+            cursor_shape: None,
+            point_size: None,
+            pointer_inside: true,
+            cursor_hidden: false,
+            demo_cursor,
+            demo_step: 0,
+            demo_next: Some(Instant::now() + Duration::from_millis(600)),
+            demo_dump_at: None,
             buttons: 0,
             dirty: true,
             modifiers: ModifiersState::empty(),
@@ -617,6 +641,85 @@ impl App {
     }
 
     fn apply_update(&mut self, update: Update) {
+        if let Some(d) = update.display {
+            self.point_size = Some((d.point_width, d.point_height));
+            if self.debug_input {
+                eprintln!(
+                    "display layout: {}x{} points / {}x{} pixels",
+                    d.point_width, d.point_height, d.pixel_width, d.pixel_height
+                );
+            }
+        }
+        if let Some((x, y)) = update.cursor_position {
+            if (x, y) != self.cursor {
+                eprintln!("remote pointer position ({x},{y})");
+                self.cursor = (x, y);
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+        }
+        if let Some(c) = update.cursor {
+            // Cursor bitmaps are sized in remote *points* (0x451). The
+            // on-screen size is points * window_px / point_px, which at 2x
+            // backing doubles the bitmap relative to the framebuffer.
+            if self.debug_input {
+                let (ww, wh) = self
+                    .window
+                    .as_ref()
+                    .map(|w| {
+                        let s = w.inner_size();
+                        (s.width.max(1), s.height.max(1))
+                    })
+                    .unwrap_or((self.fb_w as u32, self.fb_h as u32));
+                let (ox, oy, sx, sy) = Self::cursor_box(
+                    &c,
+                    self.cursor,
+                    self.input_w,
+                    self.input_h,
+                    self.point_size,
+                    ww,
+                    wh,
+                );
+                eprintln!(
+                    "cursor change: bitmap={}x{} points hotspot=({},{}) scale={sx:.2}x{sy:.2} drawn={:.0}x{:.0} px at ({:.0},{:.0})",
+                    c.width,
+                    c.height,
+                    c.hotspot.0,
+                    c.hotspot.1,
+                    c.width as f64 * sx,
+                    c.height as f64 * sy,
+                    ox,
+                    oy
+                );
+            } else if let Some(m) = &c.mask {
+                eprintln!(
+                    "remote cursor: {}x{} hotspot=({},{}) RichCursor mask={} bytes",
+                    c.width,
+                    c.height,
+                    c.hotspot.0,
+                    c.hotspot.1,
+                    m.len()
+                );
+            } else {
+                eprintln!(
+                    "remote cursor: {}x{} hotspot=({},{}) alpha plane",
+                    c.width, c.height, c.hotspot.0, c.hotspot.1
+                );
+            }
+            self.cursor_shape = Some(c);
+            if !self.cursor_hidden {
+                if let Some(w) = &self.window {
+                    // The decoded bitmap replaces the OS pointer. This is
+                    // supported on macOS (invisible cursor) and on Wayland/X11.
+                    w.set_cursor_visible(false);
+                    self.cursor_hidden = true;
+                }
+            }
+            if let Some(w) = &self.window {
+                w.request_redraw();
+            }
+        }
         for r in update.rects {
             if r.encoding == 0x3f3 {
                 self.apply_mvs(&r);
@@ -712,6 +815,17 @@ impl App {
                 }
             }
         }
+        Self::composite_cursor(
+            &self.cursor_shape,
+            self.cursor,
+            self.input_w,
+            self.input_h,
+            self.point_size,
+            self.pointer_inside,
+            &mut buffer,
+            w,
+            h,
+        );
         if self.debug_input {
             let ms = started.elapsed().as_secs_f64() * 1000.0;
             if ms > 5.0 {
@@ -724,6 +838,154 @@ impl App {
             .map_err(|e| anyhow::anyhow!("softbuffer present: {e:?}"))?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// Cursor geometry in the target buffer: top-left origin plus per-axis
+    /// scale from cursor points to target pixels. Pointer position is in
+    /// framebuffer pixels; bitmap size/hotspot are in remote points (0x451).
+    fn cursor_box(
+        c: &CursorUpdate,
+        cursor: (u16, u16),
+        input_w: u16,
+        input_h: u16,
+        point_size: Option<(u16, u16)>,
+        w: u32,
+        h: u32,
+    ) -> (f64, f64, f64, f64) {
+        let (kx, ky) = (w as f64 / input_w.max(1) as f64, h as f64 / input_h.max(1) as f64);
+        let (sx, sy) = point_size
+            .map(|(pw, ph)| {
+                (
+                    w as f64 / pw.max(1) as f64,
+                    h as f64 / ph.max(1) as f64,
+                )
+            })
+            .unwrap_or((kx, ky));
+        (
+            cursor.0 as f64 * kx - c.hotspot.0 as f64 * sx,
+            cursor.1 as f64 * ky - c.hotspot.1 as f64 * sy,
+            sx,
+            sy,
+        )
+    }
+
+    /// Composite the decoded remote cursor bitmap over the presented frame.
+    ///
+    /// The remote pointer position is our own last motion (in server backing
+    /// space), mapped to window pixels with the same factor as `to_fb`, and the
+    /// bitmap is offset by its hotspot. Nearest-neighbour keeps this cheap; the
+    /// shape comes straight from the server, so an I-beam or resize cursor is
+    /// exactly what macOS drew.
+    fn composite_cursor(
+        shape: &Option<CursorUpdate>,
+        cursor: (u16, u16),
+        input_w: u16,
+        input_h: u16,
+        point_size: Option<(u16, u16)>,
+        pointer_inside: bool,
+        buffer: &mut [u32],
+        w: u32,
+        h: u32,
+    ) {
+        if !pointer_inside {
+            return;
+        }
+        let Some(c) = shape else { return };
+        if c.width == 0 || c.height == 0 || input_w == 0 || input_h == 0 {
+            return;
+        }
+        let npx = c.width as usize * c.height as usize;
+        if c.rgba.len() < npx * 4 {
+            return;
+        }
+        // 0x450 carries a straight-alpha plane; RichCursor (-239) carries a
+        // 1-bit row-padded mask instead.
+        let stride = (c.width as usize + 7) / 8;
+        let mask = c.mask.as_deref().filter(|m| m.len() >= stride * c.height as usize);
+        // Pointer position is in framebuffer pixels; bitmap size and hotspot
+        // are in remote *points* (0x451), so the cursor's on-screen size is
+        // points * target_px / point_px while its anchor stays in the
+        // framebuffer mapping.
+        let (ox, oy, sx, sy) =
+            Self::cursor_box(c, cursor, input_w, input_h, point_size, w, h);
+        let x0 = ox.floor().max(0.0) as i64;
+        let y0 = oy.floor().max(0.0) as i64;
+        let x1 = ((ox + c.width as f64 * sx).ceil() as i64).min(w as i64);
+        let y1 = ((oy + c.height as f64 * sy).ceil() as i64).min(h as i64);
+        let win_w = w as usize;
+        for wy in y0..y1 {
+            let cy = (((wy as f64 - oy) / sy) as usize).min(c.height as usize - 1);
+            let prow = cy * c.width as usize;
+            for wx in x0..x1 {
+                let cx = (((wx as f64 - ox) / sx) as usize).min(c.width as usize - 1);
+                let i = (prow + cx) * 4;
+                let alpha = match mask {
+                    Some(m) => {
+                        if (m[cy * stride + cx / 8] >> (7 - (cx % 8))) & 1 == 0 {
+                            continue;
+                        }
+                        255
+                    }
+                    None => c.rgba[i + 3],
+                };
+                if alpha == 0 {
+                    continue;
+                }
+                let (r, g, b) = (c.rgba[i] as u32, c.rgba[i + 1] as u32, c.rgba[i + 2] as u32);
+                let di = wy as usize * win_w + wx as usize;
+                buffer[di] = if alpha == 255 {
+                    (r << 16) | (g << 8) | b
+                } else {
+                    // Straight-alpha blend over the frame.
+                    let a = alpha as u32;
+                    let dst = buffer[di];
+                    let dr = (dst >> 16) & 0xff;
+                    let dg = (dst >> 8) & 0xff;
+                    let db = dst & 0xff;
+                    let mix = |s: u32, d: u32| ((s * a + d * (255 - a) + 127) / 255) & 0xff;
+                    (mix(r, dr) << 16) | (mix(g, dg) << 8) | mix(b, db)
+                };
+            }
+        }
+    }
+
+    /// The framebuffer with the remote cursor composited, for `--dump` output.
+    fn dump_frame(&self) -> Vec<u32> {
+        if self.debug_input {
+            if let Some(c) = &self.cursor_shape {
+                let (ox, oy, sx, sy) = Self::cursor_box(
+                    c,
+                    self.cursor,
+                    self.input_w,
+                    self.input_h,
+                    self.point_size,
+                    self.fb_w as u32,
+                    self.fb_h as u32,
+                );
+                eprintln!(
+                    "dump cursor: {}x{} points at ({:.0},{:.0}) drawn={:.0}x{:.0} px (scale {sx:.2}x{sy:.2})",
+                    c.width,
+                    c.height,
+                    ox,
+                    oy,
+                    c.width as f64 * sx,
+                    c.height as f64 * sy
+                );
+            }
+        }
+        let mut fb = self.fb.clone();
+        Self::composite_cursor(
+            &self.cursor_shape,
+            self.cursor,
+            self.input_w,
+            self.input_h,
+            self.point_size,
+            true,
+            &mut fb,
+            self.fb_w as u32,
+            self.fb_h as u32,
+        );
+        fb
     }
 }
 
@@ -821,16 +1083,34 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("IME preedit {text:?}");
                 }
             }
+            WindowEvent::CursorEntered { .. } => {
+                self.pointer_inside = true;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
+            WindowEvent::CursorLeft { .. } => {
+                self.pointer_inside = false;
+                if let Some(w) = &self.window {
+                    w.request_redraw();
+                }
+            }
             WindowEvent::CursorMoved { position, .. } => {
                 note_input();
                 let (x, y) = self.to_fb(position);
                 if self.debug_input && self.buttons != 0 {
                     eprintln!("cursor fb=({x},{y}) buttons={}", self.buttons);
                 }
+                self.pointer_inside = true;
                 if (x, y) != self.cursor {
                     self.cursor = (x, y);
                     self.pending_pointer = Some((x, y, self.buttons));
                     self.flush_pointer(false);
+                    if self.cursor_shape.is_some() {
+                        if let Some(w) = &self.window {
+                            w.request_redraw();
+                        }
+                    }
                 }
             }
             WindowEvent::MouseInput { state, button, .. } => {
@@ -1000,6 +1280,53 @@ impl ApplicationHandler<UserEvent> for App {
             self.focused_once = true;
         }
         self.flush_pointer(false);
+        if self.demo_cursor {
+            let mut wake: Option<Instant> = None;
+            let now = Instant::now();
+            if let Some((at, path)) = self.demo_dump_at.clone() {
+                if now >= at {
+                    self.demo_dump_at = None;
+                    let frame = self.dump_frame();
+                    match write_png(&path, self.fb_w, self.fb_h, &frame) {
+                        Ok(()) => eprintln!("cursor demo: wrote {path}"),
+                        Err(e) => eprintln!("cursor demo: dump {path} failed: {e:#}"),
+                    }
+                } else {
+                    wake = Some(at);
+                }
+            }
+            if let Some(next) = self.demo_next {
+                if now >= next {
+                    const STOPS: [(u16, u16, &str); 4] = [
+                        (500, 350, "textedit text"),
+                        (300, 600, "terminal text"),
+                        (2168, 600, "terminal right edge"),
+                        (60, 120, "desktop"),
+                    ];
+                    let (x, y, what) = STOPS[self.demo_step.min(STOPS.len() - 1)];
+                    self.cursor = (x, y);
+                    self.send(pointer_event(0, x, y));
+                    let path = format!("artifacts/cursor-gui-{}.png", self.demo_step + 1);
+                    eprintln!(
+                        "cursor demo: pointer -> ({x},{y}) [{what}], dumping {path} in 1200 ms"
+                    );
+                    let at = now + Duration::from_millis(1200);
+                    self.demo_dump_at = Some((at, path));
+                    self.demo_step += 1;
+                    self.demo_next = if self.demo_step < STOPS.len() {
+                        Some(now + Duration::from_millis(2200))
+                    } else {
+                        None
+                    };
+                    wake = Some(at);
+                } else {
+                    wake = Some(wake.map_or(next, |w| w.min(next)));
+                }
+            }
+            if let Some(at) = wake {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
+        }
         if self.pinch_active
             && self.pinch_last.map_or(true, |t| t.elapsed() > Duration::from_millis(150))
         {
@@ -1046,7 +1373,8 @@ impl ApplicationHandler<UserEvent> for App {
         if let Some(deadline) = self.deadline {
             if Instant::now() >= deadline {
                 if let Some(path) = self.dump_path.take() {
-                    match write_png(&path, self.fb_w, self.fb_h, &self.fb) {
+                    let frame = self.dump_frame();
+                    match write_png(&path, self.fb_w, self.fb_h, &frame) {
                         Ok(()) => eprintln!("wrote {path} at deadline"),
                         Err(e) => eprintln!("dump failed: {e:#}"),
                     }
@@ -1057,7 +1385,8 @@ impl ApplicationHandler<UserEvent> for App {
         }
         if self.full_frame && self.frames >= self.dump_after {
             if let Some(path) = self.dump_path.take() {
-                match write_png(&path, self.fb_w, self.fb_h, &self.fb) {
+                let frame = self.dump_frame();
+                match write_png(&path, self.fb_w, self.fb_h, &frame) {
                     Ok(()) => eprintln!("wrote {path} after {} frames", self.frames),
                     Err(e) => eprintln!("dump failed: {e:#}"),
                 }
@@ -1111,6 +1440,9 @@ fn main() -> Result<()> {
     // Server push is the default for MVS; `--poll` forces the request loop.
     // `--push` is kept as an accepted no-op alias for the default.
     let mut poll = false;
+    // Lab helper: scripted remote pointer tour that dumps a PNG per stop, so
+    // cursor-shape rendering can be verified without a human at the mouse.
+    let mut demo_cursor = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1197,6 +1529,10 @@ fn main() -> Result<()> {
                 // Accepted for compatibility: push is the default for --mvs.
                 i += 1;
             }
+            "--demo-cursor" => {
+                demo_cursor = true;
+                i += 1;
+            }
             "--poll" => {
                 poll = true;
                 i += 1;
@@ -1251,12 +1587,20 @@ fn main() -> Result<()> {
         eprintln!("warning: --scale {scale} is experimental; this server build may stop incremental updates");
         session.set_scale(scale)?;
     }
+    // Only advertise encodings `read_update` can consume end to end: an
+    // unknown rect kills the session. Apple 0x450 is the alpha cursor
+    // (w*h*5 inflated: BGRX plane + alpha plane) and 0x44c reports pointer
+    // warps; the server prefers 0x450 over RichCursor -239, so -239 stays out
+    // of the list. Cursor rects only arrive while push (0x09) is armed.
     if let Some(enc) = encoding {
-        session.send_message(&rfb_proto::set_encodings(&[enc]))?;
-        eprintln!("advertised encoding {enc} only");
+        session.send_message(&rfb_proto::set_encodings(&[enc, 0x450, 0x44c]))?;
+        eprintln!("advertised encoding {enc} + cursor 0x450/0x44c");
     } else if mvs {
-        session.send_message(&rfb_proto::set_encodings(&[0x3f3]))?;
-        eprintln!("advertised MVS (0x3f3) only");
+        session.send_message(&rfb_proto::set_encodings(&[0x3f3, 0x450, 0x44c]))?;
+        eprintln!("advertised MVS (0x3f3) + cursor 0x450/0x44c");
+    } else {
+        session.send_message(&rfb_proto::set_encodings(&[6, 0x450, 0x44c, 0x451, 0x453]))?;
+        eprintln!("advertised Zlib (6) + cursor 0x450/0x44c + DisplayInfo");
     }
     if clipboard_send {
         session.send_message(&rfb_proto::auto_pasteboard(1))?;
@@ -1575,6 +1919,7 @@ fn main() -> Result<()> {
         ime,
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
         mvs,
+        demo_cursor,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
