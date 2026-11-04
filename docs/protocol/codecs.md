@@ -306,3 +306,34 @@ cargo run -p ss-client -- stream --host mm.local --encoding 1011 --frames 4
 # Reference for pixel comparison
 ssh tai@mm.local 'screencapture -x /tmp/ref.png'
 ```
+
+### 2.8 Stream layout and DCT grammar (2026-11-04, continued)
+
+Re-reading the client settles the container question: for type 0 the second
+stream pointer is computed as `body + data_off` (`0x7ff9223b91e2`:
+`lea rcx,[r15+3]; lea rcx,[rcx+rdx-3]`), so the 6-byte header
+(`type, p1, p2, data_off[3]`) is correct after all:
+
+- stream **A** = `body + 6` (commands + luma), ends at `data_off`
+- stream **B** = `body + data_off` (chroma)
+
+(the type-1 "full" path uses `body + 3`, i.e. no `data_off` field.)
+
+The DCT coefficient grammar is now partly readable from `0x7ff9223b967c`:
+
+```
+6-bit value  ->  count = value + 1        (matches the encoder's 6-bit prefix)
+count x 3-bit codes, MSB-first, each applied as
+    running = running >= 0 ? running + code : running - code
+```
+
+so a block is `[6-bit count][count * 3-bit]`. There is a second path taken when
+the parameter at `[rsp+0x78]` is >= 15, which appears to be the Huffman path
+(the JPEG tables above).
+
+What still does not line up: parsing the command stream
+(`code / payload / repeat`) at either `body+6` or `body+3` desynchronises within
+a few commands, and inserting the `[6-bit][3-bit * n]` DCT payload does not fix
+it. So the *command* grammar remains the one unknown; the coefficient grammar,
+container layout, Huffman tables, quant tables, IDCT and bit reader are all
+identified.
