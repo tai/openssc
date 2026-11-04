@@ -488,3 +488,22 @@ JPEG-style `(length, code)` lookup therefore fails immediately (the prototype
 This is the last missing piece: port `0x7ff9223bc1bf` exactly (unary prefix +
 table lookup at `0x7ff9223bc2ee`), then the block decoder `0x7ff922480b28`, and
 the parse should land on exactly 64,000 tiles.
+
+### 2.15 Symbol code structure (2026-11-04, final for this session)
+
+The tail of `0x7ff9223bc1bf` dispatches on the unary prefix length
+(`cmp r9b,0`, `cmp r9b,1`, `cmp r9b,2`, …) and each case reads additional bits
+and indexes a per-prefix table. So a symbol is an **Elias-gamma-style code**:
+`k` one-bits, a zero, then `k` more bits selecting a table entry — not a
+canonical `(length, code)` Huffman code.
+
+That explains why every table-based prototype failed immediately. Recovering
+the remaining work is mechanical but sizable:
+
+1. transcribe each of the ~40 prefix cases of `0x7ff9223bc1bf` (table + extra
+   bits) into a decoder;
+2. port the block decoder `0x7ff922480b28` (1-bit flag, 2-bit mode, two
+   differential predictors, mode-dependent width, AC run/size loop);
+3. dequantise with the extracted JPEG tables, IDCT, YCbCr→RGB;
+4. validate: command parse must land on exactly **64,000** tiles, then compare
+   pixels against `screencapture`.
