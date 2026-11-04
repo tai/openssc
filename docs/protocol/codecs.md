@@ -534,3 +534,34 @@ terminated) is the one remaining unknown.
 Status: container, commands, runs, bit reader, gamma decoder and tables are all
 known and implemented in `tools/probe/mvs_parse.py`; the block grammar needs a
 few more focused iterations against the 64,000-tile oracle.
+
+### 2.17 In-process oracle: calling the framework's decoder directly (2026-11-04)
+
+A much better tool than static reading: the framework is `dlopen`-able from our
+own process, so its static decoder functions can be called by address through
+`ctypes`. `tools/probe/mvs_oracle.py` does this and works:
+
+| Function | Address | Calling convention |
+|---|---|---|
+| bit reader | `0x7ff922480895` | `(state + 0xa8, nbits) -> value` |
+| run reader | `0x7ff92248090c` | `(state + 0xa8) -> run` |
+| gamma integer | `0x7ff9223bc1bf` | `(state, &out_u16) -> 0` |
+| codec init | `0x7ff9223bb400` | `(viewer) -> state` (works on a zeroed 0x2000 buffer) |
+
+The state layout matters: the bit/run readers take a pointer to the
+**`state+0xa8`** sub-struct (`acc`, `avail`, `ptr`), while the gamma decoder and
+init take the **state base**. Getting that wrong segfaults.
+
+**Ground truth confirmed** with the oracle on a captured frame: a command is
+`3 bits`, followed by the run (1 flag bit + 4 bits / escape). That matches the
+client loop exactly, so the command/run layer is settled.
+
+The DCT block decoder (`0x7ff922480b28`) could not yet be driven directly: it
+needs specific arguments (the codec state, two planes, and three stack
+arguments built from viewer fields) and crashes with plausible-looking dummies.
+`tools/probe/mvs_block.py` records the attempt.
+
+Next: pin those arguments from the handler at `0x7ff9223ba76d` (note `rdi` is
+loaded from `[rsp+0x68]`, which was set from `ecx`, so at least one argument is
+a pointer smuggled through a register), then use the real block decoder to size
+every block and confirm the 64,000-tile total.
