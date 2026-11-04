@@ -441,6 +441,11 @@ pub struct PortableBlocks {
     /// Chain reference for the next block: the previous block's output.
     /// Zeroed at the start of an update body.
     pub reference: [i16; 192],
+    /// True when the block reused the reference (first header bit was 1).
+    pub last_reuse: bool,
+    /// Parameter actually used by the block (`p1` or `p2`), for the spatial
+    /// record that type-1 refinement reads back.
+    pub last_param: u8,
 }
 
 impl Default for PortableBlocks {
@@ -450,6 +455,8 @@ impl Default for PortableBlocks {
             bits: 0,
             coeff: [0; 192],
             reference: [0; 192],
+            last_reuse: false,
+            last_param: 0,
         }
     }
 }
@@ -460,40 +467,9 @@ impl PortableBlocks {
         self.reference = [0; 192];
     }
 
-    fn unary(r: &mut BitReader<'_>, limit: u32) -> Result<u32> {
-        let mut ones = 0;
-        while r.read_bit()? == 1 {
-            ones += 1;
-            if ones >= limit {
-                bail!("invalid unary prefix");
-            }
-        }
-        Ok(ones)
-    }
-
-    /// Signed predictor symbol (`0x7ff9223bc1bf`).
-    fn predictor(r: &mut BitReader<'_>) -> Result<i32> {
-        let k = Self::unary(r, 39)?;
-        let suffix = r.read((k + 1).min(4))?;
-        if k == 0 {
-            if suffix == 0 {
-                return Ok(0);
-            }
-            let negative = r.read_bit()? == 1;
-            return Ok(if negative { -1 } else { 1 });
-        }
-        let base = if k < 3 { 1 << k } else { 8 * k - 16 };
-        let magnitude = base + (suffix >> 1);
-        Ok(if suffix & 1 == 1 {
-            -(magnitude as i32)
-        } else {
-            magnitude as i32
-        })
-    }
-
     /// Non-unit coefficient magnitude token; returns the signed value.
     fn magnitude(r: &mut BitReader<'_>, index: usize) -> Result<i32> {
-        let k = Self::unary(r, if index < 6 { 33 } else { 19 })?;
+        let k = read_unary(r, if index < 6 { 33 } else { 19 })?;
         let (suffix_bits, base) = if index < 6 {
             if k < 4 {
                 (3, 4 * k + 2)
@@ -525,7 +501,8 @@ impl BlockDecoder for PortableBlocks {
         let start = r.bit_pos();
         let mut out = [0i16; 192];
         let reference = self.reference;
-        if r.read_bit()? == 1 {
+        self.last_reuse = r.read_bit()? == 1;
+        if self.last_reuse {
             // Reuse: copy the luma plane and the two chroma DC words.
             out[..PLANE].copy_from_slice(&reference[..PLANE]);
             out[64] = reference[64];
@@ -533,16 +510,17 @@ impl BlockDecoder for PortableBlocks {
         } else {
             let copy_chroma = r.read_bit()? == 1;
             let param = if r.read_bit()? == 1 { p2 } else { p1 };
+            self.last_param = param;
             if copy_chroma {
                 out[64] = reference[64];
                 out[128] = reference[128];
             } else {
-                let cb = Self::predictor(r)?;
-                let cr = Self::predictor(r)?;
+                let cb = predictor_symbol(r)?;
+                let cr = predictor_symbol(r)?;
                 out[64] = i16w(2 * (half_toward_zero(reference[64]) - cb));
                 out[128] = i16w(2 * (half_toward_zero(reference[128]) - cr));
             }
-            let y = Self::predictor(r)?;
+            let y = predictor_symbol(r)?;
             out[0] = i16w(reference[0] as i32 - y);
 
             let mut index = 1usize;
@@ -715,11 +693,15 @@ fn clip8(x: i32) -> u8 {
 /// zero-centred. Returns BGR, the framebuffer byte order.
 pub fn rgb_from_idct(y: i32, cb: i32, cr: i32) -> [u8; 3] {
     let y = i16w(y + 8192) as i32;
+    // `pmulhw` semantics: wrap the 32-bit product, then take the high word.
+    // Refined/cached tiles can drive the spatial samples far beyond the range a
+    // plain type-0 frame produces, so these must not panic on overflow.
     let green = sat16(
-        sat16(y + ((cb * -22554) >> 16)) + sat16(((cr * 18734) >> 16) - cr),
+        sat16(y + ((cb.wrapping_mul(-22554)) >> 16))
+            + sat16(((cr.wrapping_mul(18734)) >> 16) - cr),
     );
-    let blue = sat16(sat16(y + cb) + sat16(cb + ((cb * -14942) >> 16)));
-    let red = sat16(sat16(y + cr) + ((cr * 26345) >> 16));
+    let blue = sat16(sat16(y + cb) + sat16(cb + ((cb.wrapping_mul(-14942)) >> 16)));
+    let red = sat16(sat16(y + cr) + ((cr.wrapping_mul(26345)) >> 16));
     let scale = |v: i32| clip8(sat16(v + 32) >> 6);
     [scale(blue), scale(green), scale(red)]
 }
@@ -770,6 +752,278 @@ pub struct FrameStats {
     pub dct_bits: usize,
 }
 
+// ---------------------------------------------------------------------------
+// Type-1 refinement, spatial records and the coefficient ring cache
+// (docs: artifacts/push-recon.md C1/C2/C3/C5).
+// ---------------------------------------------------------------------------
+
+/// Entries in the coefficient ring (`viewer+0xda0`, `calloc(99, 65000)`).
+pub const CACHE_ENTRIES: usize = 65_000;
+/// Bytes per ring entry: 64 luma + 15 Cb + 20 Cr signed coefficients.
+pub const CACHE_STRIDE: usize = 99;
+
+/// AAC-style counts of the framework's luma AC Huffman table (`0x4c34c0`).
+/// The native table struct is `[unused][counts; 16][symbols]`, so the dump
+/// tool must read 17 bytes and drop the first one.
+pub const LUMA_AC_COUNTS: [u8; 16] =
+    [0, 2, 1, 3, 3, 2, 4, 3, 5, 5, 4, 4, 0, 0, 1, 125];
+
+/// Symbols of the luma AC table (`0x4c34e0`, 162 bytes).
+pub const LUMA_AC_SYMBOLS: [u8; 162] = [
+    0x01, 0x02, 0x03, 0x00, 0x04, 0x11, 0x05, 0x12, 0x21, 0x31, 0x41, 0x06, 0x13, 0x51, 0x61, 0x07,
+    0x22, 0x71, 0x14, 0x32, 0x81, 0x91, 0xa1, 0x08, 0x23, 0x42, 0xb1, 0xc1, 0x15, 0x52, 0xd1, 0xf0,
+    0x24, 0x33, 0x62, 0x72, 0x82, 0x09, 0x0a, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x25, 0x26, 0x27, 0x28,
+    0x29, 0x2a, 0x34, 0x35, 0x36, 0x37, 0x38, 0x39, 0x3a, 0x43, 0x44, 0x45, 0x46, 0x47, 0x48, 0x49,
+    0x4a, 0x53, 0x54, 0x55, 0x56, 0x57, 0x58, 0x59, 0x5a, 0x63, 0x64, 0x65, 0x66, 0x67, 0x68, 0x69,
+    0x6a, 0x73, 0x74, 0x75, 0x76, 0x77, 0x78, 0x79, 0x7a, 0x83, 0x84, 0x85, 0x86, 0x87, 0x88, 0x89,
+    0x8a, 0x92, 0x93, 0x94, 0x95, 0x96, 0x97, 0x98, 0x99, 0x9a, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6, 0xa7,
+    0xa8, 0xa9, 0xaa, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6, 0xb7, 0xb8, 0xb9, 0xba, 0xc2, 0xc3, 0xc4, 0xc5,
+    0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xd2, 0xd3, 0xd4, 0xd5, 0xd6, 0xd7, 0xd8, 0xd9, 0xda, 0xe1, 0xe2,
+    0xe3, 0xe4, 0xe5, 0xe6, 0xe7, 0xe8, 0xe9, 0xea, 0xf1, 0xf2, 0xf3, 0xf4, 0xf5, 0xf6, 0xf7, 0xf8,
+    0xf9, 0xfa,
+];
+
+/// Canonical Huffman decoder built from a JPEG-style counts/symbols pair.
+pub struct Huffman {
+    counts: [u8; 16],
+    symbols: Vec<u8>,
+    first_code: [i32; 17],
+    first_index: [i32; 17],
+}
+
+impl Huffman {
+    pub fn new(counts: [u8; 16], symbols: &[u8]) -> Self {
+        let mut first_code = [0i32; 17];
+        let mut first_index = [0i32; 17];
+        let mut code = 0i32;
+        let mut index = 0i32;
+        for len in 1..=16 {
+            first_code[len] = code;
+            first_index[len] = index;
+            code = (code + counts[len - 1] as i32) << 1;
+            index += counts[len - 1] as i32;
+        }
+        Self {
+            counts,
+            symbols: symbols.to_vec(),
+            first_code,
+            first_index,
+        }
+    }
+
+    pub fn luma_ac() -> Self {
+        Self::new(LUMA_AC_COUNTS, &LUMA_AC_SYMBOLS)
+    }
+
+    pub fn decode(&self, r: &mut BitReader<'_>) -> Result<u8> {
+        let mut code = 0i32;
+        for len in 1..=16 {
+            code = (code << 1) | r.read_bit()? as i32;
+            let count = self.counts[len - 1] as i32;
+            if code - self.first_code[len] < count {
+                let i = self.first_index[len] + (code - self.first_code[len]);
+                return Ok(self.symbols[i as usize]);
+            }
+        }
+        bail!("invalid Huffman code")
+    }
+}
+
+/// One 84-byte spatial record (`viewer+0xd80`, stride 0x54).
+///
+/// Stores the *base* coefficients of a tile; type-1 bodies refine them. It is
+/// not pixel storage and not the code-6/7 ring.
+#[derive(Clone, Copy)]
+pub struct SpatialRecord {
+    /// Selected DCT multiplier threshold (`p1` or `p2`).
+    pub param: u8,
+    /// Luma coefficients in coded order, low byte of the i16.
+    pub y: [i8; 64],
+    pub cr_count: u8,
+    pub cr_dc: i8,
+    pub cb_count: u8,
+    pub cb_dc: i8,
+    pub generation: u32,
+    pub source_record: i32,
+    pub source_framebuffer_offset: u32,
+}
+
+impl Default for SpatialRecord {
+    fn default() -> Self {
+        // calloc semantics: every field starts at zero (source_record 0, not -1).
+        Self {
+            param: 0,
+            y: [0; 64],
+            cr_count: 0,
+            cr_dc: 0,
+            cb_count: 0,
+            cb_dc: 0,
+            generation: 0,
+            source_record: 0,
+            source_framebuffer_offset: 0,
+        }
+    }
+}
+
+/// The 99-byte coefficient ring. Entries are inserted only by type-1 code 1.
+pub struct CacheRing {
+    entries: Vec<[u8; CACHE_STRIDE]>,
+    /// Last successfully *read* index; code 7 and type-1 code 3 use it.
+    pub last_read: u16,
+    write_cursor: u16,
+    /// Number of insertions so far (also bounds valid read indices).
+    pub total_insertions: u32,
+}
+
+impl Default for CacheRing {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl CacheRing {
+    pub fn new() -> Self {
+        Self {
+            entries: vec![[0u8; CACHE_STRIDE]; CACHE_ENTRIES],
+            last_read: 0,
+            write_cursor: 0,
+            total_insertions: 0,
+        }
+    }
+
+    /// Native validity: `u16(index + 535) >= 536` (excludes 0 and >= 65001)
+    /// and `index <= total_insertions`.
+    fn valid(&self, index: u16) -> bool {
+        let i = index as usize;
+        i != 0 && i < CACHE_ENTRIES && (i as u32) <= self.total_insertions
+    }
+
+    /// Read an entry; sets `last_read` only on success, like `0x481ae3`.
+    pub fn read(&mut self, index: u16) -> Option<[u8; CACHE_STRIDE]> {
+        if !self.valid(index) {
+            return None;
+        }
+        self.last_read = index;
+        Some(self.entries[index as usize])
+    }
+
+    /// Ring write cursor (last inserted slot).
+    pub fn write_cursor(&self) -> u16 {
+        self.write_cursor
+    }
+
+    /// Append an entry (`0x481cd3`): cursor wraps 65000 -> 1.
+    pub fn insert(&mut self, entry: [u8; CACHE_STRIDE]) {
+        self.total_insertions += 1;
+        self.write_cursor = self.write_cursor.wrapping_add(1);
+        if self.write_cursor as usize == CACHE_ENTRIES {
+            self.write_cursor = 1;
+        }
+        self.entries[self.write_cursor as usize] = entry;
+    }
+}
+
+/// Expand a 99-byte ring entry into three coefficient planes.
+pub fn expand_cache_entry(entry: &[u8; CACHE_STRIDE]) -> [i16; 192] {
+    let mut coeff = [0i16; 192];
+    for j in 0..64 {
+        coeff[SCAN[j]] = entry[j] as i8 as i16;
+    }
+    // C8: ring order is Y64, Cr15, Cb20 (plane order is still Y, Cb, Cr).
+    for j in 0..15 {
+        coeff[128 + SCAN[j]] = entry[64 + j] as i8 as i16;
+    }
+    for j in 0..20 {
+        coeff[64 + SCAN[j]] = entry[79 + j] as i8 as i16;
+    }
+    coeff
+}
+
+fn read_unary(r: &mut BitReader<'_>, limit: u32) -> Result<u32> {
+    let mut ones = 0;
+    while r.read_bit()? == 1 {
+        ones += 1;
+        if ones >= limit {
+            bail!("invalid unary prefix");
+        }
+    }
+    Ok(ones)
+}
+
+/// Signed predictor symbol (`0x7ff9223bc1bf`).
+fn predictor_symbol(r: &mut BitReader<'_>) -> Result<i32> {
+    let k = read_unary(r, 39)?;
+    let suffix = r.read((k + 1).min(4))?;
+    if k == 0 {
+        if suffix == 0 {
+            return Ok(0);
+        }
+        let negative = r.read_bit()? == 1;
+        return Ok(if negative { -1 } else { 1 });
+    }
+    let base = if k < 3 { 1 << k } else { 8 * k - 16 };
+    let magnitude = base + (suffix >> 1);
+    Ok(if suffix & 1 == 1 {
+        -(magnitude as i32)
+    } else {
+        magnitude as i32
+    })
+}
+
+/// Type-1 refinement step for one coefficient (`3b95b9..3b9df9`).
+fn refine_step(old: i8, r: &mut BitReader<'_>, width: u32) -> Result<i8> {
+    if old != 0 {
+        let v = r.read(width)? as i32;
+        let delta = if old > 0 { v } else { -v };
+        return Ok((old as i32 + delta) as i8);
+    }
+    if width != 1 {
+        return Ok(predictor_symbol(r)? as i8);
+    }
+    if r.read(1)? == 0 {
+        return Ok(0);
+    }
+    Ok(if r.read(1)? == 1 { -1 } else { 1 })
+}
+
+/// JPEG AC run/size decoding with the luma table (`3be6f9`).
+///
+/// Writes into `plane` in *plane* order: `plane[SCAN[1 + cursor]] = value`.
+fn decode_ac(
+    plane: &mut [i16; 64],
+    count: u8,
+    r: &mut BitReader<'_>,
+    huff: &Huffman,
+) -> Result<()> {
+    let count = count as usize;
+    let mut cursor = 0usize;
+    while cursor < count {
+        let symbol = huff.decode(r)?;
+        let (run, size) = ((symbol >> 4) as usize, (symbol & 15) as u32);
+        if size == 0 {
+            if run != 15 {
+                break;
+            }
+            cursor += 16;
+        } else {
+            cursor += run;
+            let pos = 1 + cursor;
+            if pos >= 64 {
+                break;
+            }
+            let raw = r.read(size)? as i32;
+            let value = if raw < (1 << (size - 1)) {
+                raw + 1 - (1 << size)
+            } else {
+                raw
+            };
+            plane[SCAN[pos]] = value as i16;
+            cursor += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Fill colour for `code 0` tiles (BGRX).
 const BACKGROUND: [u8; 4] = [255, 255, 255, 0];
 
@@ -783,15 +1037,32 @@ pub struct MvsDecoder {
     height: u16,
     pub quant: QuantTables,
     idct: Idct,
+    /// `ceil(width / 8)`; the global spatial-record index includes it.
+    grid_width: usize,
+    /// Incremented once per type-0 body (`viewer+0xd90`).
+    generation: u32,
+    /// Base coefficient records, one 84-byte entry per tile (`viewer+0xd80`).
+    records: Vec<SpatialRecord>,
+    /// Scratch record for the DCT reuse path.
+    prev_record: SpatialRecord,
+    /// 99-byte coefficient ring (`viewer+0xda0`); session scoped.
+    pub cache: CacheRing,
 }
 
 impl MvsDecoder {
     pub fn new(width: u16, height: u16) -> Self {
+        let grid_width = (width as usize).div_ceil(8);
+        let grid_height = (height as usize).div_ceil(8);
         Self {
             width,
             height,
             quant: QuantTables::default(),
             idct: Idct::new(),
+            grid_width,
+            generation: 0,
+            records: vec![SpatialRecord::default(); grid_width * grid_height],
+            prev_record: SpatialRecord::default(),
+            cache: CacheRing::new(),
         }
     }
 
@@ -804,6 +1075,9 @@ impl MvsDecoder {
     pub fn resize(&mut self, width: u16, height: u16) {
         self.width = width;
         self.height = height;
+        self.grid_width = (width as usize).div_ceil(8);
+        let grid_height = (height as usize).div_ceil(8);
+        self.records = vec![SpatialRecord::default(); self.grid_width * grid_height];
     }
 
     /// Apply one MVS body. Returns `None` for type-2 (quant table) bodies.
@@ -815,6 +1089,7 @@ impl MvsDecoder {
     ) -> Result<Option<FrameStats>> {
         match body.first().copied() {
             Some(0) => Ok(Some(self.decode_partial(body, rect, fb)?)),
+            Some(1) => Ok(Some(self.decode_refinement(body, rect, fb)?)),
             Some(2) => {
                 self.quant = QuantTables::from_type2(body)?;
                 Ok(None)
@@ -824,15 +1099,12 @@ impl MvsDecoder {
         }
     }
 
-    /// Decode a type-0 body into `fb` (BGRX, `self.width * 4` bytes per row).
-    pub fn decode_partial(&mut self, body: &[u8], rect: Rect, fb: &mut [u8]) -> Result<FrameStats> {
+    fn check_rect(&self, rect: Rect, fb_len: usize) -> Result<()> {
         let stride = self.width as usize * 4;
-        let fb_h = self.height as usize;
-        if fb.len() < stride * fb_h {
+        if fb_len < stride * self.height as usize {
             bail!(
-                "framebuffer is {} bytes, need {}",
-                fb.len(),
-                stride * fb_h
+                "framebuffer is {fb_len} bytes, need {}",
+                stride * self.height as usize
             );
         }
         if rect.x as usize + rect.w as usize > self.width as usize
@@ -848,16 +1120,51 @@ impl MvsDecoder {
                 self.height
             );
         }
-        let header = Header::parse(body)?;
-        if header.type_of_update != 0 {
-            bail!("only type-0 (partial) MVS bodies are decoded");
-        }
-        let tiles_x = rect.w as usize / TILE;
-        let tiles_y = rect.h as usize / TILE;
-        if tiles_x == 0 || tiles_y == 0 {
+        if rect.w < TILE as u16 || rect.h < TILE as u16 {
             bail!("MVS rect {}x{} is smaller than one tile", rect.w, rect.h);
         }
+        Ok(())
+    }
+
+    /// Render three coefficient planes into a BGRX tile.
+    fn render_coeff(&self, coeff: &[i16; 192], tile: &mut [u8; TILE * TILE * 4]) {
+        let y = self.idct.plane(&coeff[..64], &self.quant.luma);
+        let cb = self.idct.plane(&coeff[64..128], &self.quant.chroma);
+        let cr = self.idct.plane(&coeff[128..192], &self.quant.chroma);
+        for j in 0..64 {
+            let [b, g, r] = rgb_from_idct(y[j], cb[j], cr[j]);
+            tile[j * 4..j * 4 + 4].copy_from_slice(&[b, g, r, 0]);
+        }
+    }
+
+    /// Resolve a cache index (type-0 code 6/7, type-1 code 3) into `tile`.
+    ///
+    /// Returns false when the index is invalid; the caller then leaves the
+    /// tile untouched, which is the closest behaviour to the native error path.
+    fn render_cache(&mut self, index: u16, tile: &mut [u8; TILE * TILE * 4]) -> bool {
+        let Some(entry) = self.cache.read(index) else {
+            return false;
+        };
+        let coeff = expand_cache_entry(&entry);
+        self.render_coeff(&coeff, tile);
+        true
+    }
+
+    /// Decode a type-0 body into `fb` (BGRX, `self.width * 4` bytes per row).
+    pub fn decode_partial(&mut self, body: &[u8], rect: Rect, fb: &mut [u8]) -> Result<FrameStats> {
+        let stride = self.width as usize * 4;
+        self.check_rect(rect, fb.len())?;
+        let header = Header::parse(body)?;
+        if header.type_of_update != 0 {
+            bail!("only type-0 (partial) MVS bodies are decoded here");
+        }
+        let tiles_x = (rect.w as usize).div_ceil(8);
+        let tiles_y = (rect.h as usize).div_ceil(8);
         let total = tiles_x * tiles_y;
+        // One generation per body; every expanded tile records it.
+        self.generation = self.generation.wrapping_add(1);
+        let generation = self.generation;
+        let grid_width = self.grid_width;
 
         let mut commands = CommandIter::new(&body[6..header.data_off], total as u32)?;
         let mut payload = BitReader::new(&body[header.data_off..]);
@@ -872,44 +1179,65 @@ impl MvsDecoder {
             let run = run?;
             stats.commands += 1;
             for _ in 0..run.tiles {
-                debug_assert!(index < total);
+                let tx = index % tiles_x;
+                let ty = index / tiles_x;
+                let gi = (rect.y as usize / TILE + ty) * grid_width
+                    + rect.x as usize / TILE
+                    + tx;
+                if let Some(record) = self.records.get_mut(gi) {
+                    record.generation = generation;
+                    record.source_record = -1;
+                }
                 match run.command {
                     Command::Fill => fill_tile(&mut tile, BACKGROUND),
                     Command::CopyPrevious => {
-                        // Source is the previous tile in raster order. The
-                        // framework keeps a precomputed framebuffer offset, so
-                        // at a rect's left edge it reads the tile just left of
-                        // the rect instead of wrapping.
-                        let copied = if index > 0 {
-                            let (sx, sy) = tile_offset(rect, tiles_x, index - 1);
-                            copy_tile_at(fb, stride, sx, sy, &mut tile)
+                        let source = if index > 0 {
+                            Some(tile_offset(rect, tiles_x, index - 1))
                         } else if rect.x as usize >= TILE {
-                            copy_tile_at(
-                                fb,
-                                stride,
-                                rect.x as usize - TILE,
-                                rect.y as usize,
-                                &mut tile,
-                            )
+                            Some((rect.x as usize - TILE, rect.y as usize))
                         } else {
-                            false
+                            None
+                        };
+                        let copied = match source {
+                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, &mut tile),
+                            None => false,
                         };
                         if !copied {
                             fill_tile(&mut tile, BACKGROUND);
                         }
+                        if let Some(record) = self.records.get_mut(gi) {
+                            record.source_record = gi as i32 - 1;
+                            if let Some((sx, sy)) = source {
+                                record.source_framebuffer_offset =
+                                    (sy * stride + sx * 4) as u32;
+                            }
+                        }
                     }
                     Command::CopyAbove => {
-                        let copied = if index >= tiles_x {
-                            let (sx, sy) = tile_offset(rect, tiles_x, index - tiles_x);
-                            copy_tile_at(fb, stride, sx, sy, &mut tile)
+                        let above_in_rect = index >= tiles_x;
+                        let source = if above_in_rect {
+                            Some(tile_offset(rect, tiles_x, index - tiles_x))
                         } else if rect.y as usize >= TILE {
-                            let sx = rect.x as usize + (index % tiles_x) * TILE;
-                            copy_tile_at(fb, stride, sx, rect.y as usize - TILE, &mut tile)
+                            Some((
+                                rect.x as usize + (index % tiles_x) * TILE,
+                                rect.y as usize - TILE,
+                            ))
                         } else {
-                            false
+                            None
+                        };
+                        let copied = match source {
+                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, &mut tile),
+                            None => false,
                         };
                         if !copied {
                             fill_tile(&mut tile, BACKGROUND);
+                        }
+                        if let Some(record) = self.records.get_mut(gi) {
+                            record.source_record = gi as i32 - grid_width as i32;
+                            if let Some((sx, sy)) = source {
+                                record.source_framebuffer_offset =
+                                    (sy * stride + sx * 4) as u32;
+                            }
                         }
                     }
                     Command::Colour => {
@@ -940,24 +1268,42 @@ impl MvsDecoder {
                     Command::Bitmap => decode_bitmap(&mut payload, &bitmap, &mut tile)?,
                     Command::Dct => {
                         blocks.decode_block(&mut payload, header.p1, header.p2)?;
-                        let y = self.idct.plane(&blocks.coeff[..64], &self.quant.luma);
-                        let cb = self.idct.plane(&blocks.coeff[64..128], &self.quant.chroma);
-                        let cr = self.idct.plane(&blocks.coeff[128..192], &self.quant.chroma);
-                        for j in 0..64 {
-                            let [b, g, r] = rgb_from_idct(y[j], cb[j], cr[j]);
-                            tile[j * 4..j * 4 + 4].copy_from_slice(&[b, g, r, 0]);
+                        self.render_coeff(&blocks.coeff, &mut tile);
+                        // Spatial record: base coefficients for type-1
+                        // refinement. A reused block copies the previous record.
+                        let record = if blocks.last_reuse {
+                            self.prev_record
+                        } else {
+                            let mut rec = SpatialRecord {
+                                generation,
+                                source_record: -1,
+                                param: blocks.last_param,
+                                cr_count: 1,
+                                cr_dc: blocks.coeff[128] as i8,
+                                cb_count: 1,
+                                cb_dc: blocks.coeff[64] as i8,
+                                ..SpatialRecord::default()
+                            };
+                            for (j, &scan) in SCAN.iter().enumerate() {
+                                rec.y[j] = blocks.coeff[scan] as i8;
+                            }
+                            rec
+                        };
+                        if let Some(slot) = self.records.get_mut(gi) {
+                            *slot = record;
                         }
+                        self.prev_record = record;
                         stats.dct_blocks += 1;
                     }
                     Command::Cache16 => {
-                        // Tile cache entries are not exercised by the reference
-                        // capture; consume the index and leave the tile alone.
-                        let _ = payload.read(16)?;
+                        let cache_index = payload.read(16)? as u16;
+                        self.render_cache(cache_index, &mut tile);
                     }
-                    Command::Cache17 => {}
+                    Command::Cache17 => {
+                        let cache_index = self.cache.last_read.wrapping_add(1);
+                        self.render_cache(cache_index, &mut tile);
+                    }
                 }
-                let tx = index % tiles_x;
-                let ty = index / tiles_x;
                 write_tile(fb, stride, rect, tx, ty, &tile);
                 index += 1;
                 stats.tiles += 1;
@@ -970,6 +1316,163 @@ impl MvsDecoder {
         payload.finish()?;
         stats.dct_bits = blocks.bits;
         Ok(stats)
+    }
+
+    /// Decode a type-1 body: refinement of the type-0 spatial records.
+    ///
+    /// No command stream and no leading flag; one MSB-first stream from
+    /// `body[3]` carrying 2-bit per-tile codes plus their payloads, terminated
+    /// by the three bytes `mvs`.
+    pub fn decode_refinement(
+        &mut self,
+        body: &[u8],
+        rect: Rect,
+        fb: &mut [u8],
+    ) -> Result<FrameStats> {
+        let stride = self.width as usize * 4;
+        self.check_rect(rect, fb.len())?;
+        if body.len() < 4 {
+            bail!("MVS type-1 body is {} bytes", body.len());
+        }
+        let cr_count = body[1].min(64);
+        let cb_count = body[2].min(64);
+        let huff = Huffman::luma_ac();
+        let mut bits = BitReader::new(&body[3..]);
+        let grid_width = self.grid_width;
+        let tiles_x = (rect.w as usize).div_ceil(8);
+        let tiles_y = (rect.h as usize).div_ceil(8);
+        let mut tile = [0u8; TILE * TILE * 4];
+        let mut stats = FrameStats::default();
+
+        for ly in 0..tiles_y {
+            for lx in 0..tiles_x {
+                let gi = (rect.y as usize / TILE + ly) * grid_width
+                    + rect.x as usize / TILE
+                    + lx;
+                let x = rect.x as usize + lx * TILE;
+                let y = rect.y as usize + ly * TILE;
+                let code = bits.read(2)?;
+                match code {
+                    0 => {}
+                    3 => {
+                        let cache_index = if bits.read_bit()? == 1 {
+                            self.cache.last_read.wrapping_add(1)
+                        } else {
+                            bits.read(16)? as u16
+                        };
+                        if self.render_cache(cache_index, &mut tile) {
+                            write_tile_at(fb, stride, x, y, &tile);
+                        }
+                    }
+                    2 => {
+                        let record = self.records.get(gi).copied().unwrap_or_default();
+                        if record.source_record >= 0 {
+                            let source = self
+                                .records
+                                .get(record.source_record as usize)
+                                .copied()
+                                .unwrap_or_default();
+                            if source.generation == record.generation {
+                                copy_tile_from_offset(
+                                    fb,
+                                    stride,
+                                    record.source_framebuffer_offset as usize,
+                                    x,
+                                    y,
+                                );
+                            }
+                        }
+                    }
+                    _ => {
+                        let record = self.records.get(gi).copied().unwrap_or_default();
+                        let (coeff, ring) =
+                            refine(&record, &mut bits, cr_count, cb_count, &huff)?;
+                        self.render_coeff(&coeff, &mut tile);
+                        write_tile_at(fb, stride, x, y, &tile);
+                        self.cache.insert(ring);
+                        stats.dct_blocks += 1;
+                    }
+                }
+                stats.tiles += 1;
+            }
+        }
+        let m = bits.read(8)?;
+        let v = bits.read(8)?;
+        let s = bits.read(8)?;
+        if [m as u8, v as u8, s as u8] != *b"mvs" {
+            bail!("type-1 terminator missing (read {m:02x} {v:02x} {s:02x})");
+        }
+        Ok(stats)
+    }
+}
+
+/// Refine one spatial record with the type-1 payload (`3b95b9..3b9df9`).
+fn refine(
+    record: &SpatialRecord,
+    bits: &mut BitReader<'_>,
+    cr_count: u8,
+    cb_count: u8,
+    huff: &Huffman,
+) -> Result<([i16; 192], [u8; CACHE_STRIDE])> {
+    let mut out = [0i16; 192];
+    let mut ring = [0u8; CACHE_STRIDE];
+    out[0] = record.y[0] as i16;
+    ring[0] = out[0] as u8;
+    let param = record.param as usize;
+    let n = ((bits.read(6)? as usize) + 1).min(64);
+    for j in 1..n {
+        let width = if param >= 15 {
+            if j < param {
+                1
+            } else {
+                3
+            }
+        } else if j < param {
+            3
+        } else {
+            4
+        };
+        let value = refine_step(record.y[j], bits, width)?;
+        out[SCAN[j]] = value as i16;
+        ring[j] = value as u8;
+    }
+    // Chroma: Cr first, then Cb, both with the *luma* AC table.
+    out[128] = refine_step(record.cr_dc, bits, 1)? as i16;
+    let mut cr_plane = [0i16; 64];
+    decode_ac(&mut cr_plane, cr_count, bits, huff)?;
+    out[129..192].copy_from_slice(&cr_plane[1..64]);
+    out[64] = refine_step(record.cb_dc, bits, 1)? as i16;
+    let mut cb_plane = [0i16; 64];
+    decode_ac(&mut cb_plane, cb_count, bits, huff)?;
+    out[65..128].copy_from_slice(&cb_plane[1..64]);
+    // C8: ring order is Y64, Cr15, Cb20.
+    for j in 0..15 {
+        ring[64 + j] = out[128 + SCAN[j]] as u8;
+    }
+    for j in 0..20 {
+        ring[79 + j] = out[64 + SCAN[j]] as u8;
+    }
+    Ok((out, ring))
+}
+
+/// Write a tile at absolute pixel coordinates.
+fn write_tile_at(fb: &mut [u8], stride: usize, x: usize, y: usize, tile: &[u8; TILE * TILE * 4]) {
+    for row in 0..TILE {
+        let src = row * TILE * 4;
+        let dst = (y + row) * stride + x * 4;
+        fb[dst..dst + TILE * 4].copy_from_slice(&tile[src..src + TILE * 4]);
+    }
+}
+
+/// Copy an 8x8 tile from a byte offset inside the framebuffer to `(x, y)`.
+fn copy_tile_from_offset(fb: &mut [u8], stride: usize, offset: usize, x: usize, y: usize) {
+    if offset + 7 * stride + TILE * 4 > fb.len() {
+        return;
+    }
+    for row in 0..TILE {
+        let src = offset + row * stride;
+        let dst = (y + row) * stride + x * 4;
+        fb.copy_within(src..src + TILE * 4, dst);
     }
 }
 
@@ -1211,6 +1714,76 @@ mod tests {
 
     /// A small incremental rectangle (56x24 at +1648+0): the decoder must
     /// honour the rect origin and its own tile budget.
+    /// Replay a captured push sequence in manifest order.
+    ///
+    /// Returns `(bodies, insertions, last_read, write_cursor, fnv)`.
+    fn replay_manifest(manifest: &str) -> Option<(usize, u32, u16, u16, u32)> {
+        let text = artifact(manifest)?;
+        let mut dec = MvsDecoder::new(2560, 1600);
+        let mut fb = vec![0u8; 2560 * 1600 * 4];
+        let mut bodies = 0usize;
+        for line in String::from_utf8_lossy(&text).lines() {
+            let f: Vec<&str> = line.split_whitespace().collect();
+            if f.len() < 8 {
+                continue;
+            }
+            let path = format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), f[7]);
+            let body = std::fs::read(&path).ok()?;
+            let rect = Rect::new(
+                f[2].parse().unwrap(),
+                f[3].parse().unwrap(),
+                f[4].parse().unwrap(),
+                f[5].parse().unwrap(),
+            );
+            dec.apply(&body, rect, &mut fb)
+                .unwrap_or_else(|e| panic!("body {} ({}): {e:#}", f[0], f[1]));
+            bodies += 1;
+        }
+        let mut fnv: u32 = 0x811c9dc5;
+        for b in &fb {
+            fnv = (fnv ^ *b as u32).wrapping_mul(16_777_619);
+        }
+        Some((
+            bodies,
+            dec.cache.total_insertions,
+            dec.cache.last_read,
+            dec.cache.write_cursor(),
+            fnv,
+        ))
+    }
+
+    /// Acceptance fixtures for the cache + type-1 path. Two independent
+    /// captures; the insertion counts are cross-checked against the
+    /// independent Python parser in `artifacts/push-codex-parse.py`.
+    #[test]
+    fn push_sequence_applies_with_cache_and_type1() {
+        let Some((bodies, inserts, last_read, cursor, fnv)) =
+            replay_manifest("push-pC/manifest.txt")
+        else {
+            return;
+        };
+        assert_eq!(bodies, 89, "manifest body count");
+        assert_eq!(inserts, 20_082, "ring insertions");
+        assert_eq!(last_read, 20_073);
+        assert_eq!(cursor, 20_082);
+        assert_eq!(fnv, 0xe065_e9ab, "final framebuffer FNV");
+    }
+
+    /// codex's own 12-second capture (131 type-0, 90 type-1, 1 quant).
+    #[test]
+    fn codex_capture_sequence_applies() {
+        let Some((bodies, inserts, last_read, cursor, fnv)) =
+            replay_manifest("push-codex-manifest.txt")
+        else {
+            return;
+        };
+        assert_eq!(bodies, 222, "manifest body count");
+        assert_eq!(inserts, 34_608, "ring insertions");
+        assert_eq!(last_read, 526);
+        assert_eq!(cursor, 34_608);
+        assert_eq!(fnv, 0xfc24_7744, "final framebuffer FNV");
+    }
+
     #[test]
     fn partial_rect_decodes() {
         let Some(body) = artifact("mvs-partial.bin") else {

@@ -589,14 +589,29 @@ client plus a pcap and experiment note.
   bit-aligned `0x6d` marker plus zero padding. The block decoder
   (`0x7ff922480b28`) is callable in-process; only bit consumption is validated,
   not pixels. See `docs/findings/2026-11-04-codex-mvs-streams.md`.
+- **MVS is the fast path.** A full 2560x1600 frame is 44–49 ms end to end
+  (14 ms decode) versus 632–675 ms for the deflate tiers, which is the
+  difference between a responsive mirror and one that stalls on repaints.
+- **Push mode (2026-11-04, VERIFIED):** server push (`0x09` with
+  `selected_screen = 0`, then one non-incremental `0x03`) emits **type-0
+  deltas** that reference earlier tiles through a 99-byte coefficient ring
+  (`viewer+0xda0`) plus **type-1 refinement** bodies that are the only writers
+  of that ring. Both are decoded (`rfb-proto::mvs`), and the result agrees with
+  an independent native-assisted renderer to max channel diff 1. Contract:
+  `codecs.md` §2.20; record: `docs/findings/2026-11-04-push-mode-mvs.md`.
+- **Latency reality:** polling MVS answers a keystroke in 85–98 ms p50, and the
+  floor is one server capture interval — not the request loop (applied rects
+  arrive 6–9 ms apart during a repaint). Whether push beats that is still
+  unmeasured; `ss-gui` does not yet expose a correct push path.
 - **Clipboard:** text sync is verified in both directions
   (`docs/protocol/clipboard.md`). Reads need no AutoPasteboard; writes require
   `0x15 AutoPasteboard(1)`, which puts the session in promise mode, so `ss-gui`
   defaults to read and offers `--send-clipboard` for write.
-- **Next:** capture a real swipe's CGEvent fields for swipe calibration (local
-  Mission Control steals the gesture, so this needs a suppressing tap or a
-  parameter sweep); clipboard duplex on one connection; keepalive/rekey;
-  verify horizontal scroll; package on a Linux Wayland host.
+- **Next:** wire `ss-gui --push` to the now-working decoder and measure
+  keystroke latency against the 85–98 ms polling baseline; capture a real
+  swipe's CGEvent fields for swipe calibration (local Mission Control steals the
+  gesture, so this needs a suppressing tap or a parameter sweep); clipboard
+  duplex on one connection; keepalive/rekey; package on a Linux Wayland host.
 - **Blockers:** none. Debugging/DTrace restrictions force the
   re-signed-copy/shim route; the in-process `dlopen` + `ndisasm` method is
   already working and documented in `tools/instrument/`.

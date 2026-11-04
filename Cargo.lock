@@ -1619,6 +1619,7 @@ dependencies = [
  "anyhow",
  "png",
  "rfb-proto",
+ "sha2",
 ]
 
 [[package]]

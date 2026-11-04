@@ -12,7 +12,83 @@ use std::io::BufWriter;
 use std::time::Duration;
 
 fn usage() -> &'static str {
-    "usage:\n  ss-client probe    [--host mm.local] [--port 5900] [--user tai] [--password <password>]\n  ss-client snapshot --out artifacts/rust.png [--mvs] [connection opts]\n  ss-client stream   --frames 3 --out artifacts/stream.png [--mvs] [--dump-mvs PREFIX] [connection opts]\n  ss-client mvs-file --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]\n  ss-client mvs-compare --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]\n  ss-client gesture  --kind swipe|scroll [gesture opts] --out artifacts/gesture.png\n  ss-client demo-input --x 1000 --y 800 --text hello --out artifacts/input.png\n  ss-client clipboard --text hello [--no-auto]\n\n--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.\nmvs-compare decodes one MVS and one Zlib full frame (one session each) and reports\nlatency plus pixel agreement.\n\ngesture opts:\n  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series\n  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series\n  common: --delay-ms N"
+    "usage:\n  ss-client probe    [--host mm.local] [--port 5900] [--user tai] [--password <password>]\n  ss-client snapshot --out artifacts/rust.png [--mvs] [connection opts]\n  ss-client stream   --frames 3 --out artifacts/stream.png [--mvs] [--dump-mvs PREFIX] [connection opts]\n  ss-client mvs-file --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]\n  ss-client mvs-compare --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]\n  ss-client mvs-sequence --manifest artifacts/push-pC/manifest.txt [--out artifacts/push-rust.png] [--hashes artifacts/push-rust-hashes.txt]\n  ss-client gesture  --kind swipe|scroll [gesture opts] --out artifacts/gesture.png\n  ss-client demo-input --x 1000 --y 800 --text hello --out artifacts/input.png\n  ss-client clipboard --text hello [--no-auto]\n\n--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.\nmvs-compare decodes one MVS and one Zlib full frame (one session each) and reports\nlatency plus pixel agreement.\n\ngesture opts:\n  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series\n  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series\n  common: --delay-ms N"
+}
+
+/// Replay a captured push sequence offline: apply every body in manifest
+/// order, hash the framebuffer after each body, and write the final PNG.
+///
+/// Manifest format: `idx<TAB>type<TAB>x<TAB>y<TAB>w<TAB>h<TAB>bytes<TAB>path`.
+fn mvs_sequence(opts: &HashMap<String, String>) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    let manifest = get(opts, "manifest").unwrap_or("artifacts/push-pC/manifest.txt");
+    let width: u16 = num(opts, "width", 2560u16);
+    let height: u16 = num(opts, "height", 1600u16);
+    let mut dec = MvsDecoder::new(width, height);
+    let mut fb = vec![0u8; width as usize * height as usize * 4];
+    let mut hashes = String::from("# idx\ttype\tsha256(bgrx)\tx\ty\tw\th\n");
+    let (mut t0, mut t1, mut tq) = (0usize, 0usize, 0usize);
+    let mut bodies = 0usize;
+    let text = std::fs::read_to_string(manifest).with_context(|| format!("read {manifest}"))?;
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let f: Vec<&str> = line.split_whitespace().collect();
+        if f.len() < 8 {
+            continue;
+        }
+        let body = std::fs::read(f[7]).with_context(|| format!("read {}", f[7]))?;
+        let rect = Rect::new(
+            f[2].parse()?,
+            f[3].parse()?,
+            f[4].parse()?,
+            f[5].parse()?,
+        );
+        match dec.apply(&body, rect, &mut fb) {
+            Ok(Some(_)) => {
+                if body.first().copied() == Some(1) {
+                    t1 += 1;
+                } else {
+                    t0 += 1;
+                }
+            }
+            Ok(None) => tq += 1,
+            Err(e) => {
+                anyhow::bail!("body {} ({}) {}x{}+{}+{}: {e:#}", f[0], f[1], f[4], f[5], f[2], f[3]);
+            }
+        }
+        let digest = Sha256::digest(&fb);
+        hashes.push_str(&format!(
+            "{}\t{}\t{:x}\t{}\t{}\t{}\t{}\n",
+            f[0], f[1], digest, f[2], f[3], f[4], f[5]
+        ));
+        bodies += 1;
+    }
+    if let Some(path) = get(opts, "hashes") {
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        std::fs::write(path, hashes.as_bytes()).with_context(|| format!("write {path}"))?;
+        println!("wrote {path} ({bodies} checkpoints)");
+    }
+    let out = get(opts, "out").unwrap_or("artifacts/push-rust.png");
+    if let Some(parent) = std::path::Path::new(out).parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    write_png(out, width, height, &fb)?;
+    let mut fnv: u32 = 0x811c9dc5;
+    for b in &fb {
+        fnv = (fnv ^ *b as u32).wrapping_mul(16_777_619);
+    }
+    println!(
+        "bodies={bodies} type0={t0} type1={t1} quant={tq} inserts={} last_read={} write_cursor={} fnv=0x{fnv:08x}",
+        dec.cache.total_insertions,
+        dec.cache.last_read,
+        dec.cache.write_cursor()
+    );
+    println!("wrote {out}");
+    Ok(())
 }
 
 /// Render a saved MVS type-0 body to PNG without touching the network.
@@ -291,6 +367,9 @@ fn main() -> Result<()> {
     // Offline modes do not open a connection.
     if cmd == "mvs-file" {
         return mvs_file(&opts);
+    }
+    if cmd == "mvs-sequence" {
+        return mvs_sequence(&opts);
     }
 
     let mut session = AppleSession::connect(&host, port, &user, &password)?;

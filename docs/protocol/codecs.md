@@ -658,3 +658,132 @@ consumption only**, not correct pixels.
 
 Evidence: `docs/findings/2026-11-04-codex-mvs-streams.md`,
 `artifacts/codex-mvs-commands.txt`.
+
+## 2.20 Push mode — spatial records, coefficient ring, type-1 (VERIFIED 2026-11-04)
+
+Server push (`0x09`) makes the server emit MVS bodies continuously instead of
+answering requests. That stream contains **two body types**, and the type-0
+deltas in it are *not* self-contained: they reference tiles sent earlier. This
+section is the decoder contract. Evidence: `docs/findings/2026-11-04-push-mode-mvs.md`,
+captures `artifacts/push-pC/` (89 bodies) and `artifacts/push-codex-manifest.txt`
+(222 bodies), framework disassembly `artifacts/push-codex-cache-annotated.asm`.
+
+### 2.20.1 Two per-session tables, not one
+
+| table | address | entry | count | written by |
+|---|---|---|---|---|
+| spatial records | `viewer+0xd80` | 84 B | `ceil(W/8)*ceil(H/8)` | type-0 (every expanded tile), read/refined by type-1 |
+| coefficient ring | `viewer+0xda0` | 99 B | 65,000 | **only** type-1 code 1; read by type-0 codes 6/7 and type-1 code 3 |
+
+Both survive across bodies for the whole session (allocated with the framebuffer
+/ codec, not per body). Ring writes use a cursor that wraps `65000 -> 1`;
+`last_read` is updated only by cache **reads**.
+
+`SpatialRecord` (84 B, one per tile, global grid `grid_width = ceil(W/8)`):
+
+```
++00  u8   param          DCT multiplier threshold for this tile
++01  i8[64] Y            luma coefficients in SCAN order (low byte of i16)
++41  u8   Cr_count       =1 from the type-0 block decoder
++42  i8   Cr_DC
++43  u8   Cb_count       =1
++44  i8   Cb_DC
++48  u32  generation     body counter; incremented once per type-0 body
++4c  i32  source_record  -1, or the tile this one was copied from
++50  u32  source_framebuffer_offset
+```
+
+Ring entry (99 B) is **signed coefficient bytes in scan order, ordered
+Y64 / Cr15 / Cb20** — note that the ring order is not the plane order
+(`Y / Cb / Cr`) used by the block decoder. Every expanded type-0 tile first
+resets its record (`generation = current`, `source_record = -1`); the DCT
+handler then fills `param`, `Y[64]` and the chroma DCs.
+
+### 2.20.2 Type-0 payload corrections
+
+- Code 1 copies the **left/previous** tile and code 2 the **above** tile. Earlier
+  revisions of this document had these swapped.
+- Record index is global and includes the rect origin:
+  `(rect_y>>3)*grid_width + (rect_x>>3) + local_y*grid_width + local_x`.
+- Code 6 reads a **16-bit big-endian absolute** ring index; code 7 reads
+  `last_read + 1`. Neither writes a ring entry, and neither is present in any
+  body this server produced in *polling* mode — which is exactly why polling
+  accumulated correctly with the cache unimplemented.
+
+### 2.20.3 Type-1 bodies
+
+Type-1 is **refinement of the type-0 spatial records**, not an independently
+decodable frame. Applying one without the preceding type-0 bodies is meaningless.
+
+```
+body[0] = 1
+body[1] = cr_ac_count   clamp 64
+body[2] = cb_ac_count   clamp 64
+body[3:] = one MSB-first bitstream, codes and payloads interleaved
+```
+
+Per tile, row-major over the rect, **2-bit code**:
+
+| code | meaning |
+|---|---|
+| 0 | no-op |
+| 1 | refine the record, render, and **insert** the 99-byte entry into the ring |
+| 2 | copy 8x8 pixels from `record.source_record`, but only if that record's `generation` matches |
+| 3 | ring read: one bit selects `last_read+1`, else 16 bits of absolute index |
+
+Terminator: three literal `mvs` bytes, bit-aligned at the end (same convention as
+type-0's `0x6d` markers).
+
+Refinement (code 1) per luma coefficient `j = 1..n-1` where `n = read(6)+1`:
+
+```
+width = (j < param ? 1 : 3) if param >= 15 else (j < param ? 3 : 4)
+old = i8(record.Y[j])
+if width == 1            value = step(old)          # +/-1 or 0, see below
+else if old == 0         value = predictor_symbol()
+else if old > 0          value = i8(old + read(width))
+else                     value = i8(old - read(width))
+step(old): old>0 -> old+bit; old<0 -> old-bit; old==0 -> 0 unless bit, then +/-1 on the next bit
+```
+
+Chroma: `Cr_DC` and `Cb_DC` use `step()`; the ACs are ordinary JPEG run/size
+with signed extension, `count = cr_ac_count` / `cb_ac_count`, starting at
+coefficient 1. The quantiser table used for **both** chroma planes is the
+**luma AC** table (`state+0x68`, counts at `0x4c34c0` read as 17 bytes with the
+unused index 0 dropped, symbols at `0x4c34e0`, 162 symbols — the standard JPEG
+Annex K luma AC table).
+
+### 2.20.4 Arming push correctly
+
+```
+SetEncodings(0x3f3)
+0x09 AutoFrameBufferUpdate  version=1  selected_screen=0  rect=(0,0,W,H)
+0x03 FBUpdateRequest non-incremental (0,0,W,H)   # once
+```
+
+`selected_screen` must be **0**. With `0xffffffff` (the convenience helper's
+default) the server sends metadata plus the type-2 quant body and then stalls.
+After that the server free-runs; extra `0x03` requests make it serve those
+instead of pushing.
+
+### 2.20.5 Validation
+
+- `artifacts/push-pC/manifest.txt`, 89 bodies (51 type-0, 37 type-1, 1 quant):
+  our decoder reports 20,082 ring insertions, `last_read` 20,073, cursor 20,082,
+  matching the independent Python parser exactly.
+- `artifacts/push-codex-manifest.txt`, 222 bodies: 34,608 insertions.
+- Command 6/7 coverage in push deltas: 18,768 + 7,727 tiles out of 214,732
+  (~12 %), present in 45 of 51 type-0 delta bodies; **zero** in polling bodies.
+- Independent pixel oracle (`artifacts/push-codex-render.py`, native block
+  decoder / cache read / insert / IDCT): the Rust decoder agrees to
+  **max channel difference 1, zero pixels above 1**, on 4.4 % of pixels (the
+  documented native-vs-portable IDCT rounding), checked at bodies 12, 45, 78 and
+  the final frame.
+- The rendered sequence is a coherent desktop with no shear or stale bands.
+
+### 2.20.6 Remaining latency
+
+Polling MVS already delivers keystrokes in ~85–98 ms p50 on the lab LAN, and the
+floor is one server capture interval, not the request loop (during a repaint,
+applied rects arrive 6–9 ms apart). Push removes the request leg; whether it
+beats that floor is **not yet measured** — see STATUS.md.

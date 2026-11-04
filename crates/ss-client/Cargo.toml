@@ -8,3 +8,4 @@ license.workspace = true
 anyhow = "1"
 png = "0.17"
 rfb-proto = { path = "../rfb-proto" }
+sha2 = "0.10"

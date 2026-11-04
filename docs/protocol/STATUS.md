@@ -1,5 +1,48 @@
 # Protocol status / agent handoff
 
+## 2026-11-04 — push-mode MVS: cache + type-1 decoded (VERIFIED)
+
+- Phase / milestone: M6 fast path, push mode.
+- Verified:
+  - The push stream's type-0 deltas reference earlier tiles through a 99-byte
+    coefficient ring (`viewer+0xda0`); codes 6/7 read it and **only type-1
+    code 1 writes it**. Our decoder ignored 6/7, which is exactly why push
+    sheared while polling was clean (18,768 + 7,727 cache tiles in 45 of 51
+    pushed delta bodies; zero in polling bodies).
+  - Type-1 is refinement of 84-byte per-tile spatial records: 2-bit code per
+    tile, `mvs` terminator, `Y64 / Cr15 / Cb20` ring order, luma AC Huffman
+    table for both chroma planes. Full contract in `codecs.md` §2.20, with two
+    corrections to earlier notes (code 1 = left/previous, code 2 = above).
+  - Push arming needs `0x09` with **`selected_screen = 0`** plus one
+    non-incremental `0x03`; `0xffffffff` stalls after the quant body.
+  - Rust decoder over an 89-body push capture: 20,082 ring insertions,
+    `last_read` 20,073, cursor 20,082 — matching the independent Python parser.
+  - Independent native-assisted renderer: Rust agrees to **max channel diff 1,
+    0 pixels above 1**, at bodies 12 / 45 / 78 and the final frame. The ±1 is
+    the known native-vs-portable IDCT rounding.
+  - Latency (twelve keystrokes, polling MVS): p50 85–98 ms, min 43 ms. The
+    request loop is not the bottleneck — applied rects arrive 6–9 ms apart
+    during a repaint; the floor is one server capture interval.
+- Changed: `rfb-proto::mvs` gains the spatial-record table, the coefficient
+  ring, type-1 decoding and `wrapping_mul` IDCT scaling; `ss-client` gains
+  `mvs-sequence` (whole-manifest replay with per-body SHA-256). `ss-gui` gained
+  the bootstrap-wedge fix, MVS banding removal and `--debug-input` latency
+  instrumentation in the preceding commit.
+- Captures / experiments (untracked): `artifacts/push-pC/` (89 bodies),
+  `artifacts/push-codex-manifest.txt` (222 bodies),
+  `artifacts/push-codex-render.py` (oracle), `artifacts/verify-push-rust.png`.
+  Record: `docs/findings/2026-11-04-push-mode-mvs.md`.
+- Open questions: does push beat the ~85 ms polling floor (needs keystrokes
+  through a correctly-rendering push GUI); where the capture-interval floor
+  actually comes from; a synthetic content-free fixture so CI exercises the
+  cache/type-1 grammar (the replay tests skip without `artifacts/`).
+- Next command: `cargo run -p ss-client -- mvs-sequence --manifest
+  artifacts/push-pC/manifest.txt --out artifacts/push-rust.png`.
+- Lab state: `mm.local` answers `RFB 003.889`; console user `tai` logged in; no
+  clients left running. Note: `screensharingd` was restarted once early in the
+  session (launchd respawn, verified healthy) before the no-restart rule was
+  issued — it must not happen again without owner approval.
+
 ## 2026-11-03 — interactive performance pass
 
 - `AutoFrameBufferUpdate` (0x09) now works: server-driven streaming with dirty
