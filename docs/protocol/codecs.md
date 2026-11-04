@@ -565,3 +565,26 @@ Next: pin those arguments from the handler at `0x7ff9223ba76d` (note `rdi` is
 loaded from `[rsp+0x68]`, which was set from `ecx`, so at least one argument is
 a pointer smuggled through a register), then use the real block decoder to size
 every block and confirm the 64,000-tile total.
+
+### 2.18 Block-size search attempts (2026-11-04, end of session)
+
+Three independent approaches failed to pin the DCT block length:
+
+1. **Fixed-size sweep** with the oracle for command/run: no size 0..320 makes
+   the walk survive; runs immediately decode to garbage after the first block.
+2. **Boundary search** (try every offset, count clean commands afterwards): the
+   best scores are 30-33 commands for many different sizes, i.e. no signal.
+3. **Beam search** guided by the tile rate (64,000 over the stream): diverges to
+   millions of tiles; no state reaches the stream end with the right total.
+
+So the block is not a fixed width, and no cheap constraint recovers it. The
+remaining route is to make the real block decoder callable. Its first argument
+is loaded as 64 bits from a slot that the caller writes with a 32-bit store
+(`mov [rsp+0x68],ecx` then `mov rdi,[rsp+0x68]` at `0x7ff9223ba76d`), so either
+the slot's upper half is pre-seeded elsewhere or the value is not a plain
+pointer. Resolving that, plus the three stack arguments built from viewer
+fields, would let the framework size every block for us.
+
+Status: the command/run layer is confirmed by direct measurement; the block
+grammar is the sole remaining unknown and needs the real decoder driven
+in-process (or an instrumented build with debug permissions).
