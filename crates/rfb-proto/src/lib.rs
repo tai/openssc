@@ -2,9 +2,12 @@
 //!
 //! Verified against macOS 12.7.6 / screensharingd 3.9.8. See docs/protocol/.
 
+pub mod mvs;
+
 use aes::cipher::generic_array::GenericArray;
 use aes::cipher::{BlockDecrypt, BlockEncrypt, KeyInit};
 use aes::Aes128;
+
 use anyhow::{bail, Context, Result};
 use num_bigint::BigUint;
 use rand::RngCore;

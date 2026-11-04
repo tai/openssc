@@ -78,6 +78,32 @@
 4. Investigate MultiVariant (0x44c/0x44d) and adaptive media.
 5. Verify horizontal scroll (`dx`) and settle the subtype-11 tail bytes.
 
+### 2026-11-04 — MVS streams decoded (Codex + OpenCode)
+
+**Two independent streams, not one.** Commands come from stream A
+(`body[6:data_off]`, reader at `state+0x98`); every payload — solids, bitmaps,
+DCT blocks, cache indices — comes from stream B (`body[data_off:]`, reader at
+`state+0xa8`). Reading payloads from A is what broke every earlier parser.
+
+A full frame now parses exactly: **64,000 tiles, 1,534 commands, 2,352 DCT
+blocks**, stream A 12,361/12,376 bits and stream B 145,378/145,392 bits, each
+ending with a **bit-aligned `0x6d` marker** plus zero padding. The block decoder
+`0x7ff922480b28` is callable in-process (ABI and state layout recovered) and
+accounts for 127,230 payload bits.
+
+Independent confirmation: `tools/probe/mvs_commands.py` (Codex) and
+`tools/probe/mvs_block.py` (full payload walk, with assertions). See
+`docs/findings/2026-11-04-codex-mvs-streams.md`.
+
+Still open: the block decoder is driven through the framework rather than
+reimplemented (bit consumption is validated; pixel output is not), codes 3/6/7
+were not exercised by the capture, and payload widths need a second capture
+with different content.
+
+- Next command: `python3 tools/probe/mvs_block.py artifacts/mvs-4.bin`
+- Lab state: no preferences changed or test clients started; banner rechecked as
+  `RFB 003.889`, console user `tai` still logged in.
+
 ### 2026-11-04 — banded refresh: big reported latency win without MVS
 
 Full-screen requests are answered in one 700-880 ms block, which is what made a

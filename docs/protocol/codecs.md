@@ -1,5 +1,7 @@
 # Apple framebuffer codecs
 
+**Current MVS framing: see §2.19 and [the verified experiment](../findings/2026-11-04-codex-mvs-streams.md). Earlier exploratory framing claims below are superseded. Pixel decoding remains unverified.**
+
 Status: **quality tiers (0x3e8/0x3e9/0x3ea) VERIFIED**, **MultiVariant (0x3f3)
 container VERIFIED, tile bitstream still being reverse engineered**.
 
@@ -588,3 +590,71 @@ fields, would let the framework size every block for us.
 Status: the command/run layer is confirmed by direct measurement; the block
 grammar is the sole remaining unknown and needs the real decoder driven
 in-process (or an instrumented build with debug permissions).
+
+## 2.19 CORRECTION — two independent streams (VERIFIED 2026-11-04)
+
+Everything in §2.7-2.18 that models a single bitstream is superseded.
+`screensharingd` keeps **two readers** in the decoder state:
+
+| Reader | State fields | Contents |
+|---|---|---|
+| A (commands) | `+0x98` | one leading flag bit, then `[3-bit command][run]` repeated |
+| B (payloads) | `+0xa8` | every command payload |
+
+**Type-0 body:**
+
+```
++0x00 u8    type_of_update (0 = partial; 1 = full uses a DIFFERENT header)
++0x01 u8    p1
++0x02 u8    p2
++0x03 u8[3] data_off, BE, offset from body start
++0x06 ..    stream A  (commands only)
+data_off .. stream B  (all payloads)
+```
+
+`state+0xb0` (the payload cursor) points at `body + data_off`.
+
+**Stream A:** one flag bit, then repeated `3-bit command` + run. Run = 1 flag
+bit (0 → single tile) else 4 bits → `v+1`; `v == 15` escapes to `16 + value`, where value is a little-endian base-128 integer (up to three bytes, high bit = continuation).
+Each stream ends with a **bit-aligned `0x6d` marker** followed by zero padding
+— it is *not* byte-aligned, so byte scans do not find it.
+
+**Stream B payload widths:**
+
+| code | payload |
+|---|---|
+| 0 fill, 1 copy-above, 2 copy-previous, 7 cache+1 | none |
+| 3 two-colour bitmap | 8-bit row mask, then one 8-bit row per clear bit |
+| 4 colour/bitmap | 2 flags `b1,b2`; if `b2==0` read `1+b1` colours of `Y8 Cb6 Cr6` (20 bits each); if `b1==1` also the 8-bit mask + one 8-bit row per clear bit |
+| 5 DCT | variable, `0x7ff922480b28` |
+| 6 cache index | 16 bits (hi, lo) |
+
+Codes 3/6/7 were **not exercised** by the validated capture; their widths are
+static-derived only.
+
+**Full-frame validation** (`artifacts/mvs-4.bin`, 2560x1600 white desktop):
+
+```
+tiles 64,000   commands 1,534   DCT blocks 2,352   DCT bits 127,230
+stream A 12,361/12,376 bits (+0x6d, 7 zero bits)
+stream B 145,378/145,392 bits (+0x6d, 6 zero bits)
+```
+
+Both the independent command parser (`tools/probe/mvs_commands.py`, Codex) and
+the full payload walk (`tools/probe/mvs_block.py`) agree, and the walker
+asserts the tile count, command count, block count, both bit-aligned markers and
+the zero padding.
+
+**Block-decoder ABI** (`0x7ff922480b28`), callable in-process through ctypes:
+
+```
+rc = block(state, out, ref, p1, p2, r9_ptr, stack1, stack2, stack3)
+```
+
+`rc == 0` on success. Note the calling conventions: the bit and run readers take
+`state+0xa8` while the gamma decoder takes the state base, and `r9` must be a
+`c_void_p`. Driving it with zeroed dummy predictors establishes **bit
+consumption only**, not correct pixels.
+
+Evidence: `docs/findings/2026-11-04-codex-mvs-streams.md`,
+`artifacts/codex-mvs-commands.txt`.

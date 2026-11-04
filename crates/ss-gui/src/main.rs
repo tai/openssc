@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use gesture_input::{Gesture, Phase};
+use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
     gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
@@ -328,6 +329,10 @@ struct App {
     rotate_last: Option<Instant>,
     pinch_x: u16,
     pinch_y: u16,
+    /// MultiVariant (0x3f3) decoder; `Some` when `--mvs` advertised it.
+    mvs: Option<MvsDecoder>,
+    /// BGRX canvas the MVS decoder paints into before we convert to words.
+    mvs_bytes: Vec<u8>,
 }
 
 impl App {
@@ -346,6 +351,7 @@ impl App {
         debug_input: bool,
         ime: bool,
         deadline: Option<Instant>,
+        mvs: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -390,6 +396,8 @@ impl App {
             rotate_last: None,
             pinch_x: 0,
             pinch_y: 0,
+            mvs: mvs.then(|| MvsDecoder::new(fb_w, fb_h)),
+            mvs_bytes: Vec::new(),
         })
     }
 
@@ -468,8 +476,71 @@ impl App {
         (x, y)
     }
 
+    /// Decode an MVS (0x3f3) rectangle into `self.fb`.
+    fn apply_mvs(&mut self, r: &rfb_proto::RectUpdate) {
+        if self.mvs.is_none() {
+            return;
+        }
+        // Grow if the server ignored our scale request (full-size rect).
+        if r.x == 0 && r.y == 0 && (r.w > self.fb_w || r.h > self.fb_h) {
+            self.fb_w = r.w;
+            self.fb_h = r.h;
+            self.fb = vec![0u32; r.w as usize * r.h as usize];
+            self.mvs_bytes.clear();
+            if let Some(dec) = self.mvs.as_mut() {
+                // Keep the quantisation tables learned from type-2 bodies.
+                dec.resize(r.w, r.h);
+            }
+        }
+        let need = self.fb_w as usize * self.fb_h as usize * 4;
+        if self.mvs_bytes.len() != need {
+            self.mvs_bytes = vec![0u8; need];
+        }
+        let rect = Rect::new(r.x, r.y, r.w, r.h);
+        let applied = {
+            // Disjoint field borrows: the decoder paints into mvs_bytes.
+            let Self { mvs, mvs_bytes, .. } = self;
+            let Some(dec) = mvs.as_mut() else { return };
+            match dec.apply(&r.pixels, rect, mvs_bytes) {
+                Ok(Some(_)) => true,
+                Ok(None) => false, // quant table update
+                Err(e) => {
+                    eprintln!("mvs decode failed ({}x{}+{}+{}): {e:#}", r.w, r.h, r.x, r.y);
+                    false
+                }
+            }
+        };
+        if !applied {
+            return;
+        }
+        let stride = self.fb_w as usize * 4;
+        let width = self.fb_w as usize;
+        let x = r.x as usize;
+        let y0 = r.y as usize;
+        for row in 0..r.h as usize {
+            let dy = y0 + row;
+            if dy >= self.fb_h as usize || x + r.w as usize > width {
+                continue;
+            }
+            let src = dy * stride + x * 4;
+            let dst = dy * width + x;
+            let out = &mut self.fb[dst..dst + r.w as usize];
+            for (slot, chunk) in out
+                .iter_mut()
+                .zip(self.mvs_bytes[src..src + r.w as usize * 4].chunks_exact(4))
+            {
+                *slot = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
+            }
+        }
+        self.dirty = true;
+    }
+
     fn apply_update(&mut self, update: Update) {
         for r in update.rects {
+            if r.encoding == 0x3f3 {
+                self.apply_mvs(&r);
+                continue;
+            }
             if r.pixels.is_empty() || r.w == 0 || r.h == 0 {
                 continue;
             }
@@ -945,6 +1016,9 @@ fn main() -> Result<()> {
     // Encoding experiment: 0 = raw, 16 = ZRLE, 6 = Zlib (default list).
     let mut encoding: Option<i32> = None;
     let mut ime = false;
+    // MultiVariant (0x3f3): GPU-encoded tiles, ~40 ms per full frame instead
+    // of the ~640 ms Zlib round trip.
+    let mut mvs = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1023,6 +1097,10 @@ fn main() -> Result<()> {
                 ime = true;
                 i += 1;
             }
+            "--mvs" => {
+                mvs = true;
+                i += 1;
+            }
             "--exit-after-secs" if i + 1 < args.len() => {
                 exit_after_secs = Some(args[i + 1].parse()?);
                 i += 2;
@@ -1052,6 +1130,9 @@ fn main() -> Result<()> {
     if let Some(enc) = encoding {
         session.send_message(&rfb_proto::set_encodings(&[enc]))?;
         eprintln!("advertised encoding {enc} only");
+    } else if mvs {
+        session.send_message(&rfb_proto::set_encodings(&[0x3f3]))?;
+        eprintln!("advertised MVS (0x3f3) only");
     }
     if clipboard_send {
         session.send_message(&rfb_proto::auto_pasteboard(1))?;
@@ -1174,6 +1255,7 @@ fn main() -> Result<()> {
         };
         let mut next_band = 0usize;
         let clip_wanted = clipboard && !clipboard_send;
+        let mut mvs_full_seen = !mvs;
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
         }
@@ -1222,6 +1304,10 @@ fn main() -> Result<()> {
                         Ordering::Relaxed,
                     );
                     let layout = update.rects.iter().any(|r| r.encoding == 0x451);
+                    let full_mvs = update
+                        .rects
+                        .iter()
+                        .any(|r| r.encoding == 0x3f3 && r.w == fb_w && r.h == fb_h);
                     if tx_upd.send(update).is_err() {
                         break;
                     }
@@ -1229,6 +1315,17 @@ fn main() -> Result<()> {
                     // This server build does not reliably free-run after the
                     // first auto frame. Poll with the *scaled* geometry so
                     // post-input dirty rectangles are always delivered.
+                    if !mvs_full_seen {
+                        // The FIRST non-incremental request after a 0x3f3
+                        // SetEncodings is answered with the type-2 quant body
+                        // and a dirty rect; a second one yields the whole
+                        // framebuffer. Repeat until it arrives.
+                        if full_mvs {
+                            mvs_full_seen = true;
+                        }
+                        let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
+                        continue;
+                    }
                     if auto_updates {
                         // Server-push mode. The stream drains on a display
                         // layout change; re-arm 0x09 *and* a non-incremental
@@ -1293,6 +1390,7 @@ fn main() -> Result<()> {
         debug_input,
         ime,
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
+        mvs,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())

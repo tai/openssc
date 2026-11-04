@@ -582,6 +582,13 @@ client plus a pcap and experiment note.
   image; input coordinates stay in the server's original backing space.
 - **Gesture input:** `gesture-input` has a tested pure-Rust recognizer and a
   Linux evdev MT-protocol-B reader (`--evdev`, input group required).
+- **MVS (2026-11-04):** the frame splits into **two independent streams** —
+  commands in `body[6:data_off]` (reader at `state+0x98`) and *all* payloads in
+  `body[data_off:]` (reader at `state+0xa8`). A full frame validates exactly:
+  64,000 tiles, 1,534 commands, 2,352 DCT blocks, each stream ending with a
+  bit-aligned `0x6d` marker plus zero padding. The block decoder
+  (`0x7ff922480b28`) is callable in-process; only bit consumption is validated,
+  not pixels. See `docs/findings/2026-11-04-codex-mvs-streams.md`.
 - **Clipboard:** text sync is verified in both directions
   (`docs/protocol/clipboard.md`). Reads need no AutoPasteboard; writes require
   `0x15 AutoPasteboard(1)`, which puts the session in promise mode, so `ss-gui`
