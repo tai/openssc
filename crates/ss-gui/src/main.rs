@@ -1108,8 +1108,9 @@ fn main() -> Result<()> {
     // MultiVariant (0x3f3): GPU-encoded tiles, ~40 ms per full frame instead
     // of the ~640 ms Zlib round trip.
     let mut mvs = false;
-    // Server-push MVS (0x09 + one provisioning request, then read-only).
-    let mut push = false;
+    // Server push is the default for MVS; `--poll` forces the request loop.
+    // `--push` is kept as an accepted no-op alias for the default.
+    let mut poll = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1193,7 +1194,11 @@ fn main() -> Result<()> {
                 i += 1;
             }
             "--push" => {
-                push = true;
+                // Accepted for compatibility: push is the default for --mvs.
+                i += 1;
+            }
+            "--poll" => {
+                poll = true;
                 i += 1;
             }
             "--exit-after-secs" if i + 1 < args.len() => {
@@ -1207,20 +1212,29 @@ fn main() -> Result<()> {
         }
     }
 
+    // Apple's client is push-based, so `--mvs` arms server push by default.
+    // `--poll` is the escape hatch and the A/B switch; the Zlib path never
+    // arms 0x09 either way.
+    let push = mvs && !poll;
+    if mvs {
+        if push {
+            eprintln!(
+                "mvs: server push (arm 0x09 screen 0 + one 0x03); use --poll for the request loop"
+            );
+        } else {
+            eprintln!("mvs: request loop (--poll); one incremental request per applied update");
+        }
+    }
+
     // Banding existed to hide the 700-880 ms deflate full repaint. An MVS full
-    // frame is 44-49 ms, so the sequential band sweep is now pure added
-    // latency: a keystroke landing in an already-swept band waits a full cycle.
-    let bands = if mvs && bands > 1 {
+    // frame is 44-49 ms, so in the request loop the sequential band sweep is
+    // pure added latency (server push never requests at all).
+    let bands = if mvs && !push && bands > 1 {
         eprintln!("mvs: banded refresh disabled");
         1
     } else {
         bands
     };
-
-    if push && !mvs {
-        eprintln!("--push requires --mvs (server push carries MultiVariant bodies)");
-        std::process::exit(2);
-    }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1316,7 +1330,7 @@ fn main() -> Result<()> {
             let quiet = now_ms().saturating_sub(LAST_APPLIED_MS.load(Ordering::Relaxed));
             if quiet > 2000 {
                 eprintln!(
-                    "[{:6} ms] push: nothing applied for {quiet} ms after the initial paint; giving up on push (no polling fallback)",
+                    "[{:6} ms] push: nothing applied for {quiet} ms after the initial paint; giving up on push — re-run with --poll to use the request loop",
                     now_ms()
                 );
                 break;
