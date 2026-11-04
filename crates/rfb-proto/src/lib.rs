@@ -938,6 +938,15 @@ impl AppleSession {
     }
 }
 
+impl SessionReader {
+    /// Bound how long a single record read may block. Callers that wait for a
+    /// specific frame use a short value so a stalled server fails fast.
+    pub fn set_read_timeout(&mut self, timeout: std::time::Duration) -> Result<()> {
+        self.stream.set_read_timeout(Some(timeout))?;
+        Ok(())
+    }
+}
+
 impl SessionWriter {
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
         let ct = self.send.encrypt(body);

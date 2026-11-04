@@ -12,7 +12,7 @@ use std::io::BufWriter;
 use std::time::Duration;
 
 fn usage() -> &'static str {
-    "usage:\n  ss-client probe    [--host mm.local] [--port 5900] [--user tai] [--password <password>]\n  ss-client snapshot --out artifacts/rust.png [--mvs] [connection opts]\n  ss-client stream   --frames 3 --out artifacts/stream.png [--mvs] [--dump-mvs PREFIX] [connection opts]\n  ss-client mvs-file --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]\n  ss-client mvs-compare --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png]\n  ss-client gesture  --kind swipe|scroll [gesture opts] --out artifacts/gesture.png\n  ss-client demo-input --x 1000 --y 800 --text hello --out artifacts/input.png\n  ss-client clipboard --text hello [--no-auto]\n\n--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.\nmvs-compare decodes one MVS and one Zlib full frame in the same session and reports\nlatency plus pixel agreement.\n\ngesture opts:\n  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series\n  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series\n  common: --delay-ms N"
+    "usage:\n  ss-client probe    [--host mm.local] [--port 5900] [--user tai] [--password <password>]\n  ss-client snapshot --out artifacts/rust.png [--mvs] [connection opts]\n  ss-client stream   --frames 3 --out artifacts/stream.png [--mvs] [--dump-mvs PREFIX] [connection opts]\n  ss-client mvs-file --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]\n  ss-client mvs-compare --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]\n  ss-client gesture  --kind swipe|scroll [gesture opts] --out artifacts/gesture.png\n  ss-client demo-input --x 1000 --y 800 --text hello --out artifacts/input.png\n  ss-client clipboard --text hello [--no-auto]\n\n--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.\nmvs-compare decodes one MVS and one Zlib full frame (one session each) and reports\nlatency plus pixel agreement.\n\ngesture opts:\n  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series\n  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series\n  common: --delay-ms N"
 }
 
 /// Render a saved MVS type-0 body to PNG without touching the network.
@@ -61,6 +61,13 @@ fn write_png(path: &str, width: u16, height: u16, bgrx: &[u8]) -> Result<()> {
     Ok(())
 }
 
+/// Capture one full frame over an already-split session.
+///
+/// Sends a single non-incremental request, then an *incremental* one after
+/// every update that does not carry the full frame. MVS needs the extra
+/// request: the first non-incremental one is answered with `0x451`/`0x453`
+/// metadata and the type-2 quant body only, and the full tile body follows the
+/// next incremental request.
 fn capture_full(
     reader: &mut rfb_proto::SessionReader,
     writer: &mut rfb_proto::SessionWriter,
@@ -70,16 +77,21 @@ fn capture_full(
     let height = reader.info.height;
     let mut fb = vec![0u8; width as usize * height as usize * 4];
     writer.send(&framebuffer_update_request(width, height, false))?;
-    for _ in 0..100 {
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    for _ in 0..2000 {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!("no full framebuffer update within 30 s");
+        }
         let update = reader.read_update()?;
-        apply_update(&mut fb, width, height, &update, mvs)?;
-        if update
+        let full = update
             .rects
             .iter()
-            .any(|r| r.w == width && r.h == height && !r.pixels.is_empty())
-        {
+            .any(|r| r.w == width && r.h == height && !r.pixels.is_empty());
+        apply_update(&mut fb, width, height, &update, mvs)?;
+        if full {
             return Ok((width, height, fb));
         }
+        writer.send(&framebuffer_update_request(width, height, true))?;
     }
     anyhow::bail!("no full framebuffer update received")
 }
@@ -104,15 +116,24 @@ fn copy_rect(fb: &mut [u8], fb_w: u16, fb_h: u16, r: &rfb_proto::RectUpdate) {
     }
 }
 
-/// Apply an update. Returns true when a full rectangle was painted by MVS.
+/// What an update painted.
+#[derive(Default, Clone, Copy)]
+struct Applied {
+    /// An MVS body painted tiles into the framebuffer.
+    painted: bool,
+    /// DCT blocks decoded by MVS bodies in this update.
+    dct_blocks: usize,
+}
+
+/// Apply an update: copy pixel rectangles and decode MVS bodies.
 fn apply_update(
     fb: &mut [u8],
     fb_w: u16,
     fb_h: u16,
     update: &Update,
     mvs: &mut Option<MvsDecoder>,
-) -> Result<bool> {
-    let mut mvs_painted = false;
+) -> Result<Applied> {
+    let mut applied = Applied::default();
     for r in &update.rects {
         if r.encoding == 0x3f3 {
             let Some(dec) = mvs.as_mut() else {
@@ -131,13 +152,101 @@ fn apply_update(
                     stats.dct_blocks,
                     stats.dct_bits
                 );
-                mvs_painted = true;
+                applied.painted = true;
+                applied.dct_blocks += stats.dct_blocks;
             }
             continue;
         }
         copy_rect(fb, fb_w, fb_h, r);
     }
-    Ok(mvs_painted)
+    Ok(applied)
+}
+
+/// One captured full frame plus its timings.
+struct CapturedFrame {
+    width: u16,
+    height: u16,
+    fb: Vec<u8>,
+    /// SetEncodings -> request -> frame applied.
+    end_to_end_ms: f64,
+    /// Applying the target update to the framebuffer.
+    decode_ms: f64,
+    dct_blocks: usize,
+}
+
+/// Connect a private session, advertise one encoding, and capture one full
+/// frame. Every wait is bounded by `budget_secs` and every read is bounded by
+/// the session's socket timeout, so a stalled server reports an error instead
+/// of hanging.
+#[allow(clippy::too_many_arguments)]
+fn capture_encoded_frame(
+    host: &str,
+    port: u16,
+    user: &str,
+    password: &str,
+    encoding: i32,
+    mvs: bool,
+    budget_secs: u64,
+    opts: &HashMap<String, String>,
+) -> Result<CapturedFrame> {
+    let mut session = AppleSession::connect(host, port, user, password)?;
+    session.debug_control = opts.contains_key("debug-controls");
+    session.start_streaming()?;
+    let (mut reader, mut writer) = session.split()?;
+    // A stalled server must report an error, not hang: bound every read.
+    let read_timeout = Duration::from_secs(budget_secs.min(5).max(1));
+    reader.set_read_timeout(read_timeout)?;
+    let (width, height) = (reader.info.width, reader.info.height);
+    let mut dec = mvs.then(|| MvsDecoder::new(width, height));
+    let mut fb = vec![0u8; width as usize * height as usize * 4];
+
+    writer.send(&rfb_proto::set_encodings(&[encoding]))?;
+    let started = std::time::Instant::now();
+    let deadline = started + Duration::from_secs(budget_secs);
+    writer.send(&framebuffer_update_request(width, height, false))?;
+
+    let mut settled = 0usize;
+    for _ in 0..2000 {
+        if std::time::Instant::now() >= deadline {
+            anyhow::bail!(
+                "no full 0x{encoding:x} frame within {budget_secs} s ({settled} updates seen)"
+            );
+        }
+        let update = reader
+            .read_update()
+            .with_context(|| format!("0x{encoding:x}: no update within {read_timeout:?}"))?;
+        settled += 1;
+        if opts.contains_key("debug-controls") {
+            let d: Vec<_> = update
+                .rects
+                .iter()
+                .map(|r| (r.x, r.y, r.w, r.h, r.encoding, r.pixels.len()))
+                .collect();
+            eprintln!("0x{encoding:x} update {settled}: {d:?}");
+        }
+        let full = update
+            .rects
+            .iter()
+            .any(|r| r.encoding == encoding as u32 && r.w == width && r.h == height);
+        let t = std::time::Instant::now();
+        let applied = apply_update(&mut fb, width, height, &update, &mut dec)?;
+        let decode_ms = t.elapsed().as_secs_f64() * 1000.0;
+        if full {
+            let dct_blocks = if mvs { applied.dct_blocks } else { 0 };
+            return Ok(CapturedFrame {
+                width,
+                height,
+                fb,
+                end_to_end_ms: started.elapsed().as_secs_f64() * 1000.0,
+                decode_ms,
+                dct_blocks,
+            });
+        }
+        // MVS answers the first non-incremental request with metadata and the
+        // type-2 quant body only; incremental requests pull the tile body.
+        writer.send(&framebuffer_update_request(width, height, true))?;
+    }
+    anyhow::bail!("no full 0x{encoding:x} frame after 2000 updates")
 }
 
 fn get<'a>(m: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
@@ -434,83 +543,59 @@ fn main() -> Result<()> {
             Ok(())
         }
         "mvs-compare" => {
-            // Same session, same screen: decode one MVS frame and one Zlib
-            // frame, then report latency and pixel agreement.
-            session.start_streaming()?;
-            let (mut reader, mut writer) = session.split()?;
-            let width = reader.info.width;
-            let height = reader.info.height;
-            let deadline = std::time::Instant::now() + Duration::from_secs(30);
-
-            let mut mvs = Some(MvsDecoder::new(width, height));
-            let mut fb_mvs = vec![0u8; width as usize * height as usize * 4];
-            writer.send(&rfb_proto::set_encodings(&[0x3f3]))?;
-            let t0 = std::time::Instant::now();
-            writer.send(&framebuffer_update_request(width, height, false))?;
-            let mut mvs_ms = 0.0;
-            let mut mvs_decode_ms = 0.0;
-            let debug = opts.contains_key("debug-controls");
-            while std::time::Instant::now() < deadline {
-                let update = reader.read_update()?;
-                if debug {
-                    let d: Vec<_> = update
-                        .rects
-                        .iter()
-                        .map(|r| (r.x, r.y, r.w, r.h, r.encoding, r.pixels.len()))
-                        .collect();
-                    eprintln!("mvs-probe rects={d:?}");
-                }
-                let is_mvs = update.rects.iter().any(|r| r.encoding == 0x3f3 && r.w == width);
-                if is_mvs {
-                    let d0 = std::time::Instant::now();
-                    apply_update(&mut fb_mvs, width, height, &update, &mut mvs)?;
-                    mvs_decode_ms = d0.elapsed().as_secs_f64() * 1000.0;
-                    mvs_ms = t0.elapsed().as_secs_f64() * 1000.0;
-                    break;
-                }
-                apply_update(&mut fb_mvs, width, height, &update, &mut mvs)?;
-                writer.send(&framebuffer_update_request(width, height, false))?;
+            // One frame per session. The server will not switch encodings
+            // back to Zlib after a SetEncodings that removed it, so each
+            // encoding gets its own freshly connected session; the MVS frame
+            // (fast) is captured immediately after the Zlib one so both see
+            // almost the same screen.
+            let budget: u64 = num(&opts, "timeout-secs", 30u64);
+            let zlib = capture_encoded_frame(
+                &host, port, &user, &password, 6, false, budget, &opts,
+            )?;
+            let mvs = capture_encoded_frame(
+                &host,
+                port,
+                &user,
+                &password,
+                0x3f3,
+                true,
+                budget,
+                &opts,
+            )?;
+            if (zlib.width, zlib.height) != (mvs.width, mvs.height) {
+                anyhow::bail!(
+                    "geometry changed between sessions: zlib {}x{} vs mvs {}x{}",
+                    zlib.width,
+                    zlib.height,
+                    mvs.width,
+                    mvs.height
+                );
             }
-            if mvs_ms == 0.0 {
-                anyhow::bail!("no MVS frame received");
-            }
-
-            let mut fb_zlib = vec![0u8; width as usize * height as usize * 4];
-            writer.send(&rfb_proto::set_encodings(&[6]))?;
-            let t1 = std::time::Instant::now();
-            writer.send(&framebuffer_update_request(width, height, false))?;
-            let mut zlib_ms = 0.0;
-            while std::time::Instant::now() < deadline {
-                let update = reader.read_update()?;
-                let full = update
-                    .rects
-                    .iter()
-                    .any(|r| r.encoding == 6 && r.w == width && r.h == height);
-                apply_update(&mut fb_zlib, width, height, &update, &mut None)?;
-                if full {
-                    zlib_ms = t1.elapsed().as_secs_f64() * 1000.0;
-                    break;
-                }
-                writer.send(&framebuffer_update_request(width, height, false))?;
-            }
-            if zlib_ms == 0.0 {
-                anyhow::bail!("no Zlib frame received");
-            }
-
+            let n = zlib.width as usize * zlib.height as usize;
             let (mut exact, mut close) = (0usize, 0usize);
             let mut worst = 0u8;
-            for (a, b) in fb_mvs.chunks_exact(4).zip(fb_zlib.chunks_exact(4)) {
-                let d = (0..3).map(|k| a[k].abs_diff(b[k])).max().unwrap_or(0);
-                worst = worst.max(d);
-                if d == 0 {
+            let mut sum = [0f64; 3];
+            for (a, b) in zlib.fb.chunks_exact(4).zip(mvs.fb.chunks_exact(4)) {
+                let mut px_worst = 0u8;
+                for k in 0..3 {
+                    let d = a[k].abs_diff(b[k]);
+                    sum[k] += d as f64;
+                    px_worst = px_worst.max(d);
+                }
+                worst = worst.max(px_worst);
+                if px_worst == 0 {
                     exact += 1;
-                } else if d <= 2 {
+                } else if px_worst <= 2 {
                     close += 1;
                 }
             }
-            let n = width as usize * height as usize;
             println!(
-                "mvs: {mvs_ms:.1} ms end to end ({mvs_decode_ms:.1} ms decode); zlib: {zlib_ms:.1} ms"
+                "mvs:  {:.1} ms end to end ({:.1} ms decode, {} dct blocks)",
+                mvs.end_to_end_ms, mvs.decode_ms, mvs.dct_blocks
+            );
+            println!(
+                "zlib: {:.1} ms end to end ({:.1} ms decode)",
+                zlib.end_to_end_ms, zlib.decode_ms
             );
             println!(
                 "pixels: exact {:.2}%, <=2 {:.2}%, >2 {:.2}% (worst {worst})",
@@ -518,18 +603,24 @@ fn main() -> Result<()> {
                 100.0 * close as f64 / n as f64,
                 100.0 * (n - exact - close) as f64 / n as f64
             );
+            println!(
+                "mean abs error: B {:.3}, G {:.3}, R {:.3} (0..255)",
+                sum[0] / n as f64,
+                sum[1] / n as f64,
+                sum[2] / n as f64
+            );
             if let Some(out) = get(&opts, "out") {
                 if let Some(parent) = std::path::Path::new(out).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                write_png(out, width, height, &fb_mvs)?;
+                write_png(out, mvs.width, mvs.height, &mvs.fb)?;
                 println!("wrote {out} (MVS frame)");
             }
             if let Some(out) = get(&opts, "out-zlib") {
                 if let Some(parent) = std::path::Path::new(out).parent() {
                     let _ = std::fs::create_dir_all(parent);
                 }
-                write_png(out, width, height, &fb_zlib)?;
+                write_png(out, zlib.width, zlib.height, &zlib.fb)?;
                 println!("wrote {out} (Zlib frame)");
             }
             Ok(())
