@@ -416,3 +416,51 @@ So the remaining work is exactly one function: decode `0x7ff922480b28`
 (JPEG-style block: DC category + bits, then AC run/size pairs until EOB/ZRL,
 using the tables in `dump_mvs_tables.py`), which both fixes the tile count and
 makes DCT tiles renderable.
+
+### 2.12 DCT block syntax (2026-11-04, `0x7ff922480b28`)
+
+The block decoder is **not** baseline JPEG. Reading it in order:
+
+```
+1 bit  flag
+if flag:                                   // block present
+    2 bits  mode                          // selects a parameter (bt eax,30)
+    huffman_decode(state) -> predictor A  // table depends on mode
+    A = (refA + A) >> 1; A *= 2           // differential against the previous
+                                          // tile's value, then doubled
+    huffman_decode(state) -> predictor B
+    B = (refB + B) >> 1; B *= 2
+    ... coefficient loop with per-tile predictors ...
+```
+
+So per block there is a 1-bit presence flag, a 2-bit mode, and then two
+Huffman-coded values that are *differentially* combined with the previous
+tile's predictors (`(ref + delta) >> 1 << 1`). A further 2- or 8-bit field
+(`lea r12d,[rcx*8+8]` vs `cmovnc 2`) selects the coefficient bit width based
+on the mode byte (`cmp r8b,0xf`).
+
+That is why a fixed DCT payload width could not fit: the block's size depends
+on Huffman-decoded symbols *and* on running predictor state, and the residual
+2.5% tile-count error at 64,000 comes from exactly this.
+
+Implementing this faithfully is now a bounded-but-large piece of work:
+1-bit flag, 2-bit mode, two differential Huffman predictors, the AC
+run/size loop with `0x00` EOB and `0xF0` ZRL, then dequantise with the JPEG
+tables and run the SIMD-equivalent IDCT.
+
+### 2.13 Where the work stands
+
+| Piece | Status |
+|---|---|
+| Container, 6-byte header, stream A/B split | done |
+| Command set, jump table, payloads | done |
+| Run-length coding | done |
+| Bit reader semantics | done |
+| JPEG Huffman + quant tables (extracted) | done |
+| Command stream parse | runs to end, 2.5% tile-count error |
+| DCT block syntax | mapped, not yet implemented |
+| Dequant + IDCT + YCbCr→RGB | identified (SIMD routines) |
+
+The remaining work is implementation rather than discovery: port the block
+syntax above and validate the 64,000-tile grid exactly, then compare pixels
+against `screencapture`.
