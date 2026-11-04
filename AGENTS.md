@@ -1,8 +1,17 @@
-# AGENTS.md — `ss-clone` — **v1.0.0**
+# AGENTS.md — `ss-clone` — **v1.1.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.1.0 — 2026-11-05.** Remote cursor and a real clipboard. The cursor is now
+> the *remote* one: shape, hotspot and size come from the server (Apple `0x450`
+> alpha cursor, `0x44c` position, `0x451` for point-vs-pixel scale), so hovering
+> text gives an I-beam instead of a local arrow. The clipboard is automatic and
+> bidirectional on one connection — text and images, byte-identical both ways —
+> after finding that `0x0b ClipboardFetch` is an 8-byte message and that our
+> 1-byte fetch was leaving the server 7 bytes short and desyncing the stream.
+> File copy (`0x22 RFBFileCopy_*`) is the next milestone and is not started.
 
 > **v1.0.0 — 2026-11-04.** First release where the client is subjectively on par
 > with the real `Screen Sharing.app` in normal use, confirmed by the owner on the
@@ -558,6 +567,30 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.1.0 — 2026-11-05
+
+Remote cursor and duplex clipboard, both owner-verified on the lab pair.
+
+- **Cursor**: advertise Apple `0x450` (alpha) and `0x44c` (position); decode
+  hotspot + ARGB bitmap + alpha plane, cache per connection (server ids are
+  monotonic), hide the local pointer and composite the bitmap ourselves.
+  Sizing comes from `0x451`, which carries both the point and the pixel
+  geometry: cursor bitmaps are in points (arrow 17x23, I-beam 9x18) while the
+  framebuffer is 2x, so scaling by `target_px / point_px` is what makes it the
+  right size. Shape changes arrive without pointer motion.
+- **Clipboard**: automatic and duplex, no flags. `AutoPasteboard(1)` at
+  connect, an 8-byte `0x0b` fetch at connect and on `0x14 cmd=2`, text via
+  `0x06`, images via a viewer `0x1f`, echo suppression on both. Images verified
+  byte-identical in both directions. `--no-clipboard` disables it all.
+- **The bug worth remembering**: `0x0b ClipboardFetch` is 8 bytes, byte 1 bit 0
+  = promises only. A 1-byte fetch leaves the server 7 bytes short, so it parses
+  the *next* message as `SetPixelFormat` and closes ~13 ms later. That, not any
+  server misbehaviour, is why the old client kept clipboard off.
+- **Not in v1.1.0**: file copy (`0x22`, a dedicated channel, not a pasteboard
+  flavour), clipboard image types beyond PNG/TIFF/JPEG preference, and the
+  local pasteboard polling (~700 ms, one process spawn per poll) which an
+  NSPasteboard change-count watcher should replace.
 
 ### v1.0.0 — 2026-11-04 (milestone)
 

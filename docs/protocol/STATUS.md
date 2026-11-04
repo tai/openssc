@@ -1,6 +1,6 @@
 # Protocol status / agent handoff
 
-## 2026-11-05 — clipboard: automatic duplex text + images (VERIFIED)
+## 2026-11-05 — **v1.1.0**: remote cursor + duplex clipboard (VERIFIED)
 
 - Phase / milestone: v1.0.x clipboard.
 - Verified:
