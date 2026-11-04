@@ -16,7 +16,7 @@ use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZeroU32;
 use std::sync::mpsc::{self, Receiver, Sender};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
@@ -121,6 +121,10 @@ static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static FOCUS_Y: AtomicU64 = AtomicU64::new(u64::MAX);
 static READER_UPDATES: AtomicU64 = AtomicU64::new(0);
 static READER_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of the last update that actually painted rectangles.
+static LAST_APPLIED_MS: AtomicU64 = AtomicU64::new(0);
+/// Set once the first pushed frame has been painted.
+static PUSH_PAINTED: AtomicBool = AtomicBool::new(false);
 /// Timestamp of the oldest local input event that has not been answered by a
 /// painted rectangle yet; `u64::MAX` means "nothing pending".
 static INPUT_PENDING_MS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -513,6 +517,7 @@ impl App {
         }
         let rect = Rect::new(r.x, r.y, r.w, r.h);
         let debug = self.debug_input;
+        let body_type = r.pixels.first().copied().unwrap_or(255);
         let applied = {
             // Disjoint field borrows: the decoder paints into mvs_bytes.
             let Self { mvs, mvs_bytes, .. } = self;
@@ -520,23 +525,40 @@ impl App {
             match dec.apply(&r.pixels, rect, mvs_bytes) {
                 Ok(Some(stats)) => {
                     if debug {
-                        eprintln!(
-                            "[{:6} ms] mvs {}x{}+{}+{} applied: {} cmds, {} dct, {} bits",
-                            now_ms(),
-                            r.w,
-                            r.h,
-                            r.x,
-                            r.y,
-                            stats.commands,
-                            stats.dct_blocks,
-                            stats.dct_bits
-                        );
+                        if body_type == 1 {
+                            eprintln!(
+                                "[{:6} ms] t1 {}x{}+{}+{} applied: {} tiles, {} refined",
+                                now_ms(),
+                                r.w,
+                                r.h,
+                                r.x,
+                                r.y,
+                                stats.tiles,
+                                stats.dct_blocks
+                            );
+                        } else {
+                            eprintln!(
+                                "[{:6} ms] t0 {}x{}+{}+{} applied: {} cmds, {} dct, {} bits",
+                                now_ms(),
+                                r.w,
+                                r.h,
+                                r.x,
+                                r.y,
+                                stats.commands,
+                                stats.dct_blocks,
+                                stats.dct_bits
+                            );
+                        }
                     }
                     true
                 }
                 Ok(None) => false, // quant table update
                 Err(e) => {
-                    eprintln!("mvs decode failed ({}x{}+{}+{}): {e:#}", r.w, r.h, r.x, r.y);
+                    // Never kill the session for one bad body.
+                    eprintln!(
+                        "mvs body t{body_type} {}x{}+{}+{} failed: {e:#}",
+                        r.w, r.h, r.x, r.y
+                    );
                     false
                 }
             }
@@ -1004,6 +1026,8 @@ impl ApplicationHandler<UserEvent> for App {
             if had_pixels {
                 self.frames += 1;
                 got_pixels = true;
+                LAST_APPLIED_MS.store(now_ms(), Ordering::Relaxed);
+                PUSH_PAINTED.store(true, Ordering::Relaxed);
                 self.record_input_latency();
                 if self.frames >= self.lat_next_report {
                     self.report_input_latency("latency report");
@@ -1084,6 +1108,8 @@ fn main() -> Result<()> {
     // MultiVariant (0x3f3): GPU-encoded tiles, ~40 ms per full frame instead
     // of the ~640 ms Zlib round trip.
     let mut mvs = false;
+    // Server-push MVS (0x09 + one provisioning request, then read-only).
+    let mut push = false;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1166,6 +1192,10 @@ fn main() -> Result<()> {
                 mvs = true;
                 i += 1;
             }
+            "--push" => {
+                push = true;
+                i += 1;
+            }
             "--exit-after-secs" if i + 1 < args.len() => {
                 exit_after_secs = Some(args[i + 1].parse()?);
                 i += 2;
@@ -1186,6 +1216,11 @@ fn main() -> Result<()> {
     } else {
         bands
     };
+
+    if push && !mvs {
+        eprintln!("--push requires --mvs (server push carries MultiVariant bodies)");
+        std::process::exit(2);
+    }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1222,12 +1257,25 @@ fn main() -> Result<()> {
     // Arm the framebuffer sender on the pre-split connection. Sending this
     // through the writer thread after split leaves the GUI without
     // server-pushed updates, while the same messages work from the CLI.
-    if auto_updates {
-        session.send_message(&rfb_proto::auto_framebuffer_update(fb_w, fb_h))?;
-    }
-    session.send_message(&framebuffer_update_request(fb_w, fb_h, false))?;
-    for _ in 1..pipeline {
-        session.send_message(&framebuffer_update_request(fb_w, fb_h, true))?;
+    if push {
+        // codecs.md 2.20.4: server push is enabled by 0x09 with
+        // `selected_screen = 0` (0xffffffff does not free-run on this build),
+        // followed by exactly ONE non-incremental 0x03. No polling after this.
+        session.send_message(&rfb_proto::auto_framebuffer_update_custom(
+            1, 0, fb_w, fb_h,
+        ))?;
+        session.send_message(&framebuffer_update_request(fb_w, fb_h, false))?;
+        eprintln!(
+            "push armed: 0x09 (version 1, screen 0) {fb_w}x{fb_h} + one non-incremental 0x03; no polling"
+        );
+    } else {
+        if auto_updates {
+            session.send_message(&rfb_proto::auto_framebuffer_update(fb_w, fb_h))?;
+        }
+        session.send_message(&framebuffer_update_request(fb_w, fb_h, false))?;
+        for _ in 1..pipeline {
+            session.send_message(&framebuffer_update_request(fb_w, fb_h, true))?;
+        }
     }
     let (reader, writer) = session.split()?;
 
@@ -1253,6 +1301,27 @@ fn main() -> Result<()> {
         {
             eprintln!("--evdev is Linux-only; use the trackpad/winit gestures on this platform");
         }
+    }
+
+    if push {
+        // Narrow watchdog: once the first pushed frame has been painted, if the
+        // stream goes quiet for more than 2 s, say so once and stop waiting.
+        // Deliberately does NOT fall back to polling, so a broken push stream
+        // is visible instead of silently costing a request per keystroke.
+        thread::spawn(move || loop {
+            thread::sleep(Duration::from_millis(200));
+            if !PUSH_PAINTED.load(Ordering::Relaxed) {
+                continue;
+            }
+            let quiet = now_ms().saturating_sub(LAST_APPLIED_MS.load(Ordering::Relaxed));
+            if quiet > 2000 {
+                eprintln!(
+                    "[{:6} ms] push: nothing applied for {quiet} ms after the initial paint; giving up on push (no polling fallback)",
+                    now_ms()
+                );
+                break;
+            }
+        });
     }
 
     let debug_writer = debug_input;
@@ -1387,6 +1456,26 @@ fn main() -> Result<()> {
                         break;
                     }
                     let _ = reader_proxy.send_event(UserEvent::Refresh);
+                    if push {
+                        // Server-push mode: never request. A display layout
+                        // change drains the pushed stream, so re-arm 0x09 plus
+                        // one non-incremental 0x03 exactly like the native
+                        // client; nothing else.
+                        if layout {
+                            let _ = tx_reader.send(
+                                rfb_proto::auto_framebuffer_update_custom(1, 0, fb_w, fb_h),
+                            );
+                            let _ = tx_reader
+                                .send(framebuffer_update_request(fb_w, fb_h, false));
+                            if debug_reader {
+                                eprintln!(
+                                    "[{:6} ms] display layout: re-armed 0x09 (screen 0) + one non-incremental 0x03",
+                                    now_ms()
+                                );
+                            }
+                        }
+                        continue;
+                    }
                     // This server build does not reliably free-run after the
                     // first auto frame. Poll with the *scaled* geometry so
                     // post-input dirty rectangles are always delivered.
