@@ -400,3 +400,19 @@ With this framing the parser consumes the **entire command stream** for the
 first time instead of desynchronising; only the long-run escape is still
 mismatched, which inflates the tile total. That is the last remaining piece
 before a full decoder.
+
+### 2.11 Current parse state (2026-11-04, end of session)
+
+With `[3-bit command][run][payload]`, tiles of **8x8** (grid 320x200 =
+**64,000** for 2560x1600), a 22-bit code-4 payload and a 6-bit DCT field, the
+parser consumes the whole command stream and totals **65,577** tiles. A sweep
+over payload sizes finds 63,637..65,577, i.e. within ~2.5% of the exact 64,000.
+
+That residual is the variable-length DCT block payload: the handler at
+`0x7ff9223ba76d` calls `0x7ff922480b28`, which decodes the block from the same
+bit-reader state and consumes as many bits as its coefficients require.
+
+So the remaining work is exactly one function: decode `0x7ff922480b28`
+(JPEG-style block: DC category + bits, then AC run/size pairs until EOB/ZRL,
+using the tables in `dump_mvs_tables.py`), which both fixes the tile count and
+makes DCT tiles renderable.
