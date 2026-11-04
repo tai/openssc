@@ -426,8 +426,8 @@ fn main() -> Result<()> {
                         for send in update.clipboard {
                             let archive = send.archive()?;
                             println!(
-                                "readback promise={} uncompressed={}",
-                                send.promise, send.uncompressed_size
+                                "readback flag={} uncompressed={}",
+                                send.flag, send.uncompressed_size
                             );
                             if let Some(t) = pasteboard_text(&archive)? {
                                 println!("remote text: {t:?}");
@@ -479,8 +479,8 @@ fn main() -> Result<()> {
                         for send in update.clipboard {
                             let archive = send.archive()?;
                             println!(
-                                "clipboard promise={} uncompressed={} archive={} bytes",
-                                send.promise,
+                                "clipboard flag={} uncompressed={} archive={} bytes",
+                                send.flag,
                                 send.uncompressed_size,
                                 archive.len()
                             );

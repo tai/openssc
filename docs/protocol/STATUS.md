@@ -1,5 +1,36 @@
 # Protocol status / agent handoff
 
+## 2026-11-05 — clipboard: automatic duplex text + images (VERIFIED)
+
+- Phase / milestone: v1.0.x clipboard.
+- Verified:
+  - `0x0b ClipboardFetch` is **8 bytes**, byte 1 bit 0 = "promises only". Our
+    old 1-byte fetch left the server 7 bytes short, so the *next* message was
+    parsed as SetPixelFormat and the session closed ~13 ms later. That was the
+    long-standing "the fetch closes the session" bug — it was our framing.
+  - Duplex works with `AutoPasteboard(1)` active: a fetch with flags 0 returns
+    the real archive even while the viewer is the pasteboard provider. Native
+    client does exactly this (`only want promises` at connect, `send all data`
+    after a remote copy).
+  - `0x14 cmd=2` is really sent by this build and triggers the fetch.
+  - Viewer→server `0x1f` (`HandleViewerClipboardSend`) is the same 16-byte
+    header + zlib archive, so images push over the same format as text.
+  - Images round-trip byte-identically both ways (sha1 matched on 549 B and
+    21484 B PNGs), with echo suppression to stop ping-pong.
+- Changed: `rfb-proto` gains `pasteboard_items`/`pasteboard_image`/
+  `viewer_clipboard_send` and the 8-byte fetch; `ss-gui` now enables clipboard
+  by default (AutoPasteboard, fetch on connect and on `0x14 cmd=2`, local
+  watcher, echo suppression) with `--no-clipboard` as the escape hatch.
+- Captures / experiments (untracked): `artifacts/verify-clip.log`,
+  `artifacts/cb-recon/`, `artifacts/clipboard-recon.md`.
+- Open: the local pasteboard is polled every ~700 ms (a process spawn per poll);
+  an NSPasteboard change-count watcher would remove that. File copy (`0x22`
+  `RFBFileCopy_*`) is a separate milestone and not started.
+- Next command: `cargo run -p ss-gui -- --host mm.local --mvs` and copy
+  something in either direction.
+- Lab state: `mm.local` answers `RFB 003.889`; console user `tai` logged in; no
+  stray clients or captures.
+
 ## 2026-11-04 — **v1.0.0**
 
 - Milestone: the client is now on par with the real `Screen Sharing.app` in

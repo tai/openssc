@@ -10,7 +10,8 @@ use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
     gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
-    key_event, pasteboard_text, pointer_event, AppleSession, CursorUpdate, Update,
+    key_event, image_item, pasteboard_archive, pasteboard_image, pasteboard_text,
+    pointer_event, viewer_clipboard_send, AppleSession, CursorUpdate, Update,
 };
 use std::fs::File;
 use std::io::BufWriter;
@@ -165,6 +166,105 @@ fn local_clipboard_text() -> Option<String> {
         return None;
     }
     Some(String::from_utf8_lossy(&out.stdout).to_string())
+}
+
+/// Stable fingerprint for echo suppression of images.
+fn hash_bytes(data: &[u8]) -> u64 {
+    let mut h = 0xcbf2_9ce4_8422_2325u64;
+    for &b in data {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x1000_0000_01b3);
+    }
+    h ^ (data.len() as u64)
+}
+
+/// Read the local clipboard image (PNG) if the pasteboard holds one.
+fn local_clipboard_image() -> Option<(&'static str, Vec<u8>)> {
+    #[cfg(target_os = "macos")]
+    {
+        let path = std::env::temp_dir().join(format!(
+            "ss-clone-read-clip-{}.png",
+            std::process::id()
+        ));
+        let script = format!(
+            "try\nset d to (the clipboard as «class PNGf»)\nset f to open for access POSIX file \"{}\" with write permission\nset eof of f to 0\nwrite d to f\nclose access f\non error\nend try",
+            path.display()
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+        let data = std::fs::read(&path).ok();
+        let _ = std::fs::remove_file(&path);
+        let data = data?;
+        if data.starts_with(b"\x89PNG\r\n\x1a\n") {
+            return Some(("public.png", data));
+        }
+        None
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let out = std::process::Command::new("wl-paste")
+            .args(["--type", "image/png"])
+            .output()
+            .ok()?;
+        if out.status.success() && out.stdout.starts_with(b"\x89PNG\r\n\x1a\n") {
+            Some(("public.png", out.stdout))
+        } else {
+            None
+        }
+    }
+}
+
+/// Put an image on the local clipboard. The archive already carries encoded
+/// bytes (`public.png`/`public.tiff`/`public.jpeg`), so write them to a temp
+/// file and let the platform clipboard service take the file's contents.
+fn set_local_clipboard_image(uti: &str, data: &[u8]) {
+    let (ext, class) = match uti {
+        "public.tiff" => ("tiff", "TIFF"),
+        "public.jpeg" => ("jpg", "JPEG"),
+        _ => ("png", "PNGf"),
+    };
+    let path = std::env::temp_dir().join(format!(
+        "ss-clone-clipboard-{}-{}.{ext}",
+        std::process::id(),
+        now_ms()
+    ));
+    if std::fs::write(&path, data).is_err() {
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let script = format!(
+            "set the clipboard to (read (POSIX file \"{}\") as «class {class}»)",
+            path.display()
+        );
+        let _ = std::process::Command::new("osascript")
+            .arg("-e")
+            .arg(script)
+            .status();
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let mime = match uti {
+            "public.tiff" => "image/tiff",
+            "public.jpeg" => "image/jpeg",
+            _ => "image/png",
+        };
+        use std::io::Write;
+        if let Ok(mut child) = std::process::Command::new("wl-copy")
+            .arg("--type")
+            .arg(mime)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(data);
+            }
+            let _ = child.wait();
+        }
+    }
+    let _ = std::fs::remove_file(&path);
 }
 
 /// Replace the local text clipboard.
@@ -1415,12 +1515,12 @@ fn main() -> Result<()> {
     let mut exit_after_dump = false;
     let mut scale = 1.0f64;
     let mut debug_input = false;
-    // Off by default until the fetch round-trip is proven stable; the 0x0b
-    // ClipboardFetch makes this server build close the viewer right after it
-    // answers (observed "going to close 5").
-    let mut clipboard = false;
-    // Writing the clipboard needs AutoPasteboard, which puts the server into
-    // promise mode and stops it sending real remote clipboard data.
+    // Clipboard sync is automatic and bidirectional. The 0x0b fetch is sent
+    // as the full 8-byte message (a 1-byte fetch shifts the server's message
+    // parser by 7 bytes and closes the session) and asks for full data.
+    let mut clipboard = true;
+    // Kept for compatibility with existing lab scripts; the write path is part
+    // of the default duplex now.
     let mut clipboard_send = false;
     // Experimental: server-pushed dirty rectangles instead of polling.
     let mut auto_updates = false;
@@ -1602,9 +1702,10 @@ fn main() -> Result<()> {
         session.send_message(&rfb_proto::set_encodings(&[6, 0x450, 0x44c, 0x451, 0x453]))?;
         eprintln!("advertised Zlib (6) + cursor 0x450/0x44c + DisplayInfo");
     }
-    if clipboard_send {
+    if clipboard {
         session.send_message(&rfb_proto::auto_pasteboard(1))?;
-        eprintln!("clipboard write mode: AutoPasteboard enabled (remote reads become promises)");
+        eprintln!("clipboard: automatic duplex (AutoPasteboard start, full-data fetches)");
+        let _ = clipboard_send;
     }
     let req_w = session.info.width;
     let req_h = session.info.height;
@@ -1700,29 +1801,65 @@ fn main() -> Result<()> {
     // Text most recently applied from the remote, so we do not echo it back.
     let clip_echo: Arc<std::sync::Mutex<Option<String>>> =
         Arc::new(std::sync::Mutex::new(None));
-    if clipboard && clipboard_send {
+    // Fingerprint of the last image applied from the remote, so the local
+    // watcher does not bounce it back.
+    let image_echo: Arc<std::sync::Mutex<Option<u64>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    if clipboard {
         let tx_clip = tx_out.clone();
         let debug_clip = debug_input;
         let clip_echo = clip_echo.clone();
+        let image_echo = image_echo.clone();
         thread::spawn(move || {
-            let mut last = String::new();
+            let mut last_text = String::new();
             loop {
                 thread::sleep(Duration::from_millis(700));
-                let Some(text) = local_clipboard_text() else { continue };
-                if text.is_empty() || text == last {
+                let text = local_clipboard_text().unwrap_or_default();
+                if !text.is_empty() {
+                    if text == last_text {
+                        continue;
+                    }
+                    let echo = clip_echo
+                        .lock()
+                        .map(|e| e.as_deref() == Some(text.as_str()))
+                        .unwrap_or(false);
+                    last_text = text.clone();
+                    if echo {
+                        // We just wrote this into the local clipboard; do not
+                        // send it straight back to the server.
+                        continue;
+                    }
+                    if debug_clip {
+                        eprintln!("clipboard -> {:?}", text);
+                    }
+                    // Remember what we sent: the server echoes the viewer's
+                    // own pasteboard back via a cmd=2 fetch.
+                    if let Ok(mut e) = clip_echo.lock() {
+                        *e = Some(text.clone());
+                    }
+                    if tx_clip.send(client_cut_text(text.as_bytes())).is_err() {
+                        break;
+                    }
                     continue;
                 }
-                if clip_echo.lock().map(|e| e.as_deref() == Some(text.as_str())).unwrap_or(false) {
-                    // We just wrote this into the local clipboard; do not send
-                    // it straight back to the server.
-                    last = text;
+                // No text: an image on the local clipboard is pushed as a
+                // viewer→server 0x1f pasteboard archive (0x06 is text-only).
+                let Some((uti, data)) = local_clipboard_image() else { continue };
+                let h = hash_bytes(&data);
+                if image_echo.lock().map(|e| *e == Some(h)).unwrap_or(false) {
                     continue;
                 }
-                last = text.clone();
+                if let Ok(mut e) = image_echo.lock() {
+                    *e = Some(h);
+                }
+                let archive = pasteboard_archive(&[image_item(uti, &data)]);
                 if debug_clip {
-                    eprintln!("clipboard -> {:?}", text);
+                    eprintln!("clipboard -> image {uti} {} bytes", data.len());
                 }
-                if tx_clip.send(client_cut_text(text.as_bytes())).is_err() {
+                if tx_clip
+                    .send(viewer_clipboard_send(&archive, false))
+                    .is_err()
+                {
                     break;
                 }
             }
@@ -1730,6 +1867,7 @@ fn main() -> Result<()> {
     }
 
     let clip_echo_reader = clip_echo.clone();
+    let image_echo_reader = image_echo.clone();
     let tx_reader = tx_out.clone();
     let reader_proxy = proxy.clone();
     let debug_reader = debug_input;
@@ -1756,7 +1894,7 @@ fn main() -> Result<()> {
             (0, y as u16, fb_w, h)
         };
         let mut next_band = 0usize;
-        let clip_wanted = clipboard && !clipboard_send;
+        let clip_wanted = clipboard;
         let mut full_seen = !mvs;
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
@@ -1772,15 +1910,51 @@ fn main() -> Result<()> {
                             let _ = tx_reader.send(clipboard_fetch());
                         }
                         for send in &update.clipboard {
-                            match send.archive().and_then(|a| pasteboard_text(&a)) {
-                                Ok(Some(text)) => {
+                            let archive = match send.archive() {
+                                Ok(a) => a,
+                                Err(e) => {
+                                    eprintln!("clipboard archive: {e:#}");
+                                    continue;
+                                }
+                            };
+                            // Prefer an image flavour; fall back to text.
+                            match pasteboard_image(&archive) {
+                                Ok(Some(img)) => {
                                     if debug_reader {
-                                        eprintln!("clipboard <- {:?}", text);
+                                        eprintln!(
+                                            "clipboard <- image {} {} bytes",
+                                            img.uti,
+                                            img.data.len()
+                                        );
                                     }
-                                    if let Ok(mut e) = clip_echo_reader.lock() {
-                                        *e = Some(text.clone());
+                                    if let Ok(mut e) = image_echo_reader.lock() {
+                                        *e = Some(hash_bytes(&img.data));
                                     }
-                                    set_local_clipboard(&text);
+                                    set_local_clipboard_image(&img.uti, &img.data);
+                                    continue;
+                                }
+                                Ok(None) => {}
+                                Err(e) => eprintln!("clipboard image decode: {e:#}"),
+                            }
+                            match pasteboard_text(&archive) {
+                                Ok(Some(text)) => {
+                                    let echo = clip_echo_reader
+                                        .lock()
+                                        .map(|e| e.as_deref() == Some(text.as_str()))
+                                        .unwrap_or(false);
+                                    if debug_reader {
+                                        eprintln!(
+                                            "clipboard <- {:?}{}",
+                                            text,
+                                            if echo { " (echo, skipped)" } else { "" }
+                                        );
+                                    }
+                                    if !echo {
+                                        if let Ok(mut e) = clip_echo_reader.lock() {
+                                            *e = Some(text.clone());
+                                        }
+                                        set_local_clipboard(&text);
+                                    }
                                 }
                                 Ok(None) => {}
                                 Err(e) => eprintln!("clipboard decode: {e:#}"),

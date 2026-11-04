@@ -1,42 +1,46 @@
 # Clipboard / pasteboard — Apple Screen Sharing
 
-Status: **text clipboard VERIFIED in both directions** (2026-11-03, `mm.local`).
-Images and file copy are still TODO.
+Status: **text and images VERIFIED in both directions, automatic and duplex**
+(2026-11-05, `mm.local`). File copy is a separate protocol and is **not**
+implemented (§7).
 
-Evidence: `artifacts/gui-clip3.log` (remote→local), `artifacts/gui-clip5.log`
-(local→remote), `artifacts/clipboard-archive.bin`, `artifacts/cb-live*.log`,
-server/agent logs captured in `artifacts/server-cb.log`, `artifacts/agent-cb.log`.
+Evidence: `artifacts/verify-clip.log` (this round: text both ways, PNG both ways
+with matching sha1), `artifacts/cb-impl-*.log`, `artifacts/cb-recon/` (native
+session unified logs + daemon disassembly), `artifacts/clipboard-recon.md`
+(working notes). Earlier text evidence: `artifacts/gui-clip3.log`,
+`artifacts/gui-clip5.log`, `artifacts/server-cb.log`, `artifacts/agent-cb.log`.
 
 ## 1. Messages
 
-| Type | Direction | Purpose |
-|------|-----------|---------|
-| `0x06` | client→server | standard RFB `ClientCutText`. **Only lands on the remote pasteboard while `0x15 AutoPasteboard(1)` is active** (VERIFIED: without it the server accepts the text — `viewer text size N`, `clipboard first read N bytes` — but the remote pasteboard stays empty). |
-| `0x15` | client→server | `AutoPasteboard`, 8 bytes: `type, reserved[2], selector, reserved[4]`. `1` = start, `2` = stop. Server log: `autopasteboard 1`. |
-| `0x0b` | client→server | `ClipboardFetch`, a single byte. Asks for the current remote pasteboard. |
-| `0x14` | server→client | `MiscStatus`, 8 bytes. `cmd = 2` (bytes 6..8) = remote clipboard changed → reply with `0x0b`. Has **not** been observed on this build yet (see §4). |
-| `0x1f` | server→client | `ClipboardSend`, see §2. |
+| Type | Direction | Size | Purpose |
+|------|-----------|------|---------|
+| `0x06` | client→server | 8 + n | standard RFB `ClientCutText`. Only lands on the remote pasteboard while `0x15 AutoPasteboard(1)` is active. |
+| `0x0a` | client→server | 5 | status/select, BE16 selector at bytes 2..4 (no log unless verbose). |
+| `0x0b` | client→server | **8** | `ClipboardFetch`. Byte 1 bit 0 = "promises only"; 0 = send all data. **Must be 8 bytes** — see §3. |
+| `0x14` | server→client | 8 | `MiscStatus`. `cmd = be16(6..8)`; `cmd = 2` = remote pasteboard changed → reply with a `0x0b` fetch. Observed on this build: `14 00 00 04 00 01 00 02`. |
+| `0x15` | client→server | 8 | `AutoPasteboard`, selector 1 = start, 2 = stop. Makes the viewer the pasteboard *provider*. |
+| `0x1f` | server→client | 16 + c | `ClipboardSend`: zlib-compressed pasteboard archive. |
+| `0x1f` | client→server | 16 + c | `HandleViewerClipboardSend`: same layout, used to push the viewer's pasteboard. |
+| `0x22` | both | — | `HandleFileCopyMessage`: the dedicated file-transfer channel (§7), not the pasteboard. |
 
-## 2. `0x1f` ClipboardSend
+## 2. The archive
+
+`0x1f` in either direction is a 16-byte header followed by a zlib stream
+(`Z_SYNC_FLUSH`, no final block — inflate with a sync flush and stop at
+`uncompressed_size`):
 
 ```
 +0x00 u8  0x1f
 +0x01 u8  pad
-+0x02 u8  promise        # 1 = flavour list only, no data
++0x02 u8  promise flag (bit 0)      # do not trust this alone, see below
 +0x03 u8  pad
-+0x04 u32 (unlabelled; observed 0 or 10)
++0x04 u32 (unlabelled, observed 0)
 +0x08 u32 uncompressed_size
 +0x0c u32 compressed_size
-+0x10 ... zlib stream, `Z_SYNC_FLUSH` framed
++0x10 ... zlib stream
 ```
 
-The payload is **not** length-prefixed at the end; `compressed_size` closes the
-message, so the frame is `16 + compressed_size` bytes (observed 197 for a
-promise archive). A strict zlib reader fails with "incomplete deflate stream"
-because the final block is never emitted — use `Decompress` with
-`FlushDecompress::Sync` and stop at `uncompressed_size`.
-
-### 2.1 Inner archive
+Inner archive:
 
 ```
 u32 item_count
@@ -48,84 +52,106 @@ per item:
   u32 data_len, data bytes
 ```
 
-Flavours seen for a plain-text copy:
+Text flavours: `public.utf8-plain-text`, `public.utf16-plain-text` (UTF-16BE),
+`com.apple.traditional-mac-plain-text` (latin-1), each with aliases
+(`com.apple.ostype`, `public.mime-type`, …).
 
-| UTI | Aliases | Data |
-|-----|---------|------|
-| `public.utf16-plain-text` | `com.apple.ostype=utf8`… , `public.mime-type=text/plain;charset=utf-16` | UTF-16BE |
-| `com.apple.traditional-mac-plain-text` | `com.apple.ostype=TEXT` | latin-1 |
-| `public.utf8-plain-text` | `com.apple.ostype=utf8`, `com.apple.nspboard-type=NSStringPboardType`, `public.mime-type=text/plain;charset=utf-8` | UTF-8 |
+Image flavours: `public.png`, `public.tiff`, `public.jpeg`. We prefer PNG, then
+TIFF, then JPEG.
 
-`u32 item_count` alone covers an empty clipboard (`uncompressed_size = 0`).
+**The +2 byte is not a reliable promise indicator.** It is 1 both for an empty
+reply and for a real archive carrying data. Treat `uncompressed_size == 0` or
+empty per-item data as "no data".
 
-## 3. Promise semantics (important)
+## 3. `0x0b ClipboardFetch` is 8 bytes — and the old "fetch closes the session" bug
 
-Enabling `0x15 AutoPasteboard(1)` makes the **viewer the clipboard provider**.
-From then on every `0x1f` the server sends has `promise = 1` and every flavour
-carries `data_len = 0`, i.e. "this pasteboard belongs to you, I will not resend
-it". Verified both ways:
+Historical note, because it cost a long time: our first implementation sent a
+**single bytes** `0x0b`. The server's handler consumes a fixed 8-byte body, so it
+read our next 7 bytes from the *following* message. Its reply was still correct,
+which made the bug look like a server-side close: the next `0x03
+FramebufferUpdateRequest` was then parsed as `SetPixelFormat`
+(`bitsperpixel 1 … viewer result -2 … going to close 9`), and the session died
+~13 ms later. Padding with zeros was worse — the server read `0x00` as
+`SetPixelFormat` immediately.
 
-- **No AutoPasteboard** → `0x0b` fetch returns the real remote text
-  (`text: "GUI_COPY_NOAUTO\n"`).
-- **With AutoPasteboard** → the same fetch returns a promise archive with no
-  data, and the remote pasteboard is only readable through AppKit
-  (`osascript -e "the clipboard as text"`), never through `pbpaste`.
+Send exactly:
 
-Consequences for the client:
-
-- `ss-gui --clipboard` = **read mode**: no AutoPasteboard, fetch on connect,
-  apply the decoded text to the local clipboard. Off by default: see §3.1.
-- `ss-gui --send-clipboard` = **write mode**: AutoPasteboard(1) at connect, push
-  local clipboard changes with `0x06`. Remote→local reads are disabled in this
-  mode on purpose, because they would only ever yield promises.
-- Both directions at once on a single connection is an **open question** (§4).
-
-### 3.1 The fetch closes the viewer (open bug)
-
-`0x0b ClipboardFetch` gets a correct answer — the server logs
-`HandleViewerClipboardRequest`, `uncompressed size 96 pasteboardDataCnt 87` —
-and then closes the session ~13 ms later (`closing 0`, `going to close 5`).
-The client sees `failed to fill whole buffer`.
-
-What we ruled out:
-
-- **Padding the fetch.** Sending `0x0b` padded to 1/4/8/12 bytes behaves
-  identically. Zero padding is actively harmful: the server then reads `0x00`
-  as SetPixelFormat and logs `bitsperpixel 1 … Only 16 or 32 bit pixels
-  supported`, `viewer result -2`, `going to close 9`.
-- **Pacing.** Issuing no framebuffer requests at all means the answer never
-  arrives (the reply seems to be piggybacked on framebuffer traffic), so the
-  close cannot be avoided by idling.
-
-Until the request framing is recovered, `ss-gui` leaves clipboard sync off and
-exposes it only through `--clipboard` / `--send-clipboard`.
-
-## 4. Open questions
-
-- How does the native client keep bidirectional sync on one connection? It
-  enables AutoPasteboard and still receives remote copies, so either a viewer
-  capability declares promise support, or `0x14 cmd=2` triggers a fetch that
-  returns real data once the item was *not* created by the viewer. Our fetches
-  after a GUI-session `pbcopy` returned no new `0x1f` at all.
-- `0x14 cmd=2` was never observed; only `cmd=12` (heartbeat) and `cmd=4`.
-- Whether promise items survive disconnect: they do not. Once the viewer
-  disconnects the remote pasteboard empties, so a one-shot "send then exit"
-  client leaves nothing behind.
-- Image (`public.png`) and file-copy flavours are not implemented.
-
-## 5. Verifying on `mm.local`
-
-```sh
-# Remote -> local (default mode)
-ssh tai@mm.local 'echo REMOTE_TEXT | sudo -n launchctl asuser 501 pbcopy'
-cargo run -p ss-gui -- --host mm.local --debug-input   # local pbpaste updates
-
-# Local -> remote (write mode)
-printf 'LOCAL_TEXT' | pbcopy
-cargo run -p ss-gui -- --host mm.local --send-clipboard
-ssh tai@mm.local 'osascript -e "the clipboard as text"'   # NOT pbpaste
+```
+0b 00 00 00 00 00 00 00        # flags = 0 -> send all data
 ```
 
-`pbpaste` runs in a different bootstrap namespace unless started with
-`sudo -n launchctl asuser 501 pbpaste`, and it cannot materialise promises —
-prefer `osascript` when checking the remote pasteboard.
+Flags bit 0 = 1 asks for the flavour list only ("only want promises"). With
+`AutoPasteboard(1)` active, a **flags = 0** fetch still returns the real archive;
+that is how the native client gets duplex.
+
+## 4. Duplex (VERIFIED)
+
+The native client: `AutoPasteboard(1)` ~400 ms after `HandleViewerInfoMessage`,
+then an initial fetch with promise-only, and a full-data fetch whenever the
+remote pasteboard changes. Its daemon log shows `only want promises` at connect
+and `send all data` after a remote copy.
+
+Our client now does the same, automatically:
+
+- `AutoPasteboard(1)` at connect;
+- `0x0b` fetch with flags 0 at connect and on every `0x14 cmd=2`;
+- local clipboard changes pushed with `0x06 ClientCutText` (text) or `0x1f`
+  (images), with echo suppression so a fetched item is not sent straight back;
+- `--no-clipboard` disables all of it (no `0x15`, no fetch, no watcher).
+
+Verified live on one connection: remote copy → local `pbpaste`; local copy →
+remote clipboard read back via `osascript`; no stall, no close, 582 framebuffer
+updates during the session.
+
+Known cost: the local pasteboard is polled (`pbpaste` / `osascript` per poll,
+~700 ms). That is a process spawn per poll, so it is the obvious thing to
+replace with an NSPasteboard change-count watcher later.
+
+## 5. Images (VERIFIED, byte-identical)
+
+- Receive: a PNG placed on the `mm.local` console pasteboard arrives as
+  `clipboard <- image public.png N bytes` and is installed on the local
+  clipboard. A 21484-byte `screencapture` round-tripped with an identical sha1.
+- Send: a local PNG is read with `osascript` (`«class PNGf»`) and pushed as a
+  viewer `0x1f` archive. Verified by reading the remote clipboard back to a file:
+  sha1 `510cfbee…` on both sides, 549 bytes.
+- The server echoes the viewer's own push back as a `0x1f`; echo suppression by
+  content fingerprint prevents a ping-pong loop.
+
+## 6. What the server will not do
+
+- With no `AutoPasteboard`, `0x06` is accepted and even logged
+  (`viewer text size N`) but the remote pasteboard stays empty.
+- Promise items do not survive disconnect: the remote pasteboard empties.
+- `pbpaste` on the remote cannot read promises; use `osascript -e
+  'the clipboard as text'`, or `sudo -n launchctl asuser 501 pbpaste` for real
+  data.
+
+## 7. File copy (not implemented)
+
+Native file copy is **not** a pasteboard flavour. The daemon has a dedicated
+`0x22 HandleFileCopyMessage` channel with `RFBFileCopy_StartFileSendMessage`
+(path + length) and `RFBFileCopy_StartFileReceiveMessage`, and the app has UI
+state for it (`FileTransferHistory` with direction, paths, byte counts). No
+`public.file-url` flavour was observed. Implementing it is a separate milestone:
+message numbering and the directional start handshake are known, the transfer
+framing is not.
+
+## 8. Verifying on `mm.local`
+
+```sh
+# remote -> local text
+ssh tai@mm.local 'printf "R2L\n" | sudo -n launchctl asuser 501 pbcopy'
+pbpaste            # expect R2L
+
+# local -> remote text (auto, no flags)
+printf 'L2R\n' | pbcopy
+ssh tai@mm.local 'osascript -e "the clipboard as text"'
+
+# local -> remote image, byte check
+osascript -e 'set the clipboard to (read (POSIX file "/tmp/x.png") as «class PNGf»)'
+ssh tai@mm.local 'osascript -e "set png to the clipboard as «class PNGf»" \
+  -e "set f to open for access POSIX file \"/tmp/rt.png\" with write permission" \
+  -e "set eof f to 0" -e "write png to f" -e "close access f"'
+ssh tai@mm.local 'shasum /tmp/rt.png'
+```

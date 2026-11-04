@@ -836,8 +836,10 @@ pub struct Update {
 /// Apple `0x1f` ClipboardSend: a zlib-compressed pasteboard archive.
 #[derive(Debug, Clone)]
 pub struct ClipboardSend {
-    /// The server only promises the data; the bytes are not materialised yet.
-    pub promise: bool,
+    /// Byte at +2 of the message. Measured as 1 both for an empty reply and
+    /// for a real archive, so it is NOT a promise indicator; use
+    /// `uncompressed_size == 0` (or empty item data) for "no data".
+    pub flag: u8,
     pub uncompressed_size: u32,
     pub compressed: Vec<u8>,
 }
@@ -865,16 +867,38 @@ impl ClipboardSend {
     }
 }
 
-/// The text flavour of a decoded pasteboard archive, if any.
-pub fn pasteboard_text(archive: &[u8]) -> Result<Option<String>> {
+/// One flavour inside a decoded pasteboard archive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PasteboardItem {
+    /// Uniform Type Identifier, e.g. `public.png`.
+    pub uti: String,
+    /// `(name, value)` metadata pairs (ostype, mime-type, nspboard-type).
+    pub aliases: Vec<(String, String)>,
+    /// Raw flavour data; empty when the server sent a promise-only archive.
+    pub data: Vec<u8>,
+}
+
+impl PasteboardItem {
+    pub fn alias(&self, name: &str) -> Option<&str> {
+        self.aliases
+            .iter()
+            .find(|(n, _)| n == name)
+            .map(|(_, v)| v.as_str())
+    }
+}
+
+/// Decode every flavour in a pasteboard archive.
+///
+/// Layout: `u32 item_count`, then per item `u32 uti_len, uti, u32 reserved,
+/// u32 alias_count, [u32 name_len, name, u32 value_len, value]*, u32 data_len,
+/// data`.
+pub fn pasteboard_items(archive: &[u8]) -> Result<Vec<PasteboardItem>> {
     if archive.is_empty() {
-        return Ok(None);
+        return Ok(Vec::new());
     }
     let mut p = 0usize;
     let count = read_be32_at(archive, &mut p)?;
-    let mut utf8 = None;
-    let mut utf16 = None;
-    let mut latin1 = None;
+    let mut items = Vec::new();
     for _ in 0..count {
         let uti_len = read_be32_at(archive, &mut p)? as usize;
         if p + uti_len > archive.len() {
@@ -883,41 +907,144 @@ pub fn pasteboard_text(archive: &[u8]) -> Result<Option<String>> {
         let uti = String::from_utf8_lossy(&archive[p..p + uti_len]).to_string();
         p += uti_len;
         let _reserved = read_be32_at(archive, &mut p)?;
-        let aliases = read_be32_at(archive, &mut p)?;
-        for _ in 0..aliases {
+        let alias_count = read_be32_at(archive, &mut p)? as usize;
+        let mut aliases = Vec::with_capacity(alias_count);
+        for _ in 0..alias_count {
             let nlen = read_be32_at(archive, &mut p)? as usize;
             if p + nlen > archive.len() {
                 bail!("pasteboard alias name out of range");
             }
+            let name = String::from_utf8_lossy(&archive[p..p + nlen]).to_string();
             p += nlen;
             let vlen = read_be32_at(archive, &mut p)? as usize;
             if p + vlen > archive.len() {
                 bail!("pasteboard alias value out of range");
             }
+            let value = String::from_utf8_lossy(&archive[p..p + vlen]).to_string();
             p += vlen;
+            aliases.push((name, value));
         }
         let dlen = read_be32_at(archive, &mut p)? as usize;
         if p + dlen > archive.len() {
             bail!("pasteboard data out of range");
         }
-        let data = &archive[p..p + dlen];
+        let data = archive[p..p + dlen].to_vec();
         p += dlen;
-        match uti.as_str() {
-            "public.utf8-plain-text" => utf8 = Some(String::from_utf8_lossy(data).to_string()),
-            "public.utf16-plain-text" => {
-                let units: Vec<u16> = data
-                    .chunks_exact(2)
-                    .map(|c| u16::from_be_bytes([c[0], c[1]]))
-                    .collect();
-                utf16 = Some(String::from_utf16_lossy(&units));
-            }
-            "com.apple.traditional-mac-plain-text" => {
-                latin1 = Some(data.iter().map(|&b| b as char).collect::<String>())
-            }
-            _ => {}
+        items.push(PasteboardItem { uti, aliases, data });
+    }
+    Ok(items)
+}
+
+/// The text flavour of a decoded pasteboard archive, if any.
+pub fn pasteboard_text(archive: &[u8]) -> Result<Option<String>> {
+    let items = pasteboard_items(archive)?;
+    let find = |uti: &str| {
+        items
+            .iter()
+            .find(|it| it.uti == uti && !it.data.is_empty())
+    };
+    if let Some(it) = find("public.utf8-plain-text") {
+        return Ok(Some(String::from_utf8_lossy(&it.data).to_string()));
+    }
+    if let Some(it) = find("public.utf16-plain-text") {
+        let units: Vec<u16> = it
+            .data
+            .chunks_exact(2)
+            .map(|c| u16::from_be_bytes([c[0], c[1]]))
+            .collect();
+        return Ok(Some(String::from_utf16_lossy(&units)));
+    }
+    if let Some(it) = find("com.apple.traditional-mac-plain-text") {
+        return Ok(Some(it.data.iter().map(|&b| b as char).collect()));
+    }
+    Ok(None)
+}
+
+/// Encode items into a pasteboard archive (the inner layout used by `0x1f`).
+pub fn pasteboard_archive(items: &[PasteboardItem]) -> Vec<u8> {
+    let mut b = Vec::new();
+    b.extend_from_slice(&(items.len() as u32).to_be_bytes());
+    for it in items {
+        b.extend_from_slice(&(it.uti.len() as u32).to_be_bytes());
+        b.extend_from_slice(it.uti.as_bytes());
+        b.extend_from_slice(&0u32.to_be_bytes());
+        b.extend_from_slice(&(it.aliases.len() as u32).to_be_bytes());
+        for (name, value) in &it.aliases {
+            b.extend_from_slice(&(name.len() as u32).to_be_bytes());
+            b.extend_from_slice(name.as_bytes());
+            b.extend_from_slice(&(value.len() as u32).to_be_bytes());
+            b.extend_from_slice(value.as_bytes());
+        }
+        b.extend_from_slice(&(it.data.len() as u32).to_be_bytes());
+        b.extend_from_slice(&it.data);
+    }
+    b
+}
+
+/// A pasteboard item for encoded image bytes, with the aliases the agent
+/// expects (`public.png` + mime/ostype).
+pub fn image_item(uti: &str, data: &[u8]) -> PasteboardItem {
+    let (mime, ostype) = match uti {
+        "public.tiff" => ("image/tiff", "TIFF"),
+        "public.jpeg" => ("image/jpeg", "JPEG"),
+        _ => ("image/png", "PNG "),
+    };
+    PasteboardItem {
+        uti: uti.to_string(),
+        aliases: vec![
+            ("public.mime-type".to_string(), mime.to_string()),
+            ("com.apple.ostype".to_string(), ostype.to_string()),
+        ],
+        data: data.to_vec(),
+    }
+}
+
+/// Viewer→server `0x1f` ClipboardSend (the native client's local→remote image
+/// path). Layout verified from the daemon: 16-byte header, then the archive
+/// zlib-compressed with Z_SYNC_FLUSH, exactly like the server→client message:
+/// `type, pad, promise, pad, u32@4, u32 uncompressed, u32 compressed, data`.
+/// Accepted only while `0x15 AutoPasteboard(1)` is active.
+pub fn viewer_clipboard_send(archive: &[u8], promise: bool) -> Vec<u8> {
+    let compressed = zlib_compress_sync(archive);
+    let mut b = Vec::with_capacity(16 + compressed.len());
+    b.extend_from_slice(&[0x1f, 0, u8::from(promise), 0]);
+    b.extend_from_slice(&0u32.to_be_bytes());
+    b.extend_from_slice(&(archive.len() as u32).to_be_bytes());
+    b.extend_from_slice(&(compressed.len() as u32).to_be_bytes());
+    b.extend_from_slice(&compressed);
+    b
+}
+
+fn zlib_compress_sync(data: &[u8]) -> Vec<u8> {
+    let mut c = flate2::Compress::new(flate2::Compression::default(), true);
+    let mut out = vec![0u8; data.len() * 2 + 256];
+    let before = c.total_out();
+    c.compress(data, &mut out, flate2::FlushCompress::Sync)
+        .expect("zlib compress");
+    out.truncate((c.total_out() - before) as usize);
+    out
+}
+
+/// An image flavour of a decoded pasteboard archive.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PasteboardImage {
+    /// `public.png`, `public.tiff` or `public.jpeg`.
+    pub uti: String,
+    pub data: Vec<u8>,
+}
+
+/// Pick the best image flavour: PNG, then TIFF, then JPEG.
+pub fn pasteboard_image(archive: &[u8]) -> Result<Option<PasteboardImage>> {
+    let items = pasteboard_items(archive)?;
+    for uti in ["public.png", "public.tiff", "public.jpeg"] {
+        if let Some(it) = items.iter().find(|it| it.uti == uti && !it.data.is_empty()) {
+            return Ok(Some(PasteboardImage {
+                uti: uti.to_string(),
+                data: it.data.clone(),
+            }));
         }
     }
-    Ok(utf8.or(utf16).or(latin1))
+    Ok(None)
 }
 
 fn read_be32_at(buf: &[u8], p: &mut usize) -> Result<u32> {
@@ -1057,11 +1184,11 @@ impl SessionReader {
             self.clipboard_changed = true;
         }
         if pending[0] == 0x1f {
-            let promise = pending[2] != 0;
+            let flag = pending[2];
             let uncompressed_size = be32(&pending[8..12]);
             let compressed = pending[16..total].to_vec();
             self.pending_clipboard.push(ClipboardSend {
-                promise,
+                flag,
                 uncompressed_size,
                 compressed,
             });
@@ -1437,8 +1564,24 @@ pub fn auto_pasteboard(selector: u8) -> Vec<u8> {
 }
 
 /// Apple ClipboardFetch (0x0b) after a remote clipboard-changed notification.
+///
+/// The message is 8 bytes: type, a flags byte and six reserved bytes. Flags
+/// bit 0 asks for the promise/flavour list only; clearing it makes the server
+/// answer with the full archive ("send all data" in its log). The dispatcher
+/// consumes a fixed 8 bytes for this type, so a 1-byte fetch shifts every
+/// following message by 7 bytes and the session dies — always send all 8.
 pub fn clipboard_fetch() -> Vec<u8> {
-    vec![0x0b]
+    clipboard_fetch_flags(0)
+}
+
+/// Fetch only the promise/flavour list (flags bit 0 set), as the native client
+/// does before it asks for the payload.
+pub fn clipboard_fetch_promises() -> Vec<u8> {
+    clipboard_fetch_flags(1)
+}
+
+fn clipboard_fetch_flags(flags: u8) -> Vec<u8> {
+    vec![0x0b, flags, 0, 0, 0, 0, 0, 0]
 }
 
 pub fn key_event(keysym: u32, down: bool) -> Vec<u8> {
@@ -1664,6 +1807,108 @@ mod tests {
         assert_eq!(be32(&b[4..8]), 0xffff_ffff);
         assert_eq!(be16(&b[12..14]), 2560);
         assert_eq!(be16(&b[14..16]), 1600);
+    }
+
+    /// Build a pasteboard archive for tests: (uti, aliases, data) items.
+    fn test_archive(items: &[(&str, &[(&str, &str)], &[u8])]) -> Vec<u8> {
+        let mut b = Vec::new();
+        b.extend_from_slice(&(items.len() as u32).to_be_bytes());
+        for (uti, aliases, data) in items {
+            b.extend_from_slice(&(uti.len() as u32).to_be_bytes());
+            b.extend_from_slice(uti.as_bytes());
+            b.extend_from_slice(&0u32.to_be_bytes());
+            b.extend_from_slice(&(aliases.len() as u32).to_be_bytes());
+            for (n, v) in *aliases {
+                b.extend_from_slice(&(n.len() as u32).to_be_bytes());
+                b.extend_from_slice(n.as_bytes());
+                b.extend_from_slice(&(v.len() as u32).to_be_bytes());
+                b.extend_from_slice(v.as_bytes());
+            }
+            b.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            b.extend_from_slice(data);
+        }
+        b
+    }
+
+    #[test]
+    fn pasteboard_items_parse_text_and_aliases() {
+        let archive = test_archive(&[
+            (
+                "public.utf8-plain-text",
+                &[("com.apple.ostype", "utf8")],
+                b"hello",
+            ),
+            (
+                "com.apple.traditional-mac-plain-text",
+                &[],
+                b"hello",
+            ),
+        ]);
+        let items = pasteboard_items(&archive).unwrap();
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0].uti, "public.utf8-plain-text");
+        assert_eq!(items[0].data, b"hello");
+        assert_eq!(items[0].alias("com.apple.ostype"), Some("utf8"));
+        assert_eq!(pasteboard_text(&archive).unwrap().as_deref(), Some("hello"));
+    }
+
+    #[test]
+    fn pasteboard_image_prefers_png() {
+        let tiff = [0x49u8, 0x49, 0x2a, 0x00];
+        let png = [0x89u8, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a];
+        let archive = test_archive(&[
+            ("public.tiff", &[], &tiff),
+            ("public.utf8-plain-text", &[], b"caption"),
+            ("public.png", &[], &png),
+        ]);
+        let img = pasteboard_image(&archive).unwrap().unwrap();
+        assert_eq!(img.uti, "public.png");
+        assert_eq!(img.data, png);
+        // Text extraction still works in an archive that also holds an image.
+        assert_eq!(
+            pasteboard_text(&archive).unwrap().as_deref(),
+            Some("caption")
+        );
+    }
+
+    #[test]
+    fn pasteboard_promise_has_no_items() {
+        // 96 zero bytes = item_count 0, the shape of an empty reply.
+        let archive = vec![0u8; 96];
+        assert!(pasteboard_items(&archive).unwrap().is_empty());
+        assert_eq!(pasteboard_text(&archive).unwrap(), None);
+        assert_eq!(pasteboard_image(&archive).unwrap(), None);
+    }
+
+    #[test]
+    fn pasteboard_archive_roundtrips_and_viewer_send_header() {
+        let png = b"\x89PNG\r\n\x1a\n0123456789".to_vec();
+        let items = vec![image_item("public.png", &png)];
+        let archive = pasteboard_archive(&items);
+        assert_eq!(pasteboard_items(&archive).unwrap(), items);
+        let msg = viewer_clipboard_send(&archive, false);
+        assert_eq!(msg[0], 0x1f);
+        assert_eq!(msg[2], 0);
+        assert_eq!(be32(&msg[4..8]), 0);
+        assert_eq!(be32(&msg[8..12]) as usize, archive.len());
+        assert_eq!(be32(&msg[12..16]) as usize, msg.len() - 16);
+        let mut dec = flate2::Decompress::new(true);
+        let mut out = vec![0u8; archive.len() + 64];
+        dec.decompress(&msg[16..], &mut out, flate2::FlushDecompress::Sync)
+            .unwrap();
+        assert_eq!(&out[..dec.total_out() as usize], &archive[..]);
+    }
+
+    #[test]
+    fn clipboard_fetch_is_eight_bytes_with_mode_flag() {
+        let full = clipboard_fetch();
+        assert_eq!(full.len(), 8, "0x0b is a fixed 8-byte message");
+        assert_eq!(full[0], 0x0b);
+        assert_eq!(full[1], 0, "flags=0 asks for full data");
+        assert!(full[2..].iter().all(|&b| b == 0));
+        let promises = clipboard_fetch_promises();
+        assert_eq!(promises.len(), 8);
+        assert_eq!(promises[1], 1, "flags bit 0 asks for the promise list");
     }
 
     #[test]
