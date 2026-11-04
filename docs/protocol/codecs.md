@@ -507,3 +507,30 @@ the remaining work is mechanical but sizable:
 3. dequantise with the extracted JPEG tables, IDCT, YCbCr→RGB;
 4. validate: command parse must land on exactly **64,000** tiles, then compare
    pixels against `screencapture`.
+
+### 2.16 Symbol decoder decoded; block grammar still not converged
+
+Reading every branch of `0x7ff9223bc1bf` shows it is a **variable-length integer**
+decoder, not a table lookup:
+
+| prefix (leading 1s) | value range |
+|---|---|
+| 0 | 0..1 (one more bit) |
+| 1 | 2..3 |
+| 2 | 4..7 |
+| k >= 3 | `8*(k+1)-24 .. +7`, i.e. 8..15, 16..23, ... |
+
+i.e. `k` one-bits, a zero, then `k+1` bits whose top `k` bits select within
+`[2^k, 2^(k+1)-1]`. The extracted JPEG tables are therefore **not** used for
+these values.
+
+With this decoder the command stream again parses end-to-end without
+desynchronising, but the tile total lands at ~21,000 instead of 64,000 for every
+AC-termination variant tried (EOB on run==0, on level==0, on both, or none),
+i.e. the block payload is being over-consumed by roughly 3x. The block's exact
+field sequence (how many gamma values, and how the AC run/level pairs are
+terminated) is the one remaining unknown.
+
+Status: container, commands, runs, bit reader, gamma decoder and tables are all
+known and implemented in `tools/probe/mvs_parse.py`; the block grammar needs a
+few more focused iterations against the 64,000-tile oracle.

@@ -109,28 +109,39 @@ def parse(path, opts):
     return tiles, cmds, b.pos, codes
 
 
+def gamma(b):
+    """Variable-length integer as decoded from 0x7ff9223bc1bf.
+
+    k leading one-bits, a zero, then k+1 bits whose top k bits select a value in
+    [2^k, 2^(k+1)-1]; k == 0 yields 0 or 1 from one extra bit.
+    """
+    k = 0
+    while b.bit() == 1:
+        k += 1
+        if k > 39:
+            raise ValueError("prefix too long")
+    if k == 0:
+        return b.bit()
+    return (1 << k) + (b.read(k + 1) >> 1)
+
+
 def dct(b, t, opts):
     """Best-effort DCT block: flag, two mode bits, predictors, AC loop."""
     flag = b.bit()
     if flag:
         return
     b1 = b.bit()
-    b2 = b.bit()
+    b.bit()
     if b1 == 0:
-        b.huff(t[opts["dc"]])
-        b.huff(t[opts["dc"]])
-    b.huff(t[opts["dc"]])
-    # AC loop (guess): pairs of (run,size) until EOB, with values of `size` bits
+        gamma(b)
+        gamma(b)
+    gamma(b)
     k = 1
     while k < 64:
-        sym = b.huff(t[opts["ac"]])
-        run, size = sym >> 4, sym & 0xF
-        if size == 0:
-            if run == 15:
-                k += 16
-                continue
+        run = gamma(b)
+        level = gamma(b)
+        if run == 0 and level == 0:
             break
-        b.read(size)
         k += run + 1
 
 
