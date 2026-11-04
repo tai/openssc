@@ -121,10 +121,20 @@ static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
 static FOCUS_Y: AtomicU64 = AtomicU64::new(u64::MAX);
 static READER_UPDATES: AtomicU64 = AtomicU64::new(0);
 static READER_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
+/// Timestamp of the oldest local input event that has not been answered by a
+/// painted rectangle yet; `u64::MAX` means "nothing pending".
+static INPUT_PENDING_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Milliseconds since the process started (the `START` epoch).
+fn now_ms() -> u64 {
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
 
 fn note_input() {
-    let start = *START.get_or_init(Instant::now);
-    LAST_INPUT_MS.store(start.elapsed().as_millis() as u64, Ordering::Relaxed);
+    let ms = now_ms();
+    LAST_INPUT_MS.store(ms, Ordering::Relaxed);
+    // Keep the oldest pending input: it bounds the feedback latency.
+    let _ = INPUT_PENDING_MS.compare_exchange(u64::MAX, ms, Ordering::Relaxed, Ordering::Relaxed);
 }
 
 fn input_is_hot() -> bool {
@@ -329,6 +339,9 @@ struct App {
     rotate_last: Option<Instant>,
     pinch_x: u16,
     pinch_y: u16,
+    /// `--debug-input` samples of input event -> first painted rectangle.
+    lat: Vec<f64>,
+    lat_next_report: u32,
     /// MultiVariant (0x3f3) decoder; `Some` when `--mvs` advertised it.
     mvs: Option<MvsDecoder>,
     /// BGRX canvas the MVS decoder paints into before we convert to words.
@@ -396,6 +409,8 @@ impl App {
             rotate_last: None,
             pinch_x: 0,
             pinch_y: 0,
+            lat: Vec::new(),
+            lat_next_report: 50,
             mvs: mvs.then(|| MvsDecoder::new(fb_w, fb_h)),
             mvs_bytes: Vec::new(),
         })
@@ -497,12 +512,28 @@ impl App {
             self.mvs_bytes = vec![0u8; need];
         }
         let rect = Rect::new(r.x, r.y, r.w, r.h);
+        let debug = self.debug_input;
         let applied = {
             // Disjoint field borrows: the decoder paints into mvs_bytes.
             let Self { mvs, mvs_bytes, .. } = self;
             let Some(dec) = mvs.as_mut() else { return };
             match dec.apply(&r.pixels, rect, mvs_bytes) {
-                Ok(Some(_)) => true,
+                Ok(Some(stats)) => {
+                    if debug {
+                        eprintln!(
+                            "[{:6} ms] mvs {}x{}+{}+{} applied: {} cmds, {} dct, {} bits",
+                            now_ms(),
+                            r.w,
+                            r.h,
+                            r.x,
+                            r.y,
+                            stats.commands,
+                            stats.dct_blocks,
+                            stats.dct_bits
+                        );
+                    }
+                    true
+                }
                 Ok(None) => false, // quant table update
                 Err(e) => {
                     eprintln!("mvs decode failed ({}x{}+{}+{}): {e:#}", r.w, r.h, r.x, r.y);
@@ -533,6 +564,34 @@ impl App {
             }
         }
         self.dirty = true;
+    }
+
+    /// `--debug-input`: close the oldest pending input once a rect is painted.
+    fn record_input_latency(&mut self) {
+        if !self.debug_input {
+            return;
+        }
+        let pending = INPUT_PENDING_MS.swap(u64::MAX, Ordering::Relaxed);
+        if pending != u64::MAX {
+            let ms = now_ms().saturating_sub(pending) as f64;
+            self.lat.push(ms);
+            eprintln!("[{:6} ms] input->applied {ms:.1} ms", now_ms());
+        }
+    }
+
+    fn report_input_latency(&self, tag: &str) {
+        if !self.debug_input {
+            return;
+        }
+        let mut v = self.lat.clone();
+        v.sort_by(f64::total_cmp);
+        let p50 = v.get(v.len() / 2).copied().unwrap_or(f64::NAN);
+        let max = v.last().copied().unwrap_or(f64::NAN);
+        eprintln!(
+            "[{:6} ms] {tag}: input->applied p50 {p50:.1} ms, max {max:.1} ms (n={})",
+            now_ms(),
+            v.len()
+        );
     }
 
     fn apply_update(&mut self, update: Update) {
@@ -945,6 +1004,11 @@ impl ApplicationHandler<UserEvent> for App {
             if had_pixels {
                 self.frames += 1;
                 got_pixels = true;
+                self.record_input_latency();
+                if self.frames >= self.lat_next_report {
+                    self.report_input_latency("latency report");
+                    self.lat_next_report = self.frames + 50;
+                }
             }
             if full {
                 self.full_frame = true;
@@ -981,6 +1045,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
+        self.report_input_latency("exit summary");
         self.surface = None;
         self.window = None;
     }
@@ -1111,6 +1176,16 @@ fn main() -> Result<()> {
             }
         }
     }
+
+    // Banding existed to hide the 700-880 ms deflate full repaint. An MVS full
+    // frame is 44-49 ms, so the sequential band sweep is now pure added
+    // latency: a keystroke landing in an already-swept band waits a full cycle.
+    let bands = if mvs && bands > 1 {
+        eprintln!("mvs: banded refresh disabled");
+        1
+    } else {
+        bands
+    };
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -1255,7 +1330,7 @@ fn main() -> Result<()> {
         };
         let mut next_band = 0usize;
         let clip_wanted = clipboard && !clipboard_send;
-        let mut mvs_full_seen = !mvs;
+        let mut full_seen = !mvs;
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
         }
@@ -1315,15 +1390,14 @@ fn main() -> Result<()> {
                     // This server build does not reliably free-run after the
                     // first auto frame. Poll with the *scaled* geometry so
                     // post-input dirty rectangles are always delivered.
-                    if !mvs_full_seen {
-                        // The FIRST non-incremental request after a 0x3f3
-                        // SetEncodings is answered with the type-2 quant body
-                        // and a dirty rect; a second one yields the whole
-                        // framebuffer. Repeat until it arrives.
+                    if !full_seen {
+                        // SetEncodings is answered with metadata and the type-2
+                        // quant body first; the first full tile body follows an
+                        // incremental request. Nudge until it has landed.
                         if full_mvs {
-                            mvs_full_seen = true;
+                            full_seen = true;
                         }
-                        let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, false));
+                        let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
                         continue;
                     }
                     if auto_updates {
@@ -1339,7 +1413,14 @@ fn main() -> Result<()> {
                         }
                         continue;
                     }
-                    if bands > 1 && input_is_hot() {
+                    if mvs {
+                        // MVS: no banding, no sleep. Re-issue a full-frame
+                        // incremental request the moment the previous update is
+                        // fanned out, so `pipeline` requests stay outstanding
+                        // and a keystroke is answered by one already queued on
+                        // the server instead of waiting for a fresh request.
+                        let _ = tx_reader.send(framebuffer_update_request(fb_w, fb_h, true));
+                    } else if bands > 1 && input_is_hot() {
                         // Progressive refresh: re-request the next band in full.
                         let focus = FOCUS_Y.swap(u64::MAX, Ordering::Relaxed);
                         if focus != u64::MAX {
