@@ -464,3 +464,27 @@ tables and run the SIMD-equivalent IDCT.
 The remaining work is implementation rather than discovery: port the block
 syntax above and validate the 64,000-tile grid exactly, then compare pixels
 against `screencapture`.
+
+### 2.14 Symbol decoder is unary-prefixed, not plain Huffman (2026-11-04)
+
+`0x7ff9223bc1bf` does **not** decode canonical Huffman codes. It runs:
+
+```
+loop:
+    if (avail <= 0) refill one byte (big-endian into the 32-bit accumulator)
+    bit = acc >> 31
+    acc <<= 1; avail--
+    count++
+    if (count <= 0x26 && bit == 1) goto loop      // stop at the first 0 bit
+if (count == 0x28) -> protocol error
+... then the remainder is decoded using the table ...
+```
+
+So a symbol starts with a **unary prefix counting 1 bits** (0..39, 40 = error), and
+the canonical tables extracted earlier are used *after* that prefix. A plain
+JPEG-style `(length, code)` lookup therefore fails immediately (the prototype
+`tools/probe/mvs_parse.py` hits `bad huffman code` within ~100 commands).
+
+This is the last missing piece: port `0x7ff9223bc1bf` exactly (unary prefix +
+table lookup at `0x7ff9223bc2ee`), then the block decoder `0x7ff922480b28`, and
+the parse should land on exactly 64,000 tiles.
