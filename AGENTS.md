@@ -1,19 +1,30 @@
-# AGENTS.md — `ss-clone`
+# AGENTS.md — `ss-clone` — **v1.0.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.0.0 — 2026-11-04.** First release where the client is subjectively on par
+> with the real `Screen Sharing.app` in normal use, confirmed by the owner on the
+> lab pair. The milestone is the MultiVariant (MVS) fast path: full-frame latency
+> went from 632–880 ms (deflate tiers) to 44–49 ms, push mode with type-0 deltas,
+> spatial records and type-1 refinement decodes correctly, and the end-to-end
+> measured keystroke latency is now within a few ms of Apple's own client at the
+> packet boundary. What is *not* in v1.0.0 is listed in §13 — most importantly
+> the Linux/Wayland packaging, which is still the last unwalked mile for the
+> actual target platform.
 
 - **Project:** a protocol-compatible reimplementation of Apple Screen Sharing
   (`RFB 003.889` + Apple extensions), with a client that runs on **Linux/Wayland**.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** live GUI + input + Linux evdev gesture backend working;
-  magnify and **two-finger scroll verified live**; performance pass done (auto
-  dirty rects, 0.5 scaling, coalesced input). Swipe semantic calibration,
-  clipboard, and rekey handling are next.
-- **Last verified:** 2026-11-03 against `md.local` and `mm.local`.
+- **Current phase:** v1.0.0 on macOS. Live GUI, keyboard/pointer input, gesture
+  backend, clipboard, MVS fast path with **server push as the default**, and the
+  full MVS push vocabulary (type-0 deltas with the coefficient ring, plus type-1
+  refinement). Next: Linux/Wayland packaging, swipe semantic calibration, and
+  the remaining latency question (frame pacing rather than round trip).
+- **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
 
 ---
 
@@ -547,6 +558,43 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.0.0 — 2026-11-04 (milestone)
+
+**What it is:** a working macOS client that talks to a real macOS Screen Sharing
+server over RFB 003.889 with Apple's extensions, renders it live, accepts input
+and gestures, syncs the text clipboard, and uses MultiVariant (the server's fast
+codec) with server push — in normal use it now feels on par with the real
+`Screen Sharing.app` (owner-verified on the lab pair).
+
+**Measured, same host, same 12-keystroke protocol:**
+
+| | full-frame latency | keystroke → painted (p50) |
+|---|---:|---:|
+| Raw / Zlib / 0x3e8–0x3ea | 632–1590 ms | — |
+| MVS polling | 44–49 ms | 85–98 ms |
+| MVS push (v1.0.0 default) | 44–49 ms | 92 ms |
+| native `Screen Sharing.app` | — | 65–72 ms at the packet boundary |
+
+The remaining ~20–30 ms against Apple is server capture/encode cadence, not our
+request path: the applied rects already arrive 6–9 ms apart during a repaint, and
+a paired packet capture found no native client advantage (native was 13–14 ms
+*later*, not earlier). Recorded in `docs/findings/2026-11-04-push-mode-mvs.md`.
+
+**Verified end to end:** authentication (type 33 RSA1 + SRP-6a), record layer
+(0x44f rekey, AES-128-CBC, SHA-1), ServerInit/pixel formats, Zlib, Raw and the
+0x3e8–0x3ea tiers, MVS type-0 (dual streams) and type-1 (refinement) with the
+spatial-record table and 99-byte coefficient ring, server push arming
+(`0x09 selected_screen=0` + one non-incremental `0x03`), keyboard, pointer,
+scroll, magnify/rotate/pan gestures, and text clipboard both directions.
+
+**Deliberately not in v1.0.0:** Linux/Wayland packaging (the actual target
+platform — the code paths exist and the evdev backend is tested, but it has not
+been run end to end on a Linux host); swipe semantic calibration; force click
+and drag-gesture variants; clipboard images; audio; multi-display arrangement;
+keepalive/rekey hardening for long sessions.
+
+### Earlier phases
 
 - **Phase 0 (recon):** complete.
 - **Phase 1 (capture):** complete. Verified protocol docs now live in

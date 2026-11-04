@@ -1,5 +1,24 @@
 # Protocol status / agent handoff
 
+## 2026-11-04 — **v1.0.0**
+
+- Milestone: the client is now on par with the real `Screen Sharing.app` in
+  normal use, confirmed by the owner on the lab pair. Full summary and the
+  explicit not-included list are in `AGENTS.md` §13.
+- What got here: MVS fast path (44–49 ms full frame vs 632–880 ms for the
+  deflate tiers), the complete MVS push vocabulary (type-0 dual streams,
+  spatial records, 99-byte coefficient ring, type-1 refinement), and server push
+  as the default transport (`--mvs` arms `0x09` screen 0 + one `0x03`; `--poll`
+  keeps the request loop).
+- Latency: keystroke → painted p50 92 ms with push, 85–98 ms polling, against
+  65–72 ms for the native client measured at the packet boundary. A paired
+  packet capture found no native advantage (native was 13–14 ms later), so the
+  remaining difference is server capture/encode cadence, not our request path.
+  Frame pacing, not round trip, is where any further gain would come from.
+- Next: Linux/Wayland packaging (the actual target platform), swipe semantic
+  calibration, force click and drag-gesture variants, clipboard images,
+  keepalive/rekey hardening for long sessions.
+
 ## 2026-11-04 — push-mode MVS: cache + type-1 decoded (VERIFIED)
 
 - Phase / milestone: M6 fast path, push mode.
