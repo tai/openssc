@@ -1,6 +1,6 @@
 # Protocol status / agent handoff
 
-## 2026-11-05 — file copy: send by drop, receive into ~/Downloads (VERIFIED)
+## 2026-11-05 — **v1.2.0**: file copy, send by drop / receive into ~/Downloads (VERIFIED)
 
 - Phase / milestone: post-v1.1.0, file copy.
 - Verified (owner, live):

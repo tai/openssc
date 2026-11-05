@@ -1,8 +1,17 @@
-# AGENTS.md — `ss-clone` — **v1.1.0**
+# AGENTS.md — `ss-clone` — **v1.2.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.2.0 — 2026-11-05.** File copy. Drop a file on the window and it appears
+> on the remote; incoming files land in `~/Downloads`. This is Apple's separate
+> `0x22` file-copy stream (not a pasteboard flavour) with its own helper process
+> on the far end, and the piece that took the longest was one field: `NewItem`
+> carries the POSIX mode at `+0x66`, so a zeroed metadata block creates the file
+> mode `000` in the in-progress state and every data write fails. The layout was
+> recovered by capturing a genuine server-sent `NewItem` rather than guessing.
+> Drag *out* of the window is deliberately not implemented.
 
 > **v1.1.0 — 2026-11-05.** Remote cursor and a real clipboard. The cursor is now
 > the *remote* one: shape, hotspot and size come from the server (Apple `0x450`
@@ -28,11 +37,12 @@ contradicts this document, update this document in the same change.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** v1.0.0 on macOS. Live GUI, keyboard/pointer input, gesture
-  backend, clipboard, MVS fast path with **server push as the default**, and the
-  full MVS push vocabulary (type-0 deltas with the coefficient ring, plus type-1
-  refinement). Next: Linux/Wayland packaging, swipe semantic calibration, and
-  the remaining latency question (frame pacing rather than round trip).
+- **Current phase:** v1.2.0 on macOS. Live GUI, keyboard/pointer input, gesture
+  backend, remote cursor, automatic duplex clipboard (text + images), file copy
+  by drop, and MVS with **server push as the default** including the full push
+  vocabulary (type-0 deltas with the coefficient ring, plus type-1 refinement).
+  Next: **Linux/Wayland packaging** — still the actual target platform and still
+  unwalked — then swipe semantic calibration and frame pacing.
 - **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
 
 ---
@@ -567,6 +577,29 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.2.0 — 2026-11-05
+
+File copy, both directions, verified by sha1 on the lab pair.
+
+- **Wire**: `0x22` + u32 length, then `{u16 version, u16 cmd, u32 sessionID}`,
+  then cmd 2 `StartFileReceive` (the viewer names the destination folder on the
+  remote), 100 `ItemInfo`, 101 `NewItem` per item, 102 `FileData` in 65536-byte
+  chunks, 104 `EndSession`. Contract in `docs/protocol/filecopy.md`.
+- **The trap worth remembering**: `NewItem` carries the item metadata and the
+  POSIX mode is at `+0x66` (plus `nameLen` excludes the NUL, and the dates are
+  `UTCDateTime` 16.32 fixed point). Zeroed, the remote creates the file in the
+  in-progress state with mode `000` and every write fails. Recovered from a
+  captured server-sent `NewItem`, not from the disassembly alone.
+- **Behaviour**: drop a file on the window to send it (winit `DroppedFile`) to
+  `/Users/<remote user>/Downloads`; incoming files are written to `~/Downloads`
+  with `" 2"` on a name collision. Directory drops are refused. Transfers run on
+  a worker thread, so painting and input stay responsive. `--send-file` /
+  `--recv-file` are test hooks, not user features.
+- **Not in v1.2.0**: drag-out of the window (declined; `StartFileSend` works but
+  has no gesture), folder drops (recursion via `level`), the xattr/resource-fork
+  trailer, and `cmd 200` status frames (arrive after a send, logged as unknown,
+  transfer completes regardless).
 
 ### v1.1.0 — 2026-11-05
 
