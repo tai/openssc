@@ -3418,8 +3418,14 @@ mod tests {
         assert_eq!(lines, (0, 2));
         let dy = i16::from_be_bytes([msg[10], msg[11]]);
         assert_eq!(dy, 2);
+        // Point and fixed deltas must stay zero: this server honours them when
+        // non-zero, in units we do not produce, and the line fields then stop
+        // being applied (measured: ~90 requested lines moved one line). See the
+        // comment in `scroll_message`.
         let py = i32::from_be_bytes([msg[34], msg[35], msg[36], msg[37]]);
-        assert_eq!(py, (2.0 * step).round() as i32);
+        assert_eq!(py, 0, "point delta must stay zero on this server");
+        let fixed_y = i32::from_be_bytes([msg[22], msg[23], msg[24], msg[25]]);
+        assert_eq!(fixed_y, 0, "fixed delta must stay zero on this server");
         assert_eq!(rem, (0.0, 0.0));
         // Two half-line samples: the first has no whole line yet, the second
         // does, and neither is dropped.
