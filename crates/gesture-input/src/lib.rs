@@ -11,6 +11,128 @@ pub const ABS_MT_POSITION_Y: u16 = 0x36;
 
 pub const SWIPE_THRESHOLD: f32 = 0.08;
 
+/// Normalized pad units -> pixels for the portable scroll model. This is a
+/// feel/unit conversion, not a copy of Apple's internals; it is calibrated
+/// against the macOS backend (which already reports pixels).
+pub const SCROLL_PIXELS_PER_UNIT: f32 = 600.0;
+
+/// Points of finger travel that make one scroll line. Measured on the lab
+/// server: one subtype-11 line unit scrolls a TextEdit document by ~120
+/// points (3 consecutive isolated events, 240 screen px at 2x). The server
+/// applies its own acceleration to multi-line deltas, so this is a 1:1
+/// tracking choice, not a protocol constant.
+/// Points of trackpad travel per scroll line.
+///
+/// Calibrated against the behaviour that felt right before the portable model
+/// landed: the old client divided winit's pixel delta by 12 and a normal flick
+/// scrolled about a screen. Apple's own client sits in the same ballpark (the
+/// agent's double-to-line conversion in `SSAgent_PostScrollEvent_rpc` implies
+/// roughly 8 points per line). 120 was a placeholder and made a flick move one
+/// or two lines, i.e. look broken.
+pub const SCROLL_POINTS_PER_LINE: f32 = 12.0;
+
+/// Inertia after the fingers lift.
+///
+/// The server truncates every scroll delta to whole lines and never generates
+/// momentum itself, so the glide is a decaying *rate* of one-line steps: a
+/// decaying amplitude would round to zero.
+pub const MOMENTUM_START_HZ: f32 = 90.0;
+/// Each step lengthens the interval by this factor.
+pub const MOMENTUM_RATE_DECAY: f32 = 0.72;
+/// Stop when the step rate falls below this.
+pub const MOMENTUM_MIN_HZ: f32 = 8.0;
+/// Hard stop, so a flick cannot glide forever.
+pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1100);
+/// Below this finger speed (points/second) a release does not glide.
+pub const MOMENTUM_MIN_SPEED: f32 = 120.0;
+
+/// Drives the post-release glide. Portable: any backend that knows the last
+/// scroll velocity can start it, and the GUI ticks it.
+#[derive(Debug)]
+pub struct Momentum {
+    dir: (i32, i32),
+    active: bool,
+    next_at: std::time::Instant,
+    interval: std::time::Duration,
+    deadline: std::time::Instant,
+}
+
+impl Default for Momentum {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Momentum {
+    pub fn new() -> Self {
+        let now = std::time::Instant::now();
+        Self {
+            dir: (0, 0),
+            active: false,
+            next_at: now,
+            interval: std::time::Duration::from_millis(11),
+            deadline: now,
+        }
+    }
+
+    /// Start a glide from the last scroll velocity (points per second).
+    /// Returns false when the release was too slow to deserve one.
+    pub fn start(&mut self, vx: f32, vy: f32, now: std::time::Instant) -> bool {
+        let speed = (vx * vx + vy * vy).sqrt();
+        if speed < MOMENTUM_MIN_SPEED {
+            self.active = false;
+            return false;
+        }
+        self.dir = (
+            if vx.abs() > speed * 0.2 { vx.signum() as i32 } else { 0 },
+            if vy.abs() > speed * 0.2 { vy.signum() as i32 } else { 0 },
+        );
+        self.active = true;
+        self.interval = std::time::Duration::from_secs_f32(1.0 / MOMENTUM_START_HZ);
+        self.next_at = now + self.interval;
+        self.deadline = now + MOMENTUM_MAX;
+        true
+    }
+
+    pub fn stop(&mut self) {
+        self.active = false;
+    }
+
+    pub fn active(&self) -> bool {
+        self.active
+    }
+
+    pub fn next_at(&self) -> Option<std::time::Instant> {
+        self.active.then_some(self.next_at)
+    }
+
+    /// Emit the next glide step if one is due: exactly one line, in the
+    /// direction of the flick, at the current (decaying) rate.
+    pub fn tick(&mut self, now: std::time::Instant) -> Option<Gesture> {
+        if !self.active || now < self.next_at {
+            return None;
+        }
+        if now >= self.deadline {
+            self.active = false;
+            return None;
+        }
+        self.interval = std::time::Duration::from_secs_f32(
+            self.interval.as_secs_f32() / MOMENTUM_RATE_DECAY,
+        );
+        self.next_at = now + self.interval;
+        if 1.0 / self.interval.as_secs_f32() < MOMENTUM_MIN_HZ {
+            self.active = false;
+        }
+        Some(Gesture::Scroll {
+            dx: self.dir.0 as f32 * SCROLL_POINTS_PER_LINE,
+            dy: self.dir.1 as f32 * SCROLL_POINTS_PER_LINE,
+            phase: Phase::Changed,
+            precise: true,
+            momentum: Some(Phase::Changed),
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Phase {
     Began,
@@ -41,10 +163,19 @@ pub struct TouchPoint {
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum Gesture {
+    /// Two-finger scroll. `dx`/`dy` are **pixels**, device independent: a
+    /// trackpad backend passes its pixel delta, a backend that works in
+    /// normalized pad units converts first (see `SCROLL_PIXELS_PER_UNIT`).
+    /// Positive `dy` scrolls content up, as winit and the Apple message do.
     Scroll {
         dx: f32,
         dy: f32,
         phase: Phase,
+        /// Trackpad (precise) vs a line-stepped wheel.
+        precise: bool,
+        /// Inertia phase when the OS reports one; `None` on platforms that
+        /// fold momentum into `phase`.
+        momentum: Option<Phase>,
     },
     Swipe {
         fingers: u8,
@@ -57,6 +188,12 @@ pub enum Gesture {
         /// Normalized centroid of the final touch set.
         x: f32,
         y: f32,
+        /// Centroid velocity in pad-widths per second; zero until a backend
+        /// measures it.
+        velocity: (f32, f32, f32),
+        /// Apple's `flavor`/`flags` fields, zero until calibrated.
+        flavor: u32,
+        flags: u32,
     },
     Magnify {
         factor: f32,
@@ -114,6 +251,8 @@ impl GestureRecognizer {
                         dx: 0.0,
                         dy: 0.0,
                         phase: Phase::Ended,
+                        precise: true,
+                        momentum: None,
                     });
                 }
             }
@@ -159,9 +298,11 @@ impl GestureRecognizer {
                     let dy = cy - last.cy;
                     if dx.abs() + dy.abs() > 0.0005 {
                         out.push(Gesture::Scroll {
-                            dx,
-                            dy,
+                            dx: dx * SCROLL_PIXELS_PER_UNIT,
+                            dy: dy * SCROLL_PIXELS_PER_UNIT,
                             phase: Phase::Changed,
+                            precise: true,
+                            momentum: None,
                         });
                     }
                     if last.dist > 0.0001 {
@@ -195,6 +336,8 @@ impl GestureRecognizer {
                         dx: 0.0,
                         dy: 0.0,
                         phase: Phase::Began,
+                        precise: true,
+                        momentum: None,
                     });
                 }
             } else {
@@ -202,6 +345,8 @@ impl GestureRecognizer {
                     dx: 0.0,
                     dy: 0.0,
                     phase: Phase::Began,
+                    precise: true,
+                    momentum: None,
                 });
             }
         }
@@ -224,6 +369,9 @@ impl GestureRecognizer {
             phase,
             x: sw.last.0,
             y: sw.last.1,
+            velocity: (0.0, 0.0, 0.0),
+            flavor: 0,
+            flags: 0,
         }
     }
 
@@ -327,5 +475,50 @@ mod tests {
         assert_eq!(swipe_direction(-0.2, 0.0), (1, 4));
         assert_eq!(swipe_direction(0.0, 0.2), (2, 2));
         assert_eq!(swipe_direction(0.0, -0.2), (2, 1));
+    }
+}
+
+#[cfg(test)]
+mod momentum_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn glide_is_a_decaying_rate_of_one_line_steps() {
+        let mut m = Momentum::new();
+        let t0 = Instant::now();
+        assert!(m.start(0.0, -600.0, t0));
+        let mut steps = 0;
+        let mut times = Vec::new();
+        let mut now = t0;
+        // Advance in 1 ms slices for 2 s; count the steps and their spacing.
+        for _ in 0..2000 {
+            now += Duration::from_millis(1);
+            if let Some(g) = m.tick(now) {
+                match g {
+                    Gesture::Scroll { dx, dy, phase, momentum, .. } => {
+                        assert_eq!(dx, 0.0);
+                        assert_eq!(dy, -SCROLL_POINTS_PER_LINE);
+                        assert_eq!(phase, Phase::Changed);
+                        assert_eq!(momentum, Some(Phase::Changed));
+                    }
+                    _ => panic!("momentum must emit scroll"),
+                }
+                times.push(now);
+                steps += 1;
+            }
+        }
+        assert!(steps >= 5, "expected a glide, got {steps} steps");
+        assert!(!m.active(), "the glide must stop");
+        // Each interval is longer than the last (decaying rate).
+        let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
+        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "rate must decay: {gaps:?}");
+    }
+
+    #[test]
+    fn a_slow_release_does_not_glide() {
+        let mut m = Momentum::new();
+        assert!(!m.start(10.0, 10.0, Instant::now()));
+        assert!(m.tick(Instant::now() + Duration::from_secs(1)).is_none());
     }
 }

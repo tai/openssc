@@ -5,7 +5,7 @@
 //! events into RFB/Apple messages and presents BGRX frames.
 
 use anyhow::Result;
-use gesture_input::{Gesture, Phase};
+use gesture_input::{Gesture, Momentum, Phase, SCROLL_POINTS_PER_LINE};
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
@@ -49,6 +49,91 @@ impl GrabHandle {
     fn is_enabled(&self) -> bool {
         false
     }
+}
+
+/// Scroll deltas accumulated between subtype-11 messages, in the portable
+/// model's units (pixels).
+struct PendingScroll {
+    dx: f32,
+    dy: f32,
+    phase: Phase,
+    momentum: Option<Phase>,
+    precise: bool,
+    /// Last sample's delta, for the debug log.
+    raw: (f32, f32),
+}
+
+/// Scroll coalescing interval: ~120 Hz, so a fast flick does not flood the
+/// session with one 58-byte message per trackpad sample.
+const SCROLL_INTERVAL: Duration = Duration::from_millis(8);
+/// Points of finger travel per scroll line. Measured on the lab server:
+/// one subtype-11 line unit scrolls a TextEdit document ~120 points (three
+/// consecutive isolated events, 240 screen px at 2x). The server applies its
+/// own acceleration to multi-line deltas, so this is a 1:1 tracking choice.
+const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
+
+/// Map winit's touch phase onto the portable gesture phase.
+fn phase_from_touch(phase: TouchPhase) -> Phase {
+    match phase {
+        TouchPhase::Started => Phase::Began,
+        TouchPhase::Moved => Phase::Changed,
+        TouchPhase::Ended => Phase::Ended,
+        TouchPhase::Cancelled => Phase::Cancelled,
+    }
+}
+
+/// Synthesise one subtype-11 scroll message from the portable gesture model.
+///
+/// This is the only place scroll numbers become wire fields, so the macOS
+/// winit backend and the Linux evdev recogniser produce identical messages.
+/// `remainder` carries the sub-line fraction between messages so sub-line
+/// motion is not lost. Every call returns a message: the point deltas carry
+/// the smooth motion even when the integer line field is still zero.
+fn scroll_message(
+    gesture: &Gesture,
+    x: u16,
+    y: u16,
+    remainder: (f32, f32),
+) -> (Option<Vec<u8>>, (f32, f32), (i16, i16)) {
+    let Gesture::Scroll {
+        dx,
+        dy,
+        phase,
+        momentum,
+        ..
+    } = *gesture
+    else {
+        return (None, remainder, (0, 0));
+    };
+    let mut acc = (
+        remainder.0 + dx / PIXELS_PER_LINE,
+        remainder.1 + dy / PIXELS_PER_LINE,
+    );
+    let whole_x = acc.0.trunc();
+    let whole_y = acc.1.trunc();
+    acc.0 -= whole_x;
+    acc.1 -= whole_y;
+    let lx = whole_x.clamp(-40.0, 40.0) as i16;
+    let ly = whole_y.clamp(-40.0, 40.0) as i16;
+    let px = dx.round().clamp(-32768.0, 32767.0) as i32;
+    let py = dy.round().clamp(-32768.0, 32767.0) as i32;
+    let msg = gesture_mouse_scroll(
+        lx,
+        ly,
+        0,
+        // fixed deltas use the same pixel space until the native divisor is
+        // known; the field is i32 pixels on both.
+        (px, py, 0),
+        (px, py, 0),
+        phase.code(),
+        // TODO(momentum): winit folds NSEvent's momentum phase into
+        // TouchPhase, so macOS cannot fill this yet; the field exists for a
+        // backend that can (an NSEvent monitor or the Linux recogniser).
+        momentum.map(|m| m.code()).unwrap_or(0),
+        x,
+        y,
+    );
+    (Some(msg), acc, (lx, ly))
 }
 
 /// One Cmd+Shift+V pull: how many fetches went out and what the last archive
@@ -381,6 +466,7 @@ Lab and debugging:
   --exit-after-dump        exit once the dump is written
   --exit-after-secs <s>    exit after s seconds
   --debug-input            trace input, clipboard, keys and framebuffer timing
+  --scroll-test            scripted flick that exercises the scroll glide
   --demo-cursor            scripted pointer tour that dumps a PNG per cursor shape
   -h, --help               show this message and exit
 ";
@@ -633,6 +719,9 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
             phase,
             x,
             y,
+            velocity,
+            flavor,
+            flags,
             ..
         } => {
             if phase == Phase::Ended {
@@ -645,35 +734,23 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
                     progress.clamp(0.0, 1.0),
                     x,
                     y,
-                    0.0,
-                    0.0,
-                    0.0,
-                    0,
-                    0,
+                    velocity.0,
+                    velocity.1,
+                    velocity.2,
+                    flavor,
+                    flags,
                     px,
                     py,
                 ));
                 out.push(gesture_begin_end(2, 0, px, py));
             }
         }
-        Gesture::Scroll { dx, dy, phase: _ } => {
-            // Normalized trackpad motion (fraction of the pad) -> scroll lines.
-            // The scale is a feel constant, to be calibrated on a Linux pad.
-            const SCROLL_LINES_PER_UNIT: f32 = 600.0;
-            let lx = (dx * SCROLL_LINES_PER_UNIT).clamp(-40.0, 40.0) as i16;
-            let ly = (dy * SCROLL_LINES_PER_UNIT).clamp(-40.0, 40.0) as i16;
-            if lx != 0 || ly != 0 {
-                out.push(gesture_mouse_scroll(
-                    lx,
-                    ly,
-                    0,
-                    (0, 0, 0),
-                    (0, 0, 0),
-                    2,
-                    0,
-                    fb_w / 2,
-                    fb_h / 2,
-                ));
+        Gesture::Scroll { .. } => {
+            // Same synthesis as the winit path: the portable gesture model
+            // carries pixels, `scroll_message` owns every wire number.
+            let (msg, _, _) = scroll_message(&g, fb_w / 2, fb_h / 2, (0.0, 0.0));
+            if let Some(msg) = msg {
+                out.push(msg);
             }
         }
         Gesture::Magnify { factor, phase, x, y } => {
@@ -791,7 +868,19 @@ struct App {
     focused_once: bool,
     deadline: Option<Instant>,
     /// Sub-line scroll remainder, so small pixel deltas still accumulate.
-    scroll_acc: (f32, f32),
+    scroll_rem: (f32, f32),
+    /// Scroll deltas coalesced since the last subtype-11 message.
+    scroll_pending: Option<PendingScroll>,
+    /// When the last scroll message went out (coalescing to ~120 Hz).
+    scroll_last: Instant,
+    /// Post-release glide, driven by the last scroll velocity.
+    scroll_momentum: Momentum,
+    /// Last scroll velocity in points per second (for the glide).
+    scroll_velocity: (f32, f32),
+    /// When the previous scroll sample arrived.
+    scroll_sample_at: Instant,
+    /// `--scroll-test`: scripted flick to exercise the glide without a pad.
+    scroll_test: bool,
     /// Open pinch/rotate gesture and when it last saw input.
     pinch_active: bool,
     pinch_last: Option<Instant>,
@@ -831,6 +920,7 @@ impl App {
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
         keymap: &'static Keymap,
         grab: Option<GrabHandle>,
+        scroll_test: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -862,6 +952,7 @@ impl App {
             keymap,
             grab,
             grab_suspended: false,
+            scroll_test,
             demo_cursor,
             demo_step: 0,
             demo_next: Some(Instant::now() + Duration::from_millis(600)),
@@ -884,7 +975,12 @@ impl App {
             ime,
             focused_once: false,
             deadline,
-            scroll_acc: (0.0, 0.0),
+            scroll_rem: (0.0, 0.0),
+            scroll_pending: None,
+            scroll_last: Instant::now(),
+            scroll_momentum: Momentum::new(),
+            scroll_velocity: (0.0, 0.0),
+            scroll_sample_at: Instant::now(),
             pinch_active: false,
             pinch_last: None,
             rotate_active: false,
@@ -1221,34 +1317,119 @@ impl App {
     /// Apple MouseScroll message (subtype 11); the pixel deltas are ignored by
     /// this server build, and phase 2 alone is sufficient (VERIFIED live:
     /// `dy=-10` moved TextEdit 15 lines, `dy=+10` moved it back 8).
-    fn queue_scroll(&mut self, dx: f32, dy: f32) {
-        self.scroll_acc.0 += dx;
-        self.scroll_acc.1 += dy;
-        let lines_x = self.scroll_acc.0.trunc();
-        let lines_y = self.scroll_acc.1.trunc();
-        if lines_x == 0.0 && lines_y == 0.0 {
+    /// Queue one scroll sample from the portable gesture model. Every sample
+    /// is eventually sent: the point deltas carry the smooth motion, the
+    /// integer line deltas are what this server honours today, and
+    /// Began/Ended/Cancelled are never coalesced away.
+    fn queue_scroll(&mut self, gesture: Gesture) {
+        let Gesture::Scroll {
+            dx,
+            dy,
+            phase,
+            precise,
+            momentum,
+        } = gesture
+        else {
             return;
+        };
+        // Track the release velocity for the glide, and stop any glide the
+        // moment the fingers are back on the pad.
+        let now = Instant::now();
+        let dt = now
+            .duration_since(self.scroll_sample_at)
+            .as_secs_f32()
+            .max(0.001);
+        // The release event itself carries no motion; keep the last real
+        // velocity so the glide has something to work with.
+        if !matches!(phase, Phase::Ended | Phase::Cancelled) && (dx != 0.0 || dy != 0.0) {
+            self.scroll_velocity = (dx / dt, dy / dt);
         }
-        self.scroll_acc.0 -= lines_x;
-        self.scroll_acc.1 -= lines_y;
-        // Stay inside i16 and avoid one absurd event after a burst.
-        let lx = lines_x.clamp(-40.0, 40.0) as i16;
-        let ly = lines_y.clamp(-40.0, 40.0) as i16;
+        self.scroll_sample_at = now;
+        match phase {
+            Phase::Began | Phase::Changed => self.scroll_momentum.stop(),
+            Phase::Ended => {}
+            Phase::Cancelled => self.scroll_momentum.stop(),
+        }
+        let pending = self.scroll_pending.get_or_insert(PendingScroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase,
+            momentum,
+            precise,
+            raw: (0.0, 0.0),
+        });
+        pending.dx += dx;
+        pending.dy += dy;
+        pending.phase = phase;
+        pending.momentum = momentum;
+        pending.precise = precise;
+        pending.raw = (dx, dy);
+
+        // Began/Ended/Cancelled go out immediately; Changed coalesces to
+        // ~120 Hz so a fast flick does not flood the session.
+        let urgent = !matches!(phase, Phase::Changed);
+        if urgent || self.scroll_last.elapsed() >= SCROLL_INTERVAL {
+            self.flush_scroll();
+        }
+        if phase == Phase::Ended {
+            let (vx, vy) = self.scroll_velocity;
+            if self.scroll_momentum.start(vx, vy, now) && self.debug_input {
+                eprintln!(
+                    "scroll momentum start v=({vx:.0},{vy:.0}) pt/s"
+                );
+            }
+        }
+    }
+
+    /// Send the coalesced scroll sample as one subtype-11 message.
+    fn flush_scroll(&mut self) {
+        let Some(pending) = self.scroll_pending.take() else {
+            return;
+        };
+        self.scroll_last = Instant::now();
+        let gesture = Gesture::Scroll {
+            dx: pending.dx,
+            dy: pending.dy,
+            phase: pending.phase,
+            precise: pending.precise,
+            momentum: pending.momentum,
+        };
+        self.emit_scroll(&gesture, false);
+    }
+
+    /// Synthesise and send one scroll message through the portable model.
+    ///
+    /// The log shows the fractional accumulator and the integer lines that
+    /// actually went on the wire, so dropped sub-line motion is visible.
+    fn emit_scroll(&mut self, gesture: &Gesture, from_momentum: bool) {
         let (x, y) = self.cursor;
+        let (msg, remainder, lines) = scroll_message(gesture, x, y, self.scroll_rem);
+        self.scroll_rem = remainder;
         if self.debug_input {
-            eprintln!("scroll lines=({lx},{ly}) at ({x},{y})");
+            if let Gesture::Scroll {
+                dx,
+                dy,
+                phase,
+                precise,
+                ..
+            } = *gesture
+            {
+                eprintln!(
+                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) frac=({:.2},{:.2}) phase={} precise={} momentum={from_momentum}",
+                    dx.round() as i32,
+                    dy.round() as i32,
+                    lines.0,
+                    lines.1,
+                    remainder.0,
+                    remainder.1,
+                    phase.code(),
+                    precise
+                );
+            }
         }
-        self.send(gesture_mouse_scroll(
-            lx,
-            ly,
-            0,
-            (0, 0, 0),
-            (0, 0, 0),
-            2,
-            0,
-            x,
-            y,
-        ));
+        if let Some(msg) = msg {
+            self.send(msg);
+        }
     }
 
     fn send_swipe(&self, motion: u32, mask: u32) {        let (x, y) = self.cursor;
@@ -2005,18 +2186,29 @@ impl ApplicationHandler<UserEvent> for App {
                 self.pending_pointer = Some((x, y, self.buttons));
                 self.flush_pointer(true);
             }
-            WindowEvent::MouseWheel { delta, .. } => {
+            WindowEvent::MouseWheel { delta, phase, .. } => {
                 note_input();
-                // Trackpads report pixel deltas on Wayland, line deltas on
-                // macOS. Convert both to scroll *lines*; the server only
-                // honours the line-delta field (see queue_scroll).
-                let (dx, dy) = match delta {
-                    MouseScrollDelta::LineDelta(x, y) => (x, y),
-                    MouseScrollDelta::PixelDelta(p) => {
-                        (p.x as f32 / 12.0, p.y as f32 / 12.0)
+                // Trackpads report pixel deltas (and a real phase) on macOS;
+                // a wheel reports lines. Both go out as subtype 11: the point
+                // deltas carry the smooth motion, the line fields keep the
+                // behaviour this server honours today.
+                let (dx, dy, precise) = match delta {
+                    MouseScrollDelta::LineDelta(x, y) => {
+                        (x * PIXELS_PER_LINE, y * PIXELS_PER_LINE, false)
                     }
+                    // winit passes NSEvent.scrollingDeltaX/Y through unchanged,
+                    // which is already in logical points - do NOT divide by the
+                    // Retina scale factor or trackpad scrolling runs at half
+                    // speed (and, with the old 120 pt/line constant, at 1/24th).
+                    MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
-                self.queue_scroll(dx, dy);
+                self.queue_scroll(Gesture::Scroll {
+                    dx,
+                    dy,
+                    phase: phase_from_touch(phase),
+                    precise,
+                    momentum: None,
+                });
             }
             WindowEvent::PinchGesture { delta, .. } => {
                 note_input();
@@ -2050,7 +2242,13 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::PanGesture { delta, .. } => {
                 note_input();
                 // Two-finger pan is scrolling: use the verified subtype 11.
-                self.queue_scroll(delta.x / 60.0, delta.y / 60.0);
+                self.queue_scroll(Gesture::Scroll {
+                    dx: delta.x,
+                    dy: delta.y,
+                    phase: Phase::Changed,
+                    precise: true,
+                    momentum: None,
+                });
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
@@ -2143,6 +2341,56 @@ impl ApplicationHandler<UserEvent> for App {
         {
             self.send(gesture_magnify(0.0, 4, 31, self.pinch_x, self.pinch_y));
             self.pinch_active = false;
+        }
+        // The post-release glide: one line per step at a decaying rate.
+        let now = Instant::now();
+        if self.scroll_test
+            && now >= *START.get_or_init(Instant::now) + Duration::from_secs(3)
+        {
+            self.scroll_test = false;
+            eprintln!("scroll test: scripted flick");
+            // Put the remote pointer over the target document; synthetic
+            // local mouse moves do not reach winit in this environment.
+            self.cursor = (600, 400);
+            self.send(pointer_event(0, 600, 400));
+            thread::sleep(Duration::from_millis(80));
+            // Click so the target window is active, then move back.
+            self.send(pointer_event(1, 600, 400));
+            thread::sleep(Duration::from_millis(60));
+            self.send(pointer_event(0, 600, 400));
+            thread::sleep(Duration::from_millis(120));
+            let flick = |dx: f32, dy: f32, phase: Phase| Gesture::Scroll {
+                dx,
+                dy,
+                phase,
+                precise: true,
+                momentum: None,
+            };
+            self.queue_scroll(flick(0.0, 0.0, Phase::Began));
+            for _ in 0..10 {
+                self.queue_scroll(flick(0.0, -40.0, Phase::Changed));
+                thread::sleep(Duration::from_millis(16));
+            }
+            self.queue_scroll(flick(0.0, 0.0, Phase::Ended));
+        }
+        while let Some(gesture) = self.scroll_momentum.tick(Instant::now()) {
+            self.emit_scroll(&gesture, true);
+        }
+        if let Some(at) = self.scroll_momentum.next_at() {
+            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        }
+        // A coalesced scroll batch must not sit until the next wheel event:
+        // flush it when the interval expires, or wake up to do so. Without
+        // this the tail of a flick (and every wheel tick) would arrive late.
+        if self.scroll_pending.is_some() {
+            let deadline = self.scroll_last + SCROLL_INTERVAL;
+            if Instant::now() >= deadline {
+                self.flush_scroll();
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
+            }
+        } else if !self.demo_cursor && !self.scroll_momentum.active() {
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
         if self.rotate_active
             && self.rotate_last.map_or(true, |t| t.elapsed() > Duration::from_millis(150))
@@ -2273,6 +2521,8 @@ fn main() -> Result<()> {
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
     let mut keymap_name: Option<String> = None;
+    // Lab hook: scripted flick for measuring the scroll glide.
+    let mut scroll_test = false;
     // macOS keyboard grab (`grab.rs`).
     let mut no_grab = false;
     let mut release_chord: Option<String> = None;
@@ -2356,6 +2606,10 @@ fn main() -> Result<()> {
             }
             "--ime" => {
                 ime = true;
+                i += 1;
+            }
+            "--scroll-test" => {
+                scroll_test = true;
                 i += 1;
             }
             "--no-grab" => {
@@ -3056,6 +3310,7 @@ fn main() -> Result<()> {
         remote_path.clone(),
         keymap,
         grab,
+        scroll_test,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -3120,6 +3375,61 @@ mod tests {
     }
 
 
+
+    #[test]
+    fn scroll_synthesis_is_portable_and_keeps_sub_line_motion() {
+        let scroll = |dx: f32, dy: f32, phase: Phase, momentum: Option<Phase>| Gesture::Scroll {
+            dx,
+            dy,
+            phase,
+            precise: true,
+            momentum,
+        };
+        // Two lines of finger travel; the point field carries the pixels.
+        let step = PIXELS_PER_LINE;
+        let (msg, rem, lines) =
+            scroll_message(&scroll(0.0, 2.0 * step, Phase::Changed, None), 10, 20, (0.0, 0.0));
+        let msg = msg.unwrap();
+        assert_eq!(msg.len(), 58);
+        assert_eq!(lines, (0, 2));
+        let dy = i16::from_be_bytes([msg[10], msg[11]]);
+        assert_eq!(dy, 2);
+        let py = i32::from_be_bytes([msg[34], msg[35], msg[36], msg[37]]);
+        assert_eq!(py, (2.0 * step).round() as i32);
+        assert_eq!(rem, (0.0, 0.0));
+        // Two half-line samples: the first has no whole line yet, the second
+        // does, and neither is dropped.
+        let (first, rem, _) =
+            scroll_message(&scroll(0.0, step / 2.0, Phase::Changed, None), 0, 0, (0.0, 0.0));
+        assert!(first.is_some());
+        assert_eq!(rem.1, 0.5);
+        let (second, rem, _) =
+            scroll_message(&scroll(0.0, step / 2.0, Phase::Changed, None), 0, 0, rem);
+        let second = second.unwrap();
+        assert_eq!(i16::from_be_bytes([second[10], second[11]]), 1);
+        assert_eq!(rem.1, 0.0);
+        // Phase codes and momentum land in their fields.
+        let (msg, _, _) = scroll_message(
+            &scroll(0.0, 12.0, Phase::Ended, Some(Phase::Changed)),
+            0,
+            0,
+            (0.0, 0.0),
+        );
+        let msg = msg.unwrap();
+        let phase = u32::from_be_bytes([msg[46], msg[47], msg[48], msg[49]]);
+        let momentum = u32::from_be_bytes([msg[50], msg[51], msg[52], msg[53]]);
+        assert_eq!(phase, 4);
+        assert_eq!(momentum, 2);
+        // A wheel gesture (not precise) still produces a message.
+        let wheel = Gesture::Scroll {
+            dx: 0.0,
+            dy: 12.0,
+            phase: Phase::Changed,
+            precise: false,
+            momentum: None,
+        };
+        assert!(scroll_message(&wheel, 0, 0, (0.0, 0.0)).0.is_some());
+    }
     #[test]
     fn usage_documents_every_flag() {
         // Every flag literal in the argument parser must appear in USAGE:

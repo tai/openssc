@@ -812,22 +812,27 @@ fn main() -> Result<()> {
                     let phases: &[u32] = if series { &[1, 2, 2, 4] } else { &[num(&opts, "phase", 2u32)] };
                     let point_y: i32 = num(&opts, "point-y", -10i32);
                     let dy: i16 = num(&opts, "dy", -10i16);
-                    for &phase in phases {
-                        let (dy, point_y) = if phase == 2 { (dy, point_y) } else { (0, 0) };
-                        let fixed_y: i32 = num(&opts, "fixed-y", 0i32);
-                        let body = gesture_mouse_scroll(
-                            num(&opts, "dx", 0i16),
-                            dy,
-                            num(&opts, "dz", 0i16),
-                            (0, if phase == 2 { fixed_y } else { 0 }, 0),
-                            (0, point_y, 0),
-                            phase,
-                            0,
-                            cx,
-                            cy,
-                        );
-                        session.send_gesture(&body)?;
-                        std::thread::sleep(Duration::from_millis(16));
+                    // Lab hook: repeat the whole phase list N times so a
+                    // scroll of N identical steps can be measured in one run.
+                    let repeat: usize = num(&opts, "repeat", 1usize).max(1);
+                    for _ in 0..repeat {
+                        for &phase in phases {
+                            let (dy, point_y) = if phase == 2 { (dy, point_y) } else { (0, 0) };
+                            let fixed_y: i32 = num(&opts, "fixed-y", 0i32);
+                            let body = gesture_mouse_scroll(
+                                num(&opts, "dx", 0i16),
+                                dy,
+                                num(&opts, "dz", 0i16),
+                                (0, if phase == 2 { fixed_y } else { 0 }, 0),
+                                (0, point_y, 0),
+                                phase,
+                                0,
+                                cx,
+                                cy,
+                            );
+                            session.send_gesture(&body)?;
+                            std::thread::sleep(Duration::from_millis(16));
+                        }
                     }
                 } else if kind == "swipe" {
                     let body = gesture_swipe(
@@ -878,6 +883,10 @@ fn main() -> Result<()> {
                 std::thread::sleep(Duration::from_millis(delay));
             }
 
+            if opts.contains_key("no-capture") {
+                // Lab hook: the gesture was sent; do not wait for a frame.
+                return Ok(());
+            }
             let (mut reader, mut writer) = session.split()?;
             let mut mvs = opts
                 .contains_key("mvs")
