@@ -104,7 +104,7 @@ fn scroll_message(
     x: u16,
     y: u16,
     remainder: (f32, f32),
-) -> (Option<Vec<u8>>, (f32, f32), (i16, i16)) {
+) -> (Option<Vec<u8>>, (f32, f32), (i16, i16), (i32, i32)) {
     let Gesture::Scroll {
         dx,
         dy,
@@ -113,30 +113,44 @@ fn scroll_message(
         ..
     } = *gesture
     else {
-        return (None, remainder, (0, 0));
+        return (None, remainder, (0, 0), (0, 0));
     };
     let points_per_line = (PIXELS_PER_LINE / scroll_speed()).max(0.5);
-    let mut acc = (
+    let total = (
         remainder.0 + dx / points_per_line,
         remainder.1 + dy / points_per_line,
     );
-    let whole_x = acc.0.trunc();
-    let whole_y = acc.1.trunc();
-    acc.0 -= whole_x;
-    acc.1 -= whole_y;
+    let whole_x = total.0.trunc();
+    let whole_y = total.1.trunc();
     let lx = whole_x.clamp(-40.0, 40.0) as i16;
     let ly = whole_y.clamp(-40.0, 40.0) as i16;
-    // Point and fixed deltas MUST stay zero on this server. Measured: with
-    // them filled, ~90 requested lines moved the remote document by 1; with
-    // them zeroed the same input moved it ~75 lines. This server acts on the
-    // point/fixed fields when they are non-zero and its units are not the
-    // points we were sending, so the line fields stop being honoured. v1.3.0
-    // sent zeros here, which is why scrolling worked then.
+    // Carry the sub-line remainder into the next event. Without this, every
+    // event restarts from zero and a slow drag never accumulates enough to
+    // move at all - which is exactly the "small motion does nothing" report.
+    let carried = (total.0 - whole_x, total.1 - whole_y);
+    // `fixedDelta` is in 16.16 fixed point and is the only channel that
+    // carries sub-line motion. MEASURED matrix (30 points of finger travel,
+    // TextEdit on mm.local):
+    //   A line=trunc, fixed=0        -> 110 points (2.5 lines, stepwise)
+    //   B line=trunc, point=pixels   -> 110 points (point ignored)
+    //   C line=trunc, fixed=fraction -> 105 points
+    //   3-point steps: A = 0, B = 0, C = 105 points  <- fixed is the sub-line
+    //   channel; point does nothing for precision.
+    // A line delta and the same delta in fixed do NOT add (line=5, fixed=5
+    // moved the same as either alone), so both fields carry the SAME total:
+    // the integer part in the line field (v1.3.0 behaviour) and the full value
+    // in fixed (precision). Whichever the server honours, the delta is right.
+    let fx = (total.0 * 65536.0)
+        .round()
+        .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
+    let fy = (total.1 * 65536.0)
+        .round()
+        .clamp(-2_147_483_648.0, 2_147_483_647.0) as i32;
     let msg = gesture_mouse_scroll(
         lx,
         ly,
         0,
-        (0, 0, 0),
+        (fx, fy, 0),
         (0, 0, 0),
         phase.code(),
         // TODO(momentum): winit folds NSEvent's momentum phase into
@@ -146,7 +160,7 @@ fn scroll_message(
         x,
         y,
     );
-    (Some(msg), acc, (lx, ly))
+    (Some(msg), carried, (lx, ly), (fx, fy))
 }
 
 /// One Cmd+Shift+V pull: how many fetches went out and what the last archive
@@ -762,7 +776,7 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
         Gesture::Scroll { .. } => {
             // Same synthesis as the winit path: the portable gesture model
             // carries pixels, `scroll_message` owns every wire number.
-            let (msg, _, _) = scroll_message(&g, fb_w / 2, fb_h / 2, (0.0, 0.0));
+            let (msg, _, _, _) = scroll_message(&g, fb_w / 2, fb_h / 2, (0.0, 0.0));
             if let Some(msg) = msg {
                 out.push(msg);
             }
@@ -1417,7 +1431,8 @@ impl App {
     /// actually went on the wire, so dropped sub-line motion is visible.
     fn emit_scroll(&mut self, gesture: &Gesture, from_momentum: bool) {
         let (x, y) = self.cursor;
-        let (msg, remainder, lines) = scroll_message(gesture, x, y, self.scroll_rem);
+        let (msg, remainder, lines, fixed) =
+            scroll_message(gesture, x, y, self.scroll_rem);
         self.scroll_rem = remainder;
         if self.debug_input {
             if let Gesture::Scroll {
@@ -1429,13 +1444,13 @@ impl App {
             } = *gesture
             {
                 eprintln!(
-                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) frac=({:.2},{:.2}) phase={} precise={} momentum={from_momentum} speed={:.2}",
+                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) fixed=({},{}) phase={} precise={} momentum={from_momentum} speed={:.2}",
                     dx.round() as i32,
                     dy.round() as i32,
                     lines.0,
                     lines.1,
-                    remainder.0,
-                    remainder.1,
+                    fixed.0,
+                    fixed.1,
                     phase.code(),
                     precise,
                     scroll_speed()
@@ -3409,38 +3424,34 @@ mod tests {
             precise: true,
             momentum,
         };
-        // Two lines of finger travel; the point field carries the pixels.
+        // Two lines of finger travel: the integer part in the line field and
+        // the same total in the 16.16 fixed field.
         let step = PIXELS_PER_LINE;
-        let (msg, rem, lines) =
+        let (msg, rem, lines, fixed) =
             scroll_message(&scroll(0.0, 2.0 * step, Phase::Changed, None), 10, 20, (0.0, 0.0));
         let msg = msg.unwrap();
         assert_eq!(msg.len(), 58);
         assert_eq!(lines, (0, 2));
+        assert_eq!(fixed, (0, 2 * 65536));
         let dy = i16::from_be_bytes([msg[10], msg[11]]);
         assert_eq!(dy, 2);
-        // Point and fixed deltas must stay zero: this server honours them when
-        // non-zero, in units we do not produce, and the line fields then stop
-        // being applied (measured: ~90 requested lines moved one line). See the
-        // comment in `scroll_message`.
+        // The point field stays zero: the server ignores it (matrix B == A).
         let py = i32::from_be_bytes([msg[34], msg[35], msg[36], msg[37]]);
         assert_eq!(py, 0, "point delta must stay zero on this server");
-        let fixed_y = i32::from_be_bytes([msg[22], msg[23], msg[24], msg[25]]);
-        assert_eq!(fixed_y, 0, "fixed delta must stay zero on this server");
-        assert_eq!(rem, (0.0, 0.0));
-        // Two half-line samples: the first has no whole line yet, the second
-        // does, and neither is dropped.
-        let (first, rem, _) =
+        // A half-line sample carries no whole line but a 16.16 fixed fraction,
+        // which is the channel the server actually applies (measured): the
+        // line field alone truncates this to nothing.
+        let (half, _, lines, fixed) =
             scroll_message(&scroll(0.0, step / 2.0, Phase::Changed, None), 0, 0, (0.0, 0.0));
-        assert!(first.is_some());
-        assert_eq!(rem.1, 0.5);
-        let (second, rem, _) =
-            scroll_message(&scroll(0.0, step / 2.0, Phase::Changed, None), 0, 0, rem);
-        let second = second.unwrap();
-        assert_eq!(i16::from_be_bytes([second[10], second[11]]), 1);
-        assert_eq!(rem.1, 0.0);
+        let half = half.unwrap();
+        assert_eq!(lines, (0, 0));
+        assert_eq!(fixed, (0, 32768));
+        assert_eq!(i16::from_be_bytes([half[10], half[11]]), 0);
+        let fixed_y = i32::from_be_bytes([half[18], half[19], half[20], half[21]]);
+        assert_eq!(fixed_y, 32768); // 0.5 line in 16.16
         // Phase codes and momentum land in their fields.
-        let (msg, _, _) = scroll_message(
-            &scroll(0.0, 12.0, Phase::Ended, Some(Phase::Changed)),
+        let (msg, _, _, _) = scroll_message(
+            &scroll(0.0, PIXELS_PER_LINE, Phase::Ended, Some(Phase::Changed)),
             0,
             0,
             (0.0, 0.0),
