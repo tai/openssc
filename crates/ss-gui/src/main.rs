@@ -65,12 +65,22 @@ struct PendingScroll {
 
 /// Scroll coalescing interval: ~120 Hz, so a fast flick does not flood the
 /// session with one 58-byte message per trackpad sample.
-const SCROLL_INTERVAL: Duration = Duration::from_millis(8);
+const SCROLL_INTERVAL: Duration = Duration::from_millis(4);
 /// Points of finger travel per scroll line. Measured on the lab server:
 /// one subtype-11 line unit scrolls a TextEdit document ~120 points (three
 /// consecutive isolated events, 240 screen px at 2x). The server applies its
 /// own acceleration to multi-line deltas, so this is a 1:1 tracking choice.
 const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
+
+/// `--scroll-speed`: multiplier on scroll distance, for feel calibration.
+/// Stored as f32 bits so it can be set from the CLI without threading it
+/// through every constructor.
+static SCROLL_SPEED: std::sync::atomic::AtomicU32 =
+    std::sync::atomic::AtomicU32::new(0x3f80_0000); // 1.0f32
+
+fn scroll_speed() -> f32 {
+    f32::from_bits(SCROLL_SPEED.load(std::sync::atomic::Ordering::Relaxed))
+}
 
 /// Map winit's touch phase onto the portable gesture phase.
 fn phase_from_touch(phase: TouchPhase) -> Phase {
@@ -105,9 +115,10 @@ fn scroll_message(
     else {
         return (None, remainder, (0, 0));
     };
+    let points_per_line = (PIXELS_PER_LINE / scroll_speed()).max(0.5);
     let mut acc = (
-        remainder.0 + dx / PIXELS_PER_LINE,
-        remainder.1 + dy / PIXELS_PER_LINE,
+        remainder.0 + dx / points_per_line,
+        remainder.1 + dy / points_per_line,
     );
     let whole_x = acc.0.trunc();
     let whole_y = acc.1.trunc();
@@ -115,16 +126,18 @@ fn scroll_message(
     acc.1 -= whole_y;
     let lx = whole_x.clamp(-40.0, 40.0) as i16;
     let ly = whole_y.clamp(-40.0, 40.0) as i16;
-    let px = dx.round().clamp(-32768.0, 32767.0) as i32;
-    let py = dy.round().clamp(-32768.0, 32767.0) as i32;
+    // Point and fixed deltas MUST stay zero on this server. Measured: with
+    // them filled, ~90 requested lines moved the remote document by 1; with
+    // them zeroed the same input moved it ~75 lines. This server acts on the
+    // point/fixed fields when they are non-zero and its units are not the
+    // points we were sending, so the line fields stop being honoured. v1.3.0
+    // sent zeros here, which is why scrolling worked then.
     let msg = gesture_mouse_scroll(
         lx,
         ly,
         0,
-        // fixed deltas use the same pixel space until the native divisor is
-        // known; the field is i32 pixels on both.
-        (px, py, 0),
-        (px, py, 0),
+        (0, 0, 0),
+        (0, 0, 0),
         phase.code(),
         // TODO(momentum): winit folds NSEvent's momentum phase into
         // TouchPhase, so macOS cannot fill this yet; the field exists for a
@@ -446,6 +459,7 @@ Display and codec:
 
 Input and keyboard:
   --keymap us|jis          layout the REMOTE runs (default us)
+  --scroll-speed <f>       scroll distance multiplier, feel calibration (default 1.0)
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
@@ -1415,7 +1429,7 @@ impl App {
             } = *gesture
             {
                 eprintln!(
-                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) frac=({:.2},{:.2}) phase={} precise={} momentum={from_momentum}",
+                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) frac=({:.2},{:.2}) phase={} precise={} momentum={from_momentum} speed={:.2}",
                     dx.round() as i32,
                     dy.round() as i32,
                     lines.0,
@@ -1423,7 +1437,8 @@ impl App {
                     remainder.0,
                     remainder.1,
                     phase.code(),
-                    precise
+                    precise,
+                    scroll_speed()
                 );
             }
         }
@@ -2618,6 +2633,15 @@ fn main() -> Result<()> {
             }
             "--release-grab" if i + 1 < args.len() => {
                 release_chord = Some(args[i + 1].clone());
+                i += 2;
+            }
+            "--scroll-speed" if i + 1 < args.len() => {
+                let speed: f32 = args[i + 1].parse()?;
+                if !(0.1..=20.0).contains(&speed) {
+                    eprintln!("--scroll-speed must be between 0.1 and 20.0");
+                    std::process::exit(2);
+                }
+                SCROLL_SPEED.store(speed.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 i += 2;
             }
             "--keymap" if i + 1 < args.len() => {
