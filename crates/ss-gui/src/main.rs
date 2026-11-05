@@ -868,6 +868,9 @@ struct App {
     pointer_inside: bool,
     /// Set once the local pointer is hidden in favour of the decoded bitmap.
     cursor_hidden: bool,
+    /// A decoded remote cursor arrived; hide the OS pointer on the next idle
+    /// turn rather than inside the event dispatch.
+    want_cursor_hidden: bool,
     /// Remote destination folder for dropped files (`/Users/<user>/Downloads`).
     file_dest: String,
     /// Set while a Cmd+Shift+V pull is waiting for the archive that answers
@@ -997,6 +1000,7 @@ impl App {
             point_size: None,
             pointer_inside: true,
             cursor_hidden: false,
+            want_cursor_hidden: false,
             file_dest,
             pull_pending,
             remote_path,
@@ -1737,14 +1741,12 @@ impl App {
                 );
             }
             self.cursor_shape = Some(c);
-            if !self.cursor_hidden {
-                if let Some(w) = &self.window {
-                    // The decoded bitmap replaces the OS pointer. This is
-                    // supported on macOS (invisible cursor) and on Wayland/X11.
-                    w.set_cursor_visible(false);
-                    self.cursor_hidden = true;
-                }
-            }
+            // Defer the actual OS call: `set_cursor_visible(false)` makes winit
+            // call `invalidateCursorRectsForView` on the window, and doing that
+            // from inside winit's own event dispatch is re-entrant AppKit
+            // usage. It is applied in `about_to_wait` instead, which is outside
+            // the dispatch and is where every other window mutation belongs.
+            self.want_cursor_hidden = true;
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
@@ -2374,7 +2376,14 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
-        grab::beat();
+        grab::beat_ui();
+        if self.want_cursor_hidden && !self.cursor_hidden {
+            if let Some(w) = &self.window {
+                w.set_cursor_visible(false);
+                self.cursor_hidden = true;
+            }
+            self.want_cursor_hidden = false;
+        }
         if !self.focused_once {
             if let Some(w) = &self.window {
                 w.focus_window();
@@ -3211,7 +3220,7 @@ fn main() -> Result<()> {
         let mut next_band = 0usize;
         let clip_wanted = clipboard;
         let mut full_seen = !mvs;
-        grab::beat();
+        grab::beat_reader();
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
         }
@@ -3221,7 +3230,7 @@ fn main() -> Result<()> {
             let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
             // The reader is a second liveness witness: the tap watchdog only
             // fires when neither the event loop nor the reader has ticked.
-            grab::beat();
+            grab::beat_reader();
             match upd {
                 Ok(update) => {
                     for event in update.filecopy.iter() {

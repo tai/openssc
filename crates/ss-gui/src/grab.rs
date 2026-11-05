@@ -518,7 +518,8 @@ pub struct Grab {
 /// Last time the application proved it was alive, in milliseconds since the
 /// process started. The tap watchdog uses it so a wedged app cannot keep the
 /// keyboard captured.
-static APP_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static READER_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// Whether the keyboard is currently captured. Mirrors `Shared::enabled` so
 /// the event loop can ask without holding the handle.
@@ -528,10 +529,31 @@ pub fn is_active() -> bool {
     GRAB_ACTIVE.load(Ordering::Relaxed)
 }
 
-/// Called from the event loop and the session reader. Cheap enough to call
-/// on every wake-up.
-pub fn beat() {
-    APP_HEARTBEAT_MS.store(now_ms(), Ordering::Relaxed);
+/// Called from the event loop. Cheap enough to call on every wake-up.
+pub fn beat_ui() {
+    UI_HEARTBEAT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Called from the session reader loop.
+pub fn beat_reader() {
+    READER_HEARTBEAT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Most recent events, so a stall report can say what the app was doing.
+static RECENT: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+
+/// Record one line of recent activity for the stall report (bounded).
+pub fn note(what: &str) {
+    if let Ok(mut v) = RECENT.lock() {
+        if v.len() >= 24 {
+            v.remove(0);
+        }
+        v.push(what.to_string());
+    }
+}
+
+fn recent_lines() -> Vec<String> {
+    RECENT.lock().map(|v| v.clone()).unwrap_or_default()
 }
 
 fn now_ms() -> u64 {
@@ -645,13 +667,21 @@ where
                 if !watch.enabled.load(Ordering::SeqCst) {
                     continue;
                 }
-                let beat = APP_HEARTBEAT_MS.load(Ordering::Relaxed);
                 let now = now_ms();
-                if now.saturating_sub(beat) > WATCHDOG_STALL.as_millis() as u64 {
+                let ui_stalled = now.saturating_sub(UI_HEARTBEAT_MS.load(Ordering::Relaxed));
+                let rd_stalled = now.saturating_sub(READER_HEARTBEAT_MS.load(Ordering::Relaxed));
+                let limit = WATCHDOG_STALL.as_millis() as u64;
+                if ui_stalled > limit || rd_stalled > limit {
+                    let what = if ui_stalled > limit { "event loop" } else { "session reader" };
                     eprintln!(
-                        "grab: application stalled for {} ms; releasing the keyboard so it cannot be a lockout",
-                        now.saturating_sub(beat)
+                        "grab: {what} stalled for {} ms (ui {} ms, reader {} ms); releasing the keyboard so it cannot be a lockout",
+                        ui_stalled.max(rd_stalled),
+                        ui_stalled,
+                        rd_stalled
                     );
+                    for line in recent_lines() {
+                        eprintln!("grab:   recent: {line}");
+                    }
                     watch.enabled.store(false, Ordering::SeqCst);
                     let tap = watch.tap.load(Ordering::SeqCst);
                     if tap != 0 {
