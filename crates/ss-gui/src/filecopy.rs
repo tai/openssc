@@ -13,6 +13,7 @@
 
 use anyhow::{bail, Context, Result};
 use rfb_proto::filecopy as proto;
+use rfb_proto::{pasteboard_items, pasteboard_text, ClipboardSend, PasteboardItem};
 use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{Read, Write};
@@ -472,6 +473,298 @@ fn hex_digest(digest: &[u8]) -> String {
         let _ = write!(out, "{byte:02x}");
     }
     out
+}
+
+/// A file path extracted from the remote clipboard for an explicit pull.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullSource {
+    /// Absolute POSIX path on the remote.
+    pub path: String,
+}
+
+/// Percent-decode `%XX` escapes. `None` on a malformed escape or bad UTF-8.
+pub fn percent_decode(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' && i + 2 < bytes.len() {
+            let hi = (bytes[i + 1] as char).to_digit(16)?;
+            let lo = (bytes[i + 2] as char).to_digit(16)?;
+            out.push(((hi << 4) | lo) as u8);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    String::from_utf8(out).ok()
+}
+
+/// A single-line absolute POSIX path.
+pub fn is_absolute_path(text: &str) -> bool {
+    let t = text.trim();
+    t.starts_with('/') && !t.contains('\n') && !t.contains('\r') && !t.contains('\0')
+}
+
+/// Decode one flavour's bytes as text, when its UTI or aliases say it is text.
+fn decode_text_flavour(item: &PasteboardItem) -> Option<String> {
+    let uti = item.uti.as_str();
+    let ostype = item.alias("com.apple.ostype").unwrap_or("");
+    if uti.contains("utf16") || ostype == "utxt" || ostype == "ut16" {
+        // `public.utf16-external-plain-text` carries a BOM; the plain utf16
+        // flavour in these archives is big-endian without one.
+        let units: Vec<u16> = match item.data.get(..2) {
+            Some([0xfe, 0xff]) => item.data[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+            Some([0xff, 0xfe]) => item.data[2..]
+                .chunks_exact(2)
+                .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                .collect(),
+            _ => item
+                .data
+                .chunks_exact(2)
+                .map(|c| u16::from_be_bytes([c[0], c[1]]))
+                .collect(),
+        };
+        return Some(String::from_utf16_lossy(&units));
+    }
+    if uti.contains("traditional-mac") || ostype == "TEXT" {
+        return Some(item.data.iter().map(|&b| b as char).collect());
+    }
+    if uti.contains("utf8")
+        || uti.contains("utf-8")
+        || uti.contains("plain-text")
+        || uti == "public.text"
+        || ostype == "utf8"
+    {
+        return Some(String::from_utf8_lossy(&item.data).to_string());
+    }
+    None
+}
+
+/// The text-side choice for a received archive, plus why it won.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalClipboard {
+    /// Value to write to the local clipboard.
+    pub text: String,
+    /// Winning flavour, e.g. `public.utf8-plain-text item 1, path-like`.
+    pub source: String,
+}
+
+/// Pick the local-clipboard value from every flavour in the archive.
+///
+/// The native client puts the whole flavour set on the pasteboard and lets
+/// macOS resolve it at paste time; we can only write one string, so:
+///
+/// 1. any text-ish flavour whose content is an absolute path (after percent
+///    decoding) wins, whatever its UTI and position. Finder's Option+Cmd+C
+///    ("Copy as Pathname") sends three text items, all the absolute path;
+/// 2. otherwise today's behaviour: the first plain-text flavour (a Finder
+///    plain copy lands here, carrying only the item name).
+///
+/// There is no file-URL stage: the agent strips `furl` when it composes the
+/// archive, so a URL can never reach a client.
+fn choose_text(items: &[PasteboardItem], archive: &[u8]) -> Result<Option<LocalClipboard>> {
+    for (index, item) in items.iter().enumerate() {
+        if item.data.is_empty() {
+            continue;
+        }
+        let Some(text) = decode_text_flavour(item) else {
+            continue;
+        };
+        let trimmed = text.trim();
+        if !is_absolute_path(trimmed) {
+            continue;
+        }
+        let decoded = percent_decode(trimmed).unwrap_or_else(|| trimmed.to_string());
+        let value = if is_absolute_path(&decoded) {
+            decoded
+        } else {
+            trimmed.to_string()
+        };
+        return Ok(Some(LocalClipboard {
+            text: value,
+            source: format!("{} item {}, path-like", item.uti, index + 1),
+        }));
+    }
+    Ok(pasteboard_text(archive)?
+        .filter(|text| !text.trim().is_empty())
+        .map(|text| LocalClipboard {
+            text,
+            source: "first plain-text flavour (unchanged)".to_string(),
+        }))
+}
+
+/// Choose the local-clipboard content for a received archive.
+///
+/// Images are handled separately by the caller; this covers the text side and
+/// never returns a basename when a flavour carries the absolute path.
+pub fn local_clipboard(archive: &[u8]) -> Result<Option<LocalClipboard>> {
+    let items = pasteboard_items(archive)?;
+    choose_text(&items, archive)
+}
+
+/// Find the first pullable path in a pasteboard archive.
+///
+/// This server's agent strips `furl` from the archive, so the only path a
+/// client can see is one that is already TEXT on the remote clipboard (for
+/// example Finder's "Copy as Pathname"). Anything else is refused.
+pub fn pull_source(archive: &[u8]) -> Result<Option<PullSource>> {
+    let items = pasteboard_items(archive)?;
+    let Some(choice) = choose_text(&items, archive)? else {
+        return Ok(None);
+    };
+    Ok(is_absolute_path(&choice.text).then_some(PullSource { path: choice.text }))
+}
+
+/// One-line description of what an archive actually held, for refusal logs.
+///
+/// The point is to make a failure self-diagnosing: the remote clipboard may
+/// carry the basename (`clipboard holds "rf_b.txt"`), something else entirely,
+/// or nothing at all (`clipboard archive was empty (0 items)`).
+pub fn describe_archives(archives: &[Vec<u8>]) -> String {
+    let mut items = Vec::new();
+    for archive in archives {
+        if let Ok(parsed) = pasteboard_items(archive) {
+            items.extend(parsed);
+        }
+    }
+    if items.is_empty() {
+        return "clipboard archive was empty (0 items)".to_string();
+    }
+    let mut texts: Vec<String> = Vec::new();
+    let mut non_text = 0usize;
+    for item in &items {
+        if item.data.is_empty() {
+            continue;
+        }
+        match decode_text_flavour(item) {
+            Some(text) => {
+                let text = text.trim();
+                if !text.is_empty() && !texts.iter().any(|t| t == text) {
+                    texts.push(text.to_string());
+                }
+            }
+            None => non_text += 1,
+        }
+    }
+    if texts.is_empty() {
+        return format!(
+            "clipboard holds {} item(s), none of them text",
+            items.len()
+        );
+    }
+    let shown: Vec<String> = texts.iter().take(3).map(|t| format!("{t:?}")).collect();
+    let mut out = format!("clipboard holds {}", shown.join(", "));
+    if texts.len() > shown.len() {
+        out.push_str(&format!(" (+{} more)", texts.len() - shown.len()));
+    }
+    if non_text > 0 {
+        out.push_str(&format!(" + {non_text} non-text item(s)"));
+    }
+    out.push_str(" (no path)");
+    out
+}
+
+/// The same description for the raw messages of one update.
+pub fn describe_sends(sends: &[ClipboardSend]) -> String {
+    let mut archives = Vec::new();
+    for send in sends {
+        if send.uncompressed_size == 0 {
+            continue;
+        }
+        if let Ok(archive) = send.archive() {
+            if !archive.is_empty() {
+                archives.push(archive);
+            }
+        }
+    }
+    describe_archives(&archives)
+}
+
+/// Resolve a pull from the ClipboardSend messages in one update.
+///
+/// `Empty` means every archive was a promise/empty (typically the viewer's own
+/// pasteboard while AutoPasteboard is active); `NoFile` means data arrived but
+/// it contained no path-shaped text.
+pub enum PullOutcome {
+    File(PullSource),
+    Empty,
+    NoFile,
+}
+
+pub fn pull_from_sends(sends: &[ClipboardSend]) -> Result<PullOutcome> {
+    let mut archives = Vec::new();
+    for send in sends {
+        if send.uncompressed_size == 0 {
+            continue;
+        }
+        let archive = send.archive()?;
+        if archive.is_empty() {
+            continue;
+        }
+        archives.push(archive);
+    }
+    pull_from_archives(&archives)
+}
+
+/// The same decision as [`pull_from_sends`], on already-inflated archives.
+pub fn pull_from_archives(archives: &[Vec<u8>]) -> Result<PullOutcome> {
+    // A zero-item archive is a promise (no data), not a failed match.
+    let mut usable = Vec::new();
+    for archive in archives {
+        if !pasteboard_items(archive)?.is_empty() {
+            usable.push(archive);
+        }
+    }
+    for archive in &usable {
+        if let Some(source) = pull_source(archive)? {
+            return Ok(PullOutcome::File(source));
+        }
+    }
+    if usable.is_empty() {
+        return Ok(PullOutcome::Empty);
+    }
+    // Diagnose the common Finder case: plain Cmd+C puts only the item NAME in
+    // the text flavours, and the path exists solely as a `furl` the agent
+    // strips before it reaches any client.
+    for archive in &usable {
+        if let Ok(items) = pasteboard_items(archive) {
+            for item in items {
+                match decode_text_flavour(&item) {
+                    Some(text) => eprintln!(
+                        "pull-from-remote: no path in {:?} ({} bytes) {:?}",
+                        item.uti,
+                        item.data.len(),
+                        text.chars().take(80).collect::<String>()
+                    ),
+                    None => eprintln!(
+                        "pull-from-remote: no path in {:?} ({} bytes, not text)",
+                        item.uti,
+                        item.data.len()
+                    ),
+                }
+            }
+        }
+    }
+    Ok(PullOutcome::NoFile)
+}
+
+/// Build a pasteboard archive for tests.
+#[cfg(test)]
+fn test_archive(items: &[(&str, &str)]) -> Vec<u8> {
+    let items: Vec<rfb_proto::PasteboardItem> = items
+        .iter()
+        .map(|(uti, data)| rfb_proto::PasteboardItem {
+            uti: (*uti).to_string(),
+            aliases: Vec::new(),
+            data: data.as_bytes().to_vec(),
+        })
+        .collect();
+    rfb_proto::pasteboard_archive(&items)
 }
 
 /// Finder-style unique name: `report.pdf`, `report 2.pdf`, `report 3.pdf`.
@@ -955,6 +1248,203 @@ mod tests {
         assert!(out.join("tree/empty").is_dir());
         assert!(!out.join("tree/link").exists());
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn pathname_archive_uses_the_absolute_path() {
+        // pD's Option+Cmd+C archive: three text items, all the absolute path,
+        // no file-url flavour.
+        let archive = test_archive(&[
+            ("public.utf8-plain-text", "/Users/me/Desktop/for-md/Makefile"),
+            (
+                "com.apple.traditional-mac-plain-text",
+                "/Users/me/Desktop/for-md/Makefile",
+            ),
+            ("public.utf16-plain-text", "/Users/me/Desktop/for-md/Makefile"),
+        ]);
+        let choice = local_clipboard(&archive).unwrap().unwrap();
+        assert_eq!(choice.text, "/Users/me/Desktop/for-md/Makefile");
+        assert_eq!(choice.source, "public.utf8-plain-text item 1, path-like");
+        match pull_from_archives(&[archive]).unwrap() {
+            PullOutcome::File(source) => {
+                assert_eq!(source.path, "/Users/me/Desktop/for-md/Makefile");
+            }
+            _ => panic!("expected the pathname to be pullable"),
+        }
+    }
+
+    #[test]
+    fn plain_copy_keeps_the_basename_and_is_not_pullable() {
+        // pD's plain Cmd+C archive: basename text plus an icon blob; the path
+        // is only in the remote pasteboard's `furl`, which the agent strips.
+        let archive = test_archive(&[
+            ("public.utf16-external-plain-text", "Makefile"),
+            ("public.utf8-plain-text", "Makefile"),
+            ("com.apple.icns", "icon"),
+            ("public.utf16-plain-text", "Makefile"),
+            ("com.apple.traditional-mac-plain-text", "Makefile"),
+        ]);
+        let choice = local_clipboard(&archive).unwrap().unwrap();
+        assert_eq!(choice.text, "Makefile");
+        assert_eq!(choice.source, "first plain-text flavour (unchanged)");
+        assert!(matches!(
+            pull_from_archives(&[archive]).unwrap(),
+            PullOutcome::NoFile
+        ));
+    }
+
+    #[test]
+    fn folder_pathname_pulls_the_folder_path() {
+        let archive = test_archive(&[
+            ("public.utf8-plain-text", "/Users/me/Desktop/for-md/pullfolder"),
+            (
+                "com.apple.traditional-mac-plain-text",
+                "/Users/me/Desktop/for-md/pullfolder",
+            ),
+            (
+                "public.utf16-plain-text",
+                "/Users/me/Desktop/for-md/pullfolder",
+            ),
+        ]);
+        assert_eq!(
+            local_clipboard(&archive).unwrap().unwrap().text,
+            "/Users/me/Desktop/for-md/pullfolder"
+        );
+        match pull_from_archives(&[archive]).unwrap() {
+            PullOutcome::File(source) => {
+                assert_eq!(source.path, "/Users/me/Desktop/for-md/pullfolder")
+            }
+            _ => panic!("expected the folder pathname to be pullable"),
+        }
+    }
+
+    #[test]
+    fn refusal_describes_what_the_clipboard_held() {
+        let plain = test_archive(&[
+            ("public.utf8-plain-text", "rf_b.txt"),
+            ("com.apple.icns", "icon"),
+        ]);
+        assert_eq!(
+            describe_archives(&[plain]),
+            "clipboard holds \"rf_b.txt\" + 1 non-text item(s) (no path)"
+        );
+        assert_eq!(
+            describe_archives(&[]),
+            "clipboard archive was empty (0 items)"
+        );
+        assert_eq!(
+            describe_archives(&[test_archive(&[])]),
+            "clipboard archive was empty (0 items)"
+        );
+        // Duplicate text flavours collapse to one value.
+        let dupes = test_archive(&[
+            ("public.utf8-plain-text", "Makefile"),
+            ("com.apple.traditional-mac-plain-text", "Makefile"),
+        ]);
+        assert_eq!(
+            describe_archives(&[dupes]),
+            "clipboard holds \"Makefile\" (no path)"
+        );
+        // A binary-only archive says so instead of printing bytes.
+        let icon = test_archive(&[("com.apple.icns", "icon")]);
+        assert_eq!(
+            describe_archives(&[icon]),
+            "clipboard holds 1 item(s), none of them text"
+        );
+    }
+
+    #[test]
+    fn plain_text_is_unchanged() {
+        let archive = test_archive(&[
+            ("public.utf16-plain-text", "hello world"),
+            ("public.utf8-plain-text", "hello world"),
+        ]);
+        let choice = local_clipboard(&archive).unwrap().unwrap();
+        assert_eq!(choice.text, "hello world");
+        assert!(matches!(
+            pull_from_archives(&[archive]).unwrap(),
+            PullOutcome::NoFile
+        ));
+        // A promise / empty archive writes nothing, so no stale path survives.
+        assert_eq!(local_clipboard(&test_archive(&[])).unwrap(), None);
+        assert!(matches!(
+            pull_from_archives(&[]).unwrap(),
+            PullOutcome::Empty
+        ));
+        assert!(matches!(
+            pull_from_archives(&[test_archive(&[])]).unwrap(),
+            PullOutcome::Empty
+        ));
+    }
+
+    #[test]
+    fn real_pull_ab_archives_decode_as_expected() {
+        // Offline check against wK:pD's captures when they are present.
+        let dir = std::path::Path::new("../../artifacts/pull-ab");
+        let read = |name: &str| std::fs::read(dir.join(name)).ok();
+        let Some(pathname) = read("file-pathname-flags0.archive") else {
+            return;
+        };
+        let choice = local_clipboard(&pathname).unwrap().unwrap();
+        assert_eq!(choice.text, "/Users/tai/Desktop/for-md/Makefile");
+        assert!(matches!(
+            pull_from_archives(&[pathname]).unwrap(),
+            PullOutcome::File(source) if source.path == "/Users/tai/Desktop/for-md/Makefile"
+        ));
+
+        let folder = read("folder-pathname-flags0.archive").unwrap();
+        assert!(matches!(
+            pull_from_archives(&[folder]).unwrap(),
+            PullOutcome::File(source)
+                if source.path == "/Users/tai/Desktop/for-md/pullfolder"
+        ));
+
+        let plain = read("smoke-flags0.archive").unwrap();
+        assert_eq!(
+            local_clipboard(&plain).unwrap().unwrap().text,
+            "Makefile"
+        );
+        assert!(matches!(
+            pull_from_archives(&[plain]).unwrap(),
+            PullOutcome::NoFile
+        ));
+
+        let plain_folder = read("folder-plain-flags0.archive").unwrap();
+        assert_eq!(
+            local_clipboard(&plain_folder).unwrap().unwrap().text,
+            "pullfolder"
+        );
+        assert!(matches!(
+            pull_from_archives(&[plain_folder]).unwrap(),
+            PullOutcome::NoFile
+        ));
+    }
+
+    #[test]
+    fn pull_source_text_fallback_and_rejections() {
+        let path = test_archive(&[("public.utf8-plain-text", "/Users/me/file.bin")]);
+        assert_eq!(
+            pull_source(&path).unwrap().unwrap().path,
+            "/Users/me/file.bin"
+        );
+        let not_path = test_archive(&[("public.utf8-plain-text", "hello")]);
+        assert!(pull_source(&not_path).unwrap().is_none());
+        let multiline = test_archive(&[("public.utf8-plain-text", "/a\n/b")]);
+        assert!(pull_source(&multiline).unwrap().is_none());
+        let empty = test_archive(&[]);
+        assert!(pull_source(&empty).unwrap().is_none());
+    }
+
+    #[test]
+    fn a_file_url_alone_is_not_pulled() {
+        // The agent strips `furl`, so an archive must never rely on one; this
+        // pins the behaviour that only TEXT paths are pullable.
+        let archive = test_archive(&[(
+            "public.file-url",
+            "file:///Users/me/My%20File.txt",
+        )]);
+        assert!(local_clipboard(&archive).unwrap().is_none());
+        assert!(pull_source(&archive).unwrap().is_none());
     }
 
     #[test]

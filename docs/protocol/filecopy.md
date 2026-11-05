@@ -147,6 +147,30 @@ at connect into `~/Downloads`. A folder arrives as a folder, tree intact, with
 Test hooks (not user-facing): `--send-file <path>` and `--recv-file <remote
 path>` exercise the two directions without a drag.
 
+## 8a. Pulling a file or folder FROM the remote (VERIFIED 2026-11-05)
+
+There is no drag-out of the window by decision, so the reverse direction is
+explicit: **Cmd+Shift+V** in `ss-gui` pulls whatever the remote clipboard names.
+
+How it resolves the path:
+1. request a fresh clipboard archive (`0x0b` flags 0) and retry briefly if the
+   server's pasteboard agent has not caught up yet;
+2. take the first flavour whose text, after percent-decoding, is an absolute
+   path (`/...`) - this is what Finder's *Copy as Pathname* puts on the
+   pasteboard;
+3. otherwise refuse with the observed content named, and say what to do instead.
+
+A plain Finder `Cmd+C` on a file cannot work and never could: the remote
+pasteboard then holds `«class furl»` plus the item **name**, the server strips
+the file URL when composing its archive, and the archive carries no path for any
+client, Apple's included. Finder's *Copy as Pathname* (Option+Cmd+C) puts the
+path on the pasteboard as text, which is the supported gesture.
+
+Requires Option to actually reach the remote - see
+`docs/protocol/input-and-gestures.md` §6; with the wrong Option keysym the remote
+performs a plain copy and the clipboard holds a name, which looks exactly like
+"no path on the remote clipboard".
+
 ## 9. Open
 
 - `cmd 200` frames arrive after a successful send (28 bytes) and are currently

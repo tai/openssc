@@ -1,5 +1,31 @@
 # Protocol status / agent handoff
 
+## 2026-11-05 — **v1.3.0**: pull a file/folder from the remote (VERIFIED)
+
+- Phase / milestone: file copy, reverse direction (no drag-out; explicit pull).
+- Verified (owner, live): remote Finder `Option+Cmd+C` then `Cmd+Shift+V` in
+  ss-gui pulls the file into `~/Downloads` with a matching sha1.
+- The bug behind the long "no path" hunt was **input, not clipboard**: our
+  client forwarded Option as `0xFFE9` (Alt_L), which this server accepts as a
+  key but never raises the Option flag, so the remote received plain `Cmd+C`,
+  Finder copied the file, and the clipboard carried the item name instead of a
+  path. Sending `0xFFE7` (Meta_L) fixes it. Modifiers are now re-synced per key
+  so a missed `ModifiersChanged` cannot drop one. Note this contradicts a static
+  reading of the daemon's KeyMap table - empirical result wins, re-test if ever
+  revisited. `docs/protocol/input-and-gestures.md` §6.
+- Also verified: a plain Finder Cmd+C of a file genuinely cannot carry a path -
+  the server strips the file URL from the archive and no client, Apple's
+  included, can recover it. Finder's *Copy as Pathname* is the supported
+  gesture, documented in `filecopy.md` §8a.
+- Changed: ss-gui gains the Cmd+Shift+V pull (fresh clipfetch with retry, path
+  selection, actionable refusal), modifier re-sync, and the file-copy receive
+  worker; `tools/probe/clipboard_pull_ab.py` is the A/B archive dumper used to
+  settle the question.
+- Open: drag-out remains out of scope; `cmd 200` status frames still logged as
+  unknown; folder drops already work, xattr/resource-fork trailer does not.
+- Lab state: `mm.local` healthy, test files removed on both sides, no client
+  running.
+
 ## 2026-11-05 — **v1.2.0**: file copy, send by drop / receive into ~/Downloads (VERIFIED)
 
 - Phase / milestone: post-v1.1.0, file copy.

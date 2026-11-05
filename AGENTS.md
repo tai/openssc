@@ -1,8 +1,16 @@
-# AGENTS.md — `ss-clone` — **v1.2.0**
+# AGENTS.md — `ss-clone` — **v1.3.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.3.0 — 2026-11-05.** Pulling files back from the remote. `Cmd+Shift+V` in
+> ss-gui pulls whatever the remote clipboard names into `~/Downloads`. Getting
+> there exposed an input bug that had nothing to do with the clipboard: Option
+> was forwarded as `0xFFE9` (Alt_L), which this server accepts as a key but never
+> treats as Option, so the remote saw a plain `Cmd+C` and copied only the item
+> name. Option is now sent as `0xFFE7` (Meta_L) and modifiers are re-synced per
+> key. Drag-out of the window stays out of scope by decision.
 
 > **v1.2.0 — 2026-11-05.** File copy. Drop a file on the window and it appears
 > on the remote; incoming files land in `~/Downloads`. This is Apple's separate
@@ -37,12 +45,12 @@ contradicts this document, update this document in the same change.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** v1.2.0 on macOS. Live GUI, keyboard/pointer input, gesture
-  backend, remote cursor, automatic duplex clipboard (text + images), file copy
-  by drop, and MVS with **server push as the default** including the full push
-  vocabulary (type-0 deltas with the coefficient ring, plus type-1 refinement).
-  Next: **Linux/Wayland packaging** — still the actual target platform and still
-  unwalked — then swipe semantic calibration and frame pacing.
+- **Current phase:** v1.3.0 on macOS. Live GUI, keyboard/pointer input (with
+  correct modifier forwarding), gesture backend, remote cursor, automatic duplex
+  clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
+  pull), and MVS with **server push as the default** including the full push
+  vocabulary. Next: **Linux/Wayland packaging** — still the actual target
+  platform and still unwalked — then swipe semantic calibration and frame pacing.
 - **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
 
 ---
@@ -577,6 +585,26 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.3.0 — 2026-11-05
+
+Pulling a file or folder from the remote, and the input bug that blocked it.
+
+- **Reverse direction**: `Cmd+Shift+V` requests a fresh clipboard archive
+  (0x0b flags 0, with a short retry), takes the first text flavour that is an
+  absolute path, and pulls that file/folder over the file-copy channel into
+  `~/Downloads`. When there is no path it names what it saw and says what to do.
+- **The real bug was Option**: we forwarded `0xFFE9` (Alt_L); this server accepts
+  it as a key but never raises the Option flag, so the remote performed a plain
+  `Cmd+C` and the clipboard carried the item name. `0xFFE7` (Meta_L) is what
+  works. Modifiers are now re-synced per key so a missed `ModifiersChanged`
+  cannot silently drop one. This contradicts a static reading of the daemon's
+  KeyMap table - empirical wins (`input-and-gestures.md` §6).
+- **A plain Finder Cmd+C can never carry a path**: the remote pasteboard holds a
+  file URL plus the name, and the server strips the URL from the archive. No
+  client recovers it, Apple's included. *Copy as Pathname* is the gesture.
+- **Not in v1.3.0**: drag-out of the window (declined), the xattr/resource-fork
+  trailer, `cmd 200` status frames.
 
 ### v1.2.0 — 2026-11-05
 

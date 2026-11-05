@@ -10,7 +10,7 @@ use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
     gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
-    key_event, image_item, pasteboard_archive, pasteboard_image, pasteboard_text,
+    key_event, image_item, pasteboard_archive, pasteboard_image,
     pointer_event, viewer_clipboard_send, AppleSession, CursorUpdate, Update,
 };
 use std::fs::File;
@@ -27,12 +27,27 @@ use winit::application::ApplicationHandler;
 use winit::dpi::{LogicalSize, PhysicalPosition};
 use winit::event::{ElementState, Ime, MouseButton, MouseScrollDelta, TouchPhase, WindowEvent};
 use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop, EventLoopProxy};
-use winit::keyboard::{Key, ModifiersState, NamedKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, NamedKey, PhysicalKey};
 use winit::window::{Window, WindowId};
 
 use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 
 mod filecopy;
+
+/// One Cmd+Shift+V pull: how many fetches went out and what the last archive
+/// actually contained, so the refusal can quote it.
+struct PullState {
+    started: Instant,
+    attempts: u8,
+    last_seen: Option<String>,
+}
+
+/// Fetches per pull (the first plus two retries) and the spacing between them.
+/// The whole pull decides within `PULL_WINDOW`, so a refusal still feels
+/// instant.
+const PULL_FETCHES: u8 = 3;
+const PULL_RETRY: Duration = Duration::from_millis(180);
+const PULL_WINDOW: Duration = Duration::from_millis(700);
 
 fn keysym_for(c: char) -> Option<(u32, bool)> {
     // Returns (keysym, needs_shift). Non-ASCII uses the X11 Unicode keysym
@@ -404,6 +419,8 @@ fn touch_phase(phase: TouchPhase) -> u32 {
 enum UserEvent {
     Refresh,
     Disconnected(String),
+    /// Status text for the window title after a pull attempt.
+    PullStatus(String),
 }
 
 struct App {
@@ -418,6 +435,8 @@ struct App {
     input_w: u16,
     input_h: u16,
     tx: Sender<Vec<u8>>,
+    /// Event-loop handle for the pull retry thread (window title updates).
+    proxy: EventLoopProxy<UserEvent>,
     rx: Receiver<Update>,
     cursor: (u16, u16),
     /// Remote cursor bitmap (0x450 alpha, or -239 mask), once received.
@@ -432,6 +451,13 @@ struct App {
     cursor_hidden: bool,
     /// Remote destination folder for dropped files (`/Users/<user>/Downloads`).
     file_dest: String,
+    /// Set while a Cmd+Shift+V pull is waiting for the archive that answers
+    /// its fetch(es); cleared by the reader on success or by the retry thread
+    /// when it refuses.
+    pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
+    /// Last absolute path the remote clipboard carried, used only when a pull
+    /// gets no archive at all.
+    remote_path: Arc<std::sync::Mutex<Option<String>>>,
     /// `--demo-cursor`: scripted remote pointer tour to exercise cursor shapes.
     demo_cursor: bool,
     demo_step: usize,
@@ -440,6 +466,9 @@ struct App {
     buttons: u8,
     dirty: bool,
     modifiers: ModifiersState,
+    /// Modifiers the remote has actually been told are down. Shift is excluded:
+    /// it is synthesised around shifted characters instead.
+    forwarded_mods: ModifiersState,
     xmap: Vec<usize>,
     render_size: (u32, u32),
     surface_size: (u32, u32),
@@ -481,7 +510,7 @@ impl App {
         input_h: u16,
         tx: Sender<Vec<u8>>,
         rx: Receiver<Update>,
-        _proxy: EventLoopProxy<UserEvent>,
+        proxy: EventLoopProxy<UserEvent>,
         dump_path: Option<String>,
         dump_after: u32,
         exit_after_dump: bool,
@@ -491,6 +520,8 @@ impl App {
         mvs: bool,
         demo_cursor: bool,
         file_dest: String,
+        pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
+        remote_path: Arc<std::sync::Mutex<Option<String>>>,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -509,6 +540,7 @@ impl App {
             input_w,
             input_h,
             tx,
+            proxy,
             rx,
             cursor: (input_w / 2, input_h / 2),
             cursor_shape: None,
@@ -516,6 +548,8 @@ impl App {
             pointer_inside: true,
             cursor_hidden: false,
             file_dest,
+            pull_pending,
+            remote_path,
             demo_cursor,
             demo_step: 0,
             demo_next: Some(Instant::now() + Duration::from_millis(600)),
@@ -523,6 +557,7 @@ impl App {
             buttons: 0,
             dirty: true,
             modifiers: ModifiersState::empty(),
+            forwarded_mods: ModifiersState::empty(),
             xmap: Vec::new(),
             render_size: (0, 0),
             surface_size: (0, 0),
@@ -555,6 +590,130 @@ impl App {
         if self.tx.send(body).is_err() && self.debug_input {
             eprintln!("input channel closed (writer thread exited)");
         }
+    }
+
+    /// Make the remote's modifier state match `target` (Shift excluded).
+    ///
+    /// Downs go out in a fixed order, ups in reverse, and the tracked state is
+    /// only advanced for what was actually sent, so a missed or reordered
+    /// `ModifiersChanged` can never leave a modifier stuck down.
+    fn sync_modifiers(&mut self, target: ModifiersState) {
+        // Option is Meta_L (0xFFE7) on this server: Alt_L (0xFFE9) is accepted
+        // as a key but never raises the Option flag, which silently turned
+        // Option+Cmd+C into a plain Cmd+C.
+        let bits = [
+            (ModifiersState::CONTROL, 0xffe3u32),
+            (ModifiersState::ALT, 0xffe7),
+            (ModifiersState::SUPER, 0xffeb),
+        ];
+        for (bit, keysym) in bits {
+            if target.contains(bit) && !self.forwarded_mods.contains(bit) {
+                self.send(key_event(keysym, true));
+                self.forwarded_mods.insert(bit);
+            }
+        }
+        for (bit, keysym) in bits.iter().rev() {
+            if !target.contains(*bit) && self.forwarded_mods.contains(*bit) {
+                self.send(key_event(*keysym, false));
+                self.forwarded_mods.remove(*bit);
+            }
+        }
+    }
+
+    /// Cmd+Shift+V: pull the file/folder named on the remote clipboard.
+    ///
+    /// The server's clipboard agent may still be updating the pasteboard when
+    /// the first fetch lands, so two more fetches go out ~180 ms apart. The
+    /// reader resolves a path as soon as one appears; if none does within
+    /// `PULL_WINDOW`, the retry thread refuses and quotes what it saw.
+    fn pull_from_remote(&mut self) {
+        {
+            let mut pending = match self.pull_pending.lock() {
+                Ok(p) => p,
+                Err(_) => return,
+            };
+            if let Some(state) = pending.as_ref() {
+                if state.started.elapsed() < PULL_WINDOW {
+                    eprintln!("pull-from-remote: already waiting for the clipboard");
+                    return;
+                }
+                eprintln!("pull-from-remote: previous attempt timed out; starting over");
+            }
+            *pending = Some(PullState {
+                started: Instant::now(),
+                attempts: 1,
+                last_seen: None,
+            });
+        }
+        eprintln!(
+            "pull-from-remote: Cmd/Ctrl+Shift+V -> fetch 1/{PULL_FETCHES}, waiting for its archive"
+        );
+        if let Some(window) = &self.window {
+            window.set_title("ss-clone — pull: reading remote clipboard…");
+        }
+        self.send(clipboard_fetch());
+
+        let pending = self.pull_pending.clone();
+        let remote_path = self.remote_path.clone();
+        let tx = self.tx.clone();
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            for _ in 1..PULL_FETCHES {
+                thread::sleep(PULL_RETRY);
+                let attempt = match pending.lock() {
+                    Ok(mut p) => match p.as_mut() {
+                        Some(state) => {
+                            state.attempts += 1;
+                            Some(state.attempts)
+                        }
+                        None => None,
+                    },
+                    Err(_) => None,
+                };
+                let Some(attempt) = attempt else { return };
+                eprintln!(
+                    "pull-from-remote: no path yet, retrying the fetch ({attempt}/{PULL_FETCHES})"
+                );
+                if tx.send(clipboard_fetch()).is_err() {
+                    return;
+                }
+            }
+            // Give the last response the rest of the window to land.
+            thread::sleep(PULL_RETRY);
+            let state = match pending.lock() {
+                Ok(mut p) => p.take(),
+                Err(_) => None,
+            };
+            let Some(state) = state else { return };
+            if state.last_seen.is_none() {
+                let cached = remote_path.lock().ok().and_then(|p| p.clone());
+                if let Some(cached) = cached {
+                    let session = filecopy::next_session();
+                    eprintln!(
+                        "pull-from-remote: stage=cached-path {cached} (session {session}); no archive arrived after {} fetches",
+                        state.attempts
+                    );
+                    let name = cached.rsplit('/').next().unwrap_or("file");
+                    let _ = proxy.send_event(UserEvent::PullStatus(format!(
+                        "ss-clone — pulling {name}…"
+                    )));
+                    let _ = tx.send(rfb_proto::filecopy::start_file_send(&cached, session));
+                    return;
+                }
+            }
+            let seen = state
+                .last_seen
+                .unwrap_or_else(|| "no clipboard archive arrived".to_string());
+            eprintln!(
+                "pull-from-remote: {seen} after {} fetches in {} ms - on the remote, put the path on the clipboard as TEXT (e.g. copy it from a Terminal), then press Cmd+Shift+V again; or drop the file on this window.",
+                state.attempts,
+                state.started.elapsed().as_millis()
+            );
+            let _ = proxy.send_event(UserEvent::PullStatus(
+                "ss-clone — No path on the remote clipboard - on the remote, put the path on the clipboard as TEXT (e.g. copy it from a Terminal), then press Cmd+Shift+V again; or drop the file on this window."
+                    .to_string(),
+            ));
+        });
     }
 
     /// Coalesce pointer motion to at most ~125 Hz; buttons always go out now.
@@ -1110,6 +1269,12 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_title("ss-clone — disconnected");
                 }
             }
+            UserEvent::PullStatus(status) => {
+                eprintln!("window title: {status}");
+                if let Some(w) = &self.window {
+                    w.set_title(&status);
+                }
+            }
         }
     }
 
@@ -1155,6 +1320,12 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::Focused(focused) => {
                 if self.debug_input {
                     eprintln!("window focused={focused}");
+                }
+                if !focused {
+                    // Never leave a modifier down on the remote when focus
+                    // leaves us mid-chord.
+                    self.modifiers = ModifiersState::empty();
+                    self.sync_modifiers(ModifiersState::empty());
                 }
                 if let Some(w) = &self.window {
                     w.set_title(if focused {
@@ -1334,6 +1505,11 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::ModifiersChanged(m) => {
                 self.modifiers = m.state();
+                // Command/Control/Option go out as real modifier key events.
+                // Shift is synthesised around shifted characters below, so it
+                // is deliberately not forwarded here (that would double it).
+                let target = self.modifiers;
+                self.sync_modifiers(target);
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 note_input();
@@ -1343,9 +1519,29 @@ impl ApplicationHandler<UserEvent> for App {
                 }
                 if self.debug_input {
                     eprintln!(
-                        "key {:?} logical={:?} text={:?}",
-                        event.state, event.logical_key, event.text
+                        "key {:?} physical={:?} logical={:?} text={:?} mods={:?}",
+                        event.state, event.physical_key, event.logical_key, event.text, self.modifiers
                     );
+                }
+                // Cmd+Shift+V is local: pull the file/folder named on the
+                // remote clipboard. Do not forward the V key (Cmd+V alone is
+                // still a normal remote paste). Match the physical key so a
+                // Japanese/IME layout cannot hide the V.
+                let is_v = matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
+                    || matches!(
+                        &event.logical_key,
+                        Key::Character(s) if s.as_str().eq_ignore_ascii_case("v")
+                    );
+                // Cmd+Shift+V is the advertised shortcut; Ctrl+Shift+V is a
+                // fallback for setups where another app owns Cmd+Shift+V.
+                if is_v
+                    && self.modifiers.shift_key()
+                    && (self.modifiers.super_key() || self.modifiers.control_key())
+                {
+                    if pressed {
+                        self.pull_from_remote();
+                    }
+                    return;
                 }
                 // Test shortcuts for gesture calibration on macOS: Ctrl+Alt+arrows
                 // emit a swipe; Ctrl+Alt+=/- emit a magnify.
@@ -1380,6 +1576,24 @@ impl ApplicationHandler<UserEvent> for App {
                         _ => {}
                     }
                 }
+                // With IME enabled, composed text arrives via Ime::Commit.
+                if self.ime && matches!(&event.logical_key, Key::Character(_)) {
+                    return;
+                }
+                // If the event reports modifiers we never forwarded (a
+                // dropped or reordered ModifiersChanged), put them down before
+                // the key and lift them again after it, in reverse order.
+                let needed = self.modifiers;
+                let synthesized = if pressed {
+                    needed
+                        & (ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER)
+                        & !self.forwarded_mods
+                } else {
+                    ModifiersState::empty()
+                };
+                if !synthesized.is_empty() {
+                    self.sync_modifiers(needed);
+                }
                 match &event.logical_key {
                     Key::Named(named) => {
                         if let Some(ks) = named_keysym(named) {
@@ -1387,10 +1601,6 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     Key::Character(s) => {
-                        // With IME enabled, composed text arrives via Ime::Commit.
-                        if self.ime {
-                            return;
-                        }
                         for c in s.chars() {
                             if let Some((ks, shifted)) = keysym_for(c) {
                                 if shifted && pressed {
@@ -1404,6 +1614,9 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                     _ => {}
+                }
+                if !synthesized.is_empty() {
+                    self.sync_modifiers(needed - synthesized);
                 }
             }
             _ => {}
@@ -1586,6 +1799,9 @@ fn main() -> Result<()> {
     // ~/Downloads. Repeatable; no protocol is guessed here.
     let mut send_files: Vec<PathBuf> = Vec::new();
     let mut recv_files: Vec<String> = Vec::new();
+    // `--pull <path>`: pull an absolute remote path without touching the
+    // remote clipboard. Works even when the clipboard carries no path at all.
+    let mut pull_paths: Vec<String> = Vec::new();
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1663,6 +1879,10 @@ fn main() -> Result<()> {
             "--ime" => {
                 ime = true;
                 i += 1;
+            }
+            "--pull" if i + 1 < args.len() => {
+                pull_paths.push(args[i + 1].clone());
+                i += 2;
             }
             "--send-file" if i + 1 < args.len() => {
                 send_files.push(PathBuf::from(&args[i + 1]));
@@ -1806,6 +2026,15 @@ fn main() -> Result<()> {
         recv_dir.display()
     );
     let (tx_fc, rx_fc) = mpsc::channel();
+    let pull_pending: Arc<std::sync::Mutex<Option<PullState>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    // Last absolute path the remote clipboard carried (from whichever text
+    // flavour held it). A fresh archive always decides the pull itself; this
+    // is only a fallback for a fetch that gets no archive at all, and it is
+    // cleared as soon as the remote clipboard holds non-path content.
+    let remote_path: Arc<std::sync::Mutex<Option<String>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    eprintln!("pull-from-remote: Cmd+Shift+V (or Ctrl+Shift+V) armed");
     {
         let recv_dir = recv_dir.clone();
         let verbose = debug_input;
@@ -1826,6 +2055,20 @@ fn main() -> Result<()> {
     for path in recv_files.drain(..) {
         let session = filecopy::next_session();
         eprintln!("filecopy: requesting remote file {path} (session {session})");
+        let _ = tx_out.send(rfb_proto::filecopy::start_file_send(&path, session));
+    }
+    for path in pull_paths.drain(..) {
+        if !filecopy::is_absolute_path(&path) {
+            eprintln!(
+                "pull-from-remote: --pull {path:?} ignored: not an absolute path"
+            );
+            continue;
+        }
+        let session = filecopy::next_session();
+        eprintln!(
+            "pull-from-remote: --pull {path} -> {} (session {session})",
+            recv_dir.display()
+        );
         let _ = tx_out.send(rfb_proto::filecopy::start_file_send(&path, session));
     }
 
@@ -1956,6 +2199,9 @@ fn main() -> Result<()> {
     let image_echo_reader = image_echo.clone();
     let tx_reader = tx_out.clone();
     let tx_fc_reader = tx_fc.clone();
+    let pull_pending_reader = pull_pending.clone();
+    let remote_path_reader = remote_path.clone();
+    let recv_dir_reader = recv_dir.clone();
     let reader_proxy = proxy.clone();
     let debug_reader = debug_input;
     thread::spawn(move || {
@@ -1995,7 +2241,57 @@ fn main() -> Result<()> {
                     for event in update.filecopy.iter() {
                         let _ = tx_fc_reader.send(event.clone());
                     }
-                    if clip_wanted {
+                    // Cmd+Shift+V: a path resolves the pull immediately;
+                    // otherwise remember what the archive actually held (the
+                    // retry thread quotes it if no path arrives in time).
+                    let mut consumed_by_pull = false;
+                    let mut pulled: Option<filecopy::PullSource> = None;
+                    if let Ok(mut pending) = pull_pending_reader.lock() {
+                        if let Some(state) = pending.as_mut() {
+                            if !update.clipboard.is_empty() {
+                                match filecopy::pull_from_sends(&update.clipboard) {
+                                    Ok(filecopy::PullOutcome::File(source)) => {
+                                        pulled = Some(source);
+                                    }
+                                    Ok(_) => {
+                                        state.last_seen = Some(
+                                            filecopy::describe_sends(&update.clipboard),
+                                        );
+                                    }
+                                    Err(error) => {
+                                        state.last_seen =
+                                            Some(format!("archive decode failed: {error:#}"));
+                                    }
+                                }
+                            }
+                        }
+                        if pulled.is_some() {
+                            *pending = None;
+                        }
+                    }
+                    if let Some(source) = pulled {
+                        consumed_by_pull = true;
+                        let session = filecopy::next_session();
+                        eprintln!(
+                            "pull-from-remote: stage=fresh-archive {} -> {} (session {session})",
+                            source.path,
+                            recv_dir_reader.display()
+                        );
+                        let name = source.path.rsplit('/').next().unwrap_or("file");
+                        let _ = reader_proxy.send_event(UserEvent::PullStatus(format!(
+                            "ss-clone — pulling {name}…"
+                        )));
+                        // Keep the cached remote path in step with what was
+                        // just pulled.
+                        if let Ok(mut p) = remote_path_reader.lock() {
+                            *p = Some(source.path.clone());
+                        }
+                        let _ = tx_reader.send(rfb_proto::filecopy::start_file_send(
+                            &source.path,
+                            session,
+                        ));
+                    }
+                    if clip_wanted && !consumed_by_pull {
                         if update.clipboard_changed {
                             let _ = tx_reader.send(clipboard_fetch());
                         }
@@ -2020,30 +2316,43 @@ fn main() -> Result<()> {
                                     if let Ok(mut e) = image_echo_reader.lock() {
                                         *e = Some(hash_bytes(&img.data));
                                     }
+                                    if let Ok(mut p) = remote_path_reader.lock() {
+                                        *p = None;
+                                    }
                                     set_local_clipboard_image(&img.uti, &img.data);
                                     continue;
                                 }
                                 Ok(None) => {}
                                 Err(e) => eprintln!("clipboard image decode: {e:#}"),
                             }
-                            match pasteboard_text(&archive) {
-                                Ok(Some(text)) => {
+                            match filecopy::local_clipboard(&archive) {
+                                Ok(Some(choice)) => {
+                                    // The winning flavour is logged: Finder's
+                                    // Option+Cmd+C sends three text items, all
+                                    // the absolute path; a plain copy sends the
+                                    // bare name, which must not be turned into
+                                    // a pull.
                                     let echo = clip_echo_reader
                                         .lock()
-                                        .map(|e| e.as_deref() == Some(text.as_str()))
+                                        .map(|e| e.as_deref() == Some(choice.text.as_str()))
                                         .unwrap_or(false);
                                     if debug_reader {
                                         eprintln!(
-                                            "clipboard <- {:?}{}",
-                                            text,
+                                            "clipboard <- {:?} (source={}){}",
+                                            choice.text,
+                                            choice.source,
                                             if echo { " (echo, skipped)" } else { "" }
                                         );
                                     }
                                     if !echo {
                                         if let Ok(mut e) = clip_echo_reader.lock() {
-                                            *e = Some(text.clone());
+                                            *e = Some(choice.text.clone());
                                         }
-                                        set_local_clipboard(&text);
+                                        if let Ok(mut p) = remote_path_reader.lock() {
+                                            *p = filecopy::is_absolute_path(&choice.text)
+                                                .then(|| choice.text.clone());
+                                        }
+                                        set_local_clipboard(&choice.text);
                                     }
                                 }
                                 Ok(None) => {}
@@ -2185,6 +2494,8 @@ fn main() -> Result<()> {
         mvs,
         demo_cursor,
         file_dest.clone(),
+        pull_pending.clone(),
+        remote_path.clone(),
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())

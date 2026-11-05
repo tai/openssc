@@ -221,6 +221,33 @@ client 0x17 gesture
 The agent log line is emitted immediately after parsing the struct and before
 posting.
 
+## 6. Modifier keys on this server — Option is 0xFFE7 (VERIFIED 2026-11-05)
+
+Modifiers must be sent as their own RFB KeyEvent messages, not folded into the
+key that follows. This client forwards Control, Option and Command as discrete
+key-down/key-up events and re-syncs them per key so a missed or reordered winit
+`ModifiersChanged` cannot silently drop one.
+
+The keysym choice matters and is **not** the textbook mapping on this server:
+
+| modifier | keysym we send | notes |
+|---|---|---|
+| Command | `0xFFEB` (Super_L) | works as expected |
+| Option | **`0xFFE7` (Meta_L)** | `0xFFE9` (Alt_L) is accepted as a key but never raises the Option flag |
+| Control | `0xFFE3` (Control_L) | works as expected |
+| Shift | synthesised around shifted characters | not forwarded separately |
+
+Getting this wrong is silent: with `0xFFE9` the remote received `Cmd+C` instead
+of `Option+Cmd+C`, so Finder did a plain copy and the clipboard carried a file
+name instead of a path. Nothing errors; the shortcut simply does something else.
+Verified by forwarding Option+Cmd+C and reading the remote clipboard:
+`/Users/tai/Desktop/rf_b.txt` (a path) with `0xFFE7`, `rf_b.txt` (a name) with
+`0xFFE9`.
+
+Note this contradicts a static reading of the daemon's `KeyMap.c` table, which
+places Meta at the Command keycode. The empirical result wins; if the mapping is
+ever revisited, re-test rather than trusting the table.
+
 ## 5. Calibration notes / open questions
 
 ### 5.1 Two-finger scroll — VERIFIED (2026-11-03, `mm.local` TextEdit)
