@@ -1,5 +1,36 @@
 # Protocol status / agent handoff
 
+## 2026-11-05 — file copy: send by drop, receive into ~/Downloads (VERIFIED)
+
+- Phase / milestone: post-v1.1.0, file copy.
+- Verified (owner, live):
+  - local -> remote: a 300000-byte file dropped/`--send-file` arrived at
+    `/Users/tai/Downloads/verify-send.bin`, sha1 identical, mode 0644, owner tai.
+  - remote -> local: a 500000-byte file arrived in `~/Downloads/fc-verify.bin`,
+    sha1 identical; a second transfer of the same name produced
+    `fc-verify 2.bin` and left the first untouched.
+  - a directory drop is refused with a clear message rather than hanging.
+- The blocker that cost the most time: `NewItem` (cmd 101) carries the item
+  metadata and **the POSIX mode lives at +0x66**. With that block zeroed the
+  receiver creates the file mode 000 in the macOS in-progress state and every
+  data write fails. Solved by capturing a genuine server-sent `NewItem` during a
+  reverse transfer (we decrypt our own stream), not by guessing.
+- Wire: `0x22` + u32 length, body = version/cmd/sessionID, then cmds 2/100/101/
+  102/104 (and 1/3/4/5 for the other flows). 64 KiB data chunks. The viewer
+  names the destination folder; the remote launches `SSFileCopyReceiver` and
+  never prompts.
+- Changed: new `rfb-proto::filecopy` and `ss-gui::filecopy`; ss-gui gains a
+  `DroppedFile` handler, a receive worker writing `~/Downloads`, and the
+  `--send-file` / `--recv-file` test hooks.
+- Captures / experiments (untracked): `artifacts/filecopy-1/` (native session
+  log), `artifacts/filecopy-2/` (captured bodies incl. the reference `NewItem`),
+  `artifacts/filecopy-recon.md`.
+- Open: `cmd 200` status frames are logged as unknown; folder drops; xattr /
+  resource-fork block; a user-facing way to pull a file from the remote
+  (`StartFileSend` works but there is no drag-out).
+- Lab state: `mm.local` healthy, all test files removed from both machines, no
+  client running.
+
 ## 2026-11-05 — **v1.1.0**: remote cursor + duplex clipboard (VERIFIED)
 
 - Phase / milestone: v1.0.x clipboard.

@@ -16,6 +16,7 @@ use rfb_proto::{
 use std::fs::File;
 use std::io::BufWriter;
 use std::num::NonZeroU32;
+use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
@@ -30,6 +31,8 @@ use winit::keyboard::{Key, ModifiersState, NamedKey};
 use winit::window::{Window, WindowId};
 
 use raw_window_handle::{DisplayHandle, HasDisplayHandle};
+
+mod filecopy;
 
 fn keysym_for(c: char) -> Option<(u32, bool)> {
     // Returns (keysym, needs_shift). Non-ASCII uses the X11 Unicode keysym
@@ -427,6 +430,8 @@ struct App {
     pointer_inside: bool,
     /// Set once the local pointer is hidden in favour of the decoded bitmap.
     cursor_hidden: bool,
+    /// Remote destination folder for dropped files (`/Users/<user>/Downloads`).
+    file_dest: String,
     /// `--demo-cursor`: scripted remote pointer tour to exercise cursor shapes.
     demo_cursor: bool,
     demo_step: usize,
@@ -485,6 +490,7 @@ impl App {
         deadline: Option<Instant>,
         mvs: bool,
         demo_cursor: bool,
+        file_dest: String,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -509,6 +515,7 @@ impl App {
             point_size: None,
             pointer_inside: true,
             cursor_hidden: false,
+            file_dest,
             demo_cursor,
             demo_step: 0,
             demo_next: Some(Instant::now() + Duration::from_millis(600)),
@@ -1183,6 +1190,37 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("IME preedit {text:?}");
                 }
             }
+            WindowEvent::DroppedFile(path) => {
+                note_input();
+                if let Some(window) = &self.window {
+                    window.set_title("ss-clone — Apple Screen Sharing");
+                }
+                let debug = self.debug_input;
+                let destination = self.file_dest.clone();
+                let tx = self.tx.clone();
+                // Read/enumerate/chunk off the event loop; the UI only logs.
+                thread::spawn(move || {
+                    if let Err(error) =
+                        filecopy::send_file(tx, path.clone(), destination, debug)
+                    {
+                        eprintln!("filecopy: drop {} failed: {error:#}", path.display());
+                    }
+                });
+            }
+            WindowEvent::HoveredFile(path) => {
+                if let Some(window) = &self.window {
+                    let name = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("file");
+                    window.set_title(&format!("ss-clone — drop {name} to send"));
+                }
+            }
+            WindowEvent::HoveredFileCancelled => {
+                if let Some(window) = &self.window {
+                    window.set_title("ss-clone — Apple Screen Sharing");
+                }
+            }
             WindowEvent::CursorEntered { .. } => {
                 self.pointer_inside = true;
                 if let Some(w) = &self.window {
@@ -1543,6 +1581,11 @@ fn main() -> Result<()> {
     // Lab helper: scripted remote pointer tour that dumps a PNG per stop, so
     // cursor-shape rendering can be verified without a human at the mouse.
     let mut demo_cursor = false;
+    // File-copy triggers until the drag UX is the only path: send local files
+    // through the verified 0x22 chain and request remote files into
+    // ~/Downloads. Repeatable; no protocol is guessed here.
+    let mut send_files: Vec<PathBuf> = Vec::new();
+    let mut recv_files: Vec<String> = Vec::new();
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1620,6 +1663,14 @@ fn main() -> Result<()> {
             "--ime" => {
                 ime = true;
                 i += 1;
+            }
+            "--send-file" if i + 1 < args.len() => {
+                send_files.push(PathBuf::from(&args[i + 1]));
+                i += 2;
+            }
+            "--recv-file" if i + 1 < args.len() => {
+                recv_files.push(args[i + 1].clone());
+                i += 2;
             }
             "--mvs" => {
                 mvs = true;
@@ -1742,6 +1793,41 @@ fn main() -> Result<()> {
     // Bounded: if the GUI cannot keep up, apply backpressure instead of
     // queueing stale frames (which makes interaction feel sluggish).
     let (tx_upd, rx_upd) = mpsc::channel::<Update>();
+
+    // File copy: received items always land in ~/Downloads; dropped files are
+    // sent to /Users/<remote user>/Downloads (the native client's shape).
+    let file_dest = filecopy::remote_destination(&user);
+    let recv_dir = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("Downloads");
+    eprintln!(
+        "filecopy: receive directory {}; remote destination {file_dest}",
+        recv_dir.display()
+    );
+    let (tx_fc, rx_fc) = mpsc::channel();
+    {
+        let recv_dir = recv_dir.clone();
+        let verbose = debug_input;
+        thread::spawn(move || filecopy::receive_worker(rx_fc, recv_dir, verbose));
+    }
+    for path in send_files.drain(..) {
+        let tx = tx_out.clone();
+        let destination = file_dest.clone();
+        let verbose = debug_input;
+        thread::spawn(move || {
+            if let Err(error) =
+                filecopy::send_file(tx, path.clone(), destination, verbose)
+            {
+                eprintln!("filecopy: send {} failed: {error:#}", path.display());
+            }
+        });
+    }
+    for path in recv_files.drain(..) {
+        let session = filecopy::next_session();
+        eprintln!("filecopy: requesting remote file {path} (session {session})");
+        let _ = tx_out.send(rfb_proto::filecopy::start_file_send(&path, session));
+    }
 
     if evdev {
         #[cfg(target_os = "linux")]
@@ -1869,6 +1955,7 @@ fn main() -> Result<()> {
     let clip_echo_reader = clip_echo.clone();
     let image_echo_reader = image_echo.clone();
     let tx_reader = tx_out.clone();
+    let tx_fc_reader = tx_fc.clone();
     let reader_proxy = proxy.clone();
     let debug_reader = debug_input;
     thread::spawn(move || {
@@ -1905,6 +1992,9 @@ fn main() -> Result<()> {
             let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
             match upd {
                 Ok(update) => {
+                    for event in update.filecopy.iter() {
+                        let _ = tx_fc_reader.send(event.clone());
+                    }
                     if clip_wanted {
                         if update.clipboard_changed {
                             let _ = tx_reader.send(clipboard_fetch());
@@ -2094,6 +2184,7 @@ fn main() -> Result<()> {
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
         mvs,
         demo_cursor,
+        file_dest.clone(),
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())

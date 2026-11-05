@@ -2,6 +2,7 @@
 //!
 //! Verified against macOS 12.7.6 / screensharingd 3.9.8. See docs/protocol/.
 
+pub mod filecopy;
 pub mod mvs;
 
 use aes::cipher::generic_array::GenericArray;
@@ -664,6 +665,13 @@ impl AppleSession {
                         }
                         16 + be32(&pending[12..16]) as usize
                     }
+                    0x22 => {
+                        while pending.len() < 6 {
+                            let body = self.recv_message()?;
+                            pending.extend_from_slice(&body);
+                        }
+                        6 + be32(&pending[2..6]) as usize
+                    }
                     t => bail!("unexpected record message type 0x{t:02x}"),
                 };
                 while pending.len() < total {
@@ -831,6 +839,8 @@ pub struct Update {
     /// A 0x14 MiscStatus with cmd = 2 said the remote pasteboard changed; the
     /// viewer should answer with a 0x0b ClipboardFetch.
     pub clipboard_changed: bool,
+    /// Parsed `0x22` file-copy events (server→viewer stream).
+    pub filecopy: Vec<filecopy::FileCopyEvent>,
 }
 
 /// Apple `0x1f` ClipboardSend: a zlib-compressed pasteboard archive.
@@ -1067,6 +1077,8 @@ pub struct SessionReader {
     pub debug_control: bool,
     /// Clipboard payloads seen while skipping control messages.
     pending_clipboard: Vec<ClipboardSend>,
+    /// File-copy events seen while skipping control messages.
+    pending_filecopy: Vec<filecopy::FileCopyEvent>,
     /// Set when the server reports the remote pasteboard changed.
     clipboard_changed: bool,
     /// Leftover bytes from a partially consumed record.
@@ -1103,6 +1115,7 @@ impl AppleSession {
                 zlib: flate2::Decompress::new(true),
                 debug_control: self.debug_control,
                 pending_clipboard: Vec::new(),
+                pending_filecopy: Vec::new(),
                 clipboard_changed: false,
                 pending: Vec::new(),
                 tier_zlib: None,
@@ -1128,11 +1141,21 @@ impl SessionReader {
 
 impl SessionWriter {
     pub fn send(&mut self, body: &[u8]) -> Result<()> {
-        let ct = self.send.encrypt(body);
-        let mut framed = Vec::with_capacity(2 + ct.len());
-        framed.extend_from_slice(&(ct.len() as u16).to_be_bytes());
-        framed.extend_from_slice(&ct);
-        self.stream.write_all(&framed)?;
+        // The record framing carries a u16 ciphertext length, so a message
+        // whose ciphertext exceeds 65535 bytes (e.g. a 65536-byte FileData
+        // chunk) must be split across records. The peer reassembles record
+        // bodies into one message stream; the native client does the same.
+        const MAX_BODY: usize = 32768;
+        for chunk in body.chunks(MAX_BODY) {
+            let ct = self.send.encrypt(chunk);
+            if ct.len() > u16::MAX as usize {
+                bail!("record ciphertext {} exceeds u16 framing", ct.len());
+            }
+            let mut framed = Vec::with_capacity(2 + ct.len());
+            framed.extend_from_slice(&(ct.len() as u16).to_be_bytes());
+            framed.extend_from_slice(&ct);
+            self.stream.write_all(&framed)?;
+        }
         Ok(())
     }
 }
@@ -1169,6 +1192,10 @@ impl SessionReader {
                 self.ensure(pending, 16)?;
                 16 + be32(&pending[12..16]) as usize
             }
+            0x22 => {
+                self.ensure(pending, 6)?;
+                6 + be32(&pending[2..6]) as usize
+            }
             t => bail!("unexpected server message type 0x{t:02x}"),
         };
         self.ensure(pending, total)?;
@@ -1193,6 +1220,22 @@ impl SessionReader {
                 compressed,
             });
         }
+        if pending[0] == 0x22 {
+            // `total` already covered the 6-byte transport; the body starts
+            // with version/cmd/session.
+            match filecopy::parse_event(&pending[6..total]) {
+                Some(event) => self.pending_filecopy.push(event),
+                None => {
+                    if self.debug_control {
+                        eprintln!(
+                            "filecopy: unparseable 0x22 body len={} bytes={:02x?}",
+                            total - 6,
+                            &pending[6..total.min(64)]
+                        );
+                    }
+                }
+            }
+        }
         pending.drain(..total);
         Ok(())
     }
@@ -1214,7 +1257,10 @@ impl SessionReader {
             self.ensure(pending, 4)?;
             if pending[0] != 0 {
                 self.skip_control(pending)?;
-                if !self.pending_clipboard.is_empty() || self.clipboard_changed {
+                if !self.pending_clipboard.is_empty()
+                    || !self.pending_filecopy.is_empty()
+                    || self.clipboard_changed
+                {
                     return Ok(Update {
                         rects: Vec::new(),
                         display: None,
@@ -1222,6 +1268,7 @@ impl SessionReader {
                         cursor_position: None,
                         clipboard: std::mem::take(&mut self.pending_clipboard),
                         clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+                        filecopy: std::mem::take(&mut self.pending_filecopy),
                     });
                 }
                 continue;
@@ -1239,6 +1286,7 @@ impl SessionReader {
                     cursor_position: None,
                     clipboard: std::mem::take(&mut self.pending_clipboard),
                     clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+                    filecopy: std::mem::take(&mut self.pending_filecopy),
                 });
             }
             let mut rects = Vec::with_capacity(nrects as usize);
@@ -1488,6 +1536,7 @@ impl SessionReader {
                 cursor_position,
                 clipboard: std::mem::take(&mut self.pending_clipboard),
                 clipboard_changed: std::mem::take(&mut self.clipboard_changed),
+                filecopy: std::mem::take(&mut self.pending_filecopy),
             });
         }
     }

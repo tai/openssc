@@ -10,5 +10,6 @@ gesture-input = { path = "../gesture-input" }
 png = "0.17"
 raw-window-handle = "0.6"
 rfb-proto = { path = "../rfb-proto" }
+sha1 = "0.10"
 winit = "0.30"
 softbuffer = "0.4"

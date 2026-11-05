@@ -1631,6 +1631,7 @@ dependencies = [
  "png",
  "raw-window-handle",
  "rfb-proto",
+ "sha1",
  "softbuffer",
  "winit",
 ]
