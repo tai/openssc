@@ -1,5 +1,28 @@
 # Protocol status / agent handoff
 
+## 2026-11-05 — **v1.4.0**: JIS keyboard (VERIFIED)
+
+- Phase / milestone: input fidelity on a Japanese keyboard.
+- Verified (owner and me, live): with a JIS/JIS pair, `a A @ ^ :` and the rest of
+  the matrix type correctly; before this, `@` produced `2` and `^` produced `6`,
+  and Shift was unreliable.
+- Root cause: the client translated a character into a **US physical key plus
+  Shift** (hardcoded table). On JIS that is the wrong key, and Shift is ignored
+  for printable keys by this server anyway, so the shift was dropped too.
+- Fix: send the **character's keysym** and let the remote layout resolve the
+  position; `A` goes as `0x41` with no Shift, `@` as `0x40`, `:` as `0x3A`.
+  Named keys keep the same shape (their named keysym). Layout is data
+  (`position -> (plain, shifted)`), selected with `--keymap us|jis` for the
+  REMOTE layout, default `us`.
+- Limitation, documented: the daemon's keysym tables have no JIS-specific
+  entries (yen, 変換/無変換, かな/英数), so those keys are logged as unsupported.
+- Changed: ss-gui key handling rewritten around a `Keymap` (tables + inverse),
+  `character_keysym`, and `wire_keysym`; Shift no longer synthesised per
+  character; JIS tables added.
+- Open: JIS-specific keys need raw keycodes or another channel; `cmd 200` status
+  frames; xattr trailer; Wayland packaging.
+- Lab state: `mm.local` healthy, no client running.
+
 ## 2026-11-05 — **v1.3.0**: pull a file/folder from the remote (VERIFIED)
 
 - Phase / milestone: file copy, reverse direction (no drag-out; explicit pull).

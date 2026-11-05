@@ -1,8 +1,17 @@
-# AGENTS.md — `ss-clone` — **v1.3.0**
+# AGENTS.md — `ss-clone` — **v1.4.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.4.0 — 2026-11-05.** Japanese JIS keyboards now type correctly. The client
+> used to translate a character into a US physical key plus Shift; on JIS that is
+> the wrong key, and this server ignores Shift for printable keys anyway, so `@`
+> arrived as `2` and `^` as `6`. The wire token is now the character's own
+> keysym and the remote layout resolves the position. Layouts are data
+> (`--keymap us|jis` for the remote layout), so adding a keyboard type is a table
+> rather than new dispatch logic. JIS-specific keys (yen, 変換, 無変換, かな)
+> have no keysym in the server's tables at all and are logged as unsupported.
 
 > **v1.3.0 — 2026-11-05.** Pulling files back from the remote. `Cmd+Shift+V` in
 > ss-gui pulls whatever the remote clipboard names into `~/Downloads`. Getting
@@ -45,11 +54,11 @@ contradicts this document, update this document in the same change.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** v1.3.0 on macOS. Live GUI, keyboard/pointer input (with
+- **Current phase:** v1.4.0 on macOS. Live GUI, keyboard/pointer input (with
   correct modifier forwarding), gesture backend, remote cursor, automatic duplex
   clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
-  pull), and MVS with **server push as the default** including the full push
-  vocabulary. Next: **Linux/Wayland packaging** — still the actual target
+  pull), JIS keyboard support with layout tables, and MVS with **server push as
+  the default** including the full push vocabulary. Next: **Linux/Wayland packaging** — still the actual target
   platform and still unwalked — then swipe semantic calibration and frame pacing.
 - **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
 
@@ -585,6 +594,23 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.4.0 — 2026-11-05
+
+JIS keyboard support, and the key-mapping model that makes layouts data.
+
+- **The wire token is the character.** The server resolves it through the remote
+  layout to a keycode and shift level, and **ignores Shift for printable keys**:
+  `A` goes as `0x41` with no modifier, `@` as `0x40`, `:` as `0x3A`. The old
+  code sent `Shift + 0x32` for `@`, which is why it typed `2`.
+- **Layouts are tables**, `position -> (plain, shifted)`, selected with
+  `--keymap us|jis` meaning the REMOTE layout. Named keys use their named keysym
+  and need no special path. The local layout never has to be named because winit
+  hands us the composed character.
+- **Not expressible**: the daemon's keysym tables contain no yen, 変換/無変換 or
+  かな/英数 keysyms, so those keys are logged as unsupported rather than guessed.
+  That is a server-side ceiling, not a table we can complete.
+- Verified on a JIS/JIS pair: `a A @ ^ :` and the wider matrix all correct.
 
 ### v1.3.0 — 2026-11-05
 

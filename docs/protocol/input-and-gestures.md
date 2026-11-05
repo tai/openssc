@@ -248,6 +248,64 @@ Note this contradicts a static reading of the daemon's `KeyMap.c` table, which
 places Meta at the Command keycode. The empirical result wins; if the mapping is
 ever revisited, re-test rather than trusting the table.
 
+## 6. Keyboard layouts — send the character, the remote picks the position
+
+VERIFIED 2026-11-05 on a JIS/JIS pair (the owner's setup). This supersedes the
+naive "translate the character to a US key + Shift" approach, which is what made
+`@` type `2` and `^` type `6`.
+
+**The wire token is the character's keysym.** The daemon/agent resolves it
+through the *remote* layout to a keycode and a shift level. Measured:
+
+| typed | keysym sent | remote produced |
+|---|---|---|
+| `a` | `0x61` | `a` |
+| `Shift+a` | `0x41` — **no Shift event** | `A` |
+| `@` (JIS position) | `0x40` | `@` |
+| `^` | `0x5E` | `^` |
+| `:` | `0x3A` | `:` |
+
+Two consequences worth remembering:
+
+1. **Shift is ignored for printable keys.** The character carries its own case,
+   so `A` goes as `0x41` with no Shift. Sending `Shift + 0x32` for `@` is what
+   produced `2` before: the shift was dropped and the keysym named the wrong
+   glyph.
+2. **The local layout never has to be named.** winit reports the composed
+   character under the local layout; that character *is* the token. A US
+   position keysym (`0x5B` for `@`) types `[` on the remote, so translating to
+   "the US key that would produce this character" is wrong.
+
+Named keys keep the same shape: their token is their named keysym (`0xFF51`
+Left, `0xFF0D` Return), and the daemon maps it. There is no separate branch.
+
+### Layouts and `--keymap`
+
+A layout is data: `position -> (plain, shifted)` characters. `--keymap us|jis`
+selects the **remote** layout (default `us`). The table is used to validate that
+the remote can type the character and to resolve the shift level; because the
+token is the character, most input works even if the table is the wrong one —
+which is why a JIS pair worked before `jis` was selectable.
+
+Adding a keyboard type is therefore a new table, not new dispatch logic.
+
+### What cannot be expressed
+
+The daemon's keysym tables carry **no JIS-specific keysyms**: no `¥`, no
+変換/無変換, no かな/英数 (verified statically in `KeyMap.c`, table at
+`0x100092110` plus the 32-entry US pass). Those keys are logged as unsupported
+rather than guessed. Supporting them needs a different mechanism (raw Apple
+keycodes), not a better table.
+
+### Modifier keys
+
+Control, Option and Command are sent as discrete key events and re-synced per key
+so a missed event cannot leave one stuck. **Option is `0xFFE7` (Meta_L) on this
+server** — `0xFFE9` (Alt_L) is accepted as a key but never raises the Option
+flag, which silently turned `Option+Cmd+C` into `Cmd+C`. Shift is not forwarded
+for printable keys (the character carries case) and is synthesised only where an
+unshifted key needs it.
+
 ## 5. Calibration notes / open questions
 
 ### 5.1 Two-finger scroll — VERIFIED (2026-11-03, `mm.local` TextEdit)

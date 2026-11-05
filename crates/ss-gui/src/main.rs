@@ -49,43 +49,272 @@ const PULL_FETCHES: u8 = 3;
 const PULL_RETRY: Duration = Duration::from_millis(180);
 const PULL_WINDOW: Duration = Duration::from_millis(700);
 
-fn keysym_for(c: char) -> Option<(u32, bool)> {
-    // Returns (keysym, needs_shift). Non-ASCII uses the X11 Unicode keysym
-    // convention (0x01000000 | codepoint).
-    if !c.is_ascii() {
-        return Some((0x0100_0000 | c as u32, false));
+/// One physical position in a layout: the character it produces plain and
+/// with Shift. macOS key codes are positions, so this table is the layout.
+type Row = (KeyCode, char, char);
+
+struct Keymap {
+    name: &'static str,
+    rows: &'static [Row],
+    /// Positions whose keysym is not a character (keypad, JIS input keys).
+    special: &'static [(KeyCode, u32)],
+}
+
+/// macOS US layout, by key code.
+static US_ROWS: &[Row] = &[
+    (KeyCode::KeyA, 'a', 'A'),
+    (KeyCode::KeyS, 's', 'S'),
+    (KeyCode::KeyD, 'd', 'D'),
+    (KeyCode::KeyF, 'f', 'F'),
+    (KeyCode::KeyH, 'h', 'H'),
+    (KeyCode::KeyG, 'g', 'G'),
+    (KeyCode::KeyZ, 'z', 'Z'),
+    (KeyCode::KeyX, 'x', 'X'),
+    (KeyCode::KeyC, 'c', 'C'),
+    (KeyCode::KeyV, 'v', 'V'),
+    (KeyCode::KeyB, 'b', 'B'),
+    (KeyCode::KeyQ, 'q', 'Q'),
+    (KeyCode::KeyW, 'w', 'W'),
+    (KeyCode::KeyE, 'e', 'E'),
+    (KeyCode::KeyR, 'r', 'R'),
+    (KeyCode::KeyY, 'y', 'Y'),
+    (KeyCode::KeyT, 't', 'T'),
+    (KeyCode::KeyO, 'o', 'O'),
+    (KeyCode::KeyU, 'u', 'U'),
+    (KeyCode::KeyI, 'i', 'I'),
+    (KeyCode::KeyP, 'p', 'P'),
+    (KeyCode::KeyL, 'l', 'L'),
+    (KeyCode::KeyJ, 'j', 'J'),
+    (KeyCode::KeyK, 'k', 'K'),
+    (KeyCode::KeyN, 'n', 'N'),
+    (KeyCode::KeyM, 'm', 'M'),
+    (KeyCode::Digit1, '1', '!'),
+    (KeyCode::Digit2, '2', '@'),
+    (KeyCode::Digit3, '3', '#'),
+    (KeyCode::Digit4, '4', '$'),
+    (KeyCode::Digit5, '5', '%'),
+    (KeyCode::Digit6, '6', '^'),
+    (KeyCode::Digit7, '7', '&'),
+    (KeyCode::Digit8, '8', '*'),
+    (KeyCode::Digit9, '9', '('),
+    (KeyCode::Digit0, '0', ')'),
+    (KeyCode::Minus, '-', '_'),
+    (KeyCode::Equal, '=', '+'),
+    (KeyCode::BracketLeft, '[', '{'),
+    (KeyCode::BracketRight, ']', '}'),
+    (KeyCode::Backslash, '\\', '|'),
+    (KeyCode::Semicolon, ';', ':'),
+    (KeyCode::Quote, '\'', '"'),
+    (KeyCode::Comma, ',', '<'),
+    (KeyCode::Period, '.', '>'),
+    (KeyCode::Slash, '/', '?'),
+    (KeyCode::Backquote, '`', '~'),
+    (KeyCode::IntlBackslash, '\\', '|'),
+    (KeyCode::IntlRo, '\\', '_'),
+];
+
+/// Apple Japanese (JIS) layout, measured key by key against the lab server's
+/// own keyboard: `@` at BracketLeft, `^` at Equal, `:` at Quote, `[` at
+/// BracketRight, `]` at Backslash, `\` at IntlYen.
+static JIS_ROWS: &[Row] = &[
+    (KeyCode::KeyA, 'a', 'A'),
+    (KeyCode::KeyS, 's', 'S'),
+    (KeyCode::KeyD, 'd', 'D'),
+    (KeyCode::KeyF, 'f', 'F'),
+    (KeyCode::KeyH, 'h', 'H'),
+    (KeyCode::KeyG, 'g', 'G'),
+    (KeyCode::KeyZ, 'z', 'Z'),
+    (KeyCode::KeyX, 'x', 'X'),
+    (KeyCode::KeyC, 'c', 'C'),
+    (KeyCode::KeyV, 'v', 'V'),
+    (KeyCode::KeyB, 'b', 'B'),
+    (KeyCode::KeyQ, 'q', 'Q'),
+    (KeyCode::KeyW, 'w', 'W'),
+    (KeyCode::KeyE, 'e', 'E'),
+    (KeyCode::KeyR, 'r', 'R'),
+    (KeyCode::KeyY, 'y', 'Y'),
+    (KeyCode::KeyT, 't', 'T'),
+    (KeyCode::KeyO, 'o', 'O'),
+    (KeyCode::KeyU, 'u', 'U'),
+    (KeyCode::KeyI, 'i', 'I'),
+    (KeyCode::KeyP, 'p', 'P'),
+    (KeyCode::KeyL, 'l', 'L'),
+    (KeyCode::KeyJ, 'j', 'J'),
+    (KeyCode::KeyK, 'k', 'K'),
+    (KeyCode::KeyN, 'n', 'N'),
+    (KeyCode::KeyM, 'm', 'M'),
+    (KeyCode::Digit1, '1', '!'),
+    (KeyCode::Digit2, '2', '"'),
+    (KeyCode::Digit3, '3', '#'),
+    (KeyCode::Digit4, '4', '$'),
+    (KeyCode::Digit5, '5', '%'),
+    (KeyCode::Digit6, '6', '&'),
+    (KeyCode::Digit7, '7', '\''),
+    (KeyCode::Digit8, '8', '('),
+    (KeyCode::Digit9, '9', ')'),
+    (KeyCode::Digit0, '0', '0'),
+    (KeyCode::Minus, '-', '='),
+    (KeyCode::Equal, '^', '~'),
+    (KeyCode::BracketLeft, '@', '`'),
+    (KeyCode::BracketRight, '[', '{'),
+    (KeyCode::Backslash, ']', '}'),
+    (KeyCode::Semicolon, ';', '+'),
+    (KeyCode::Quote, ':', '*'),
+    (KeyCode::Comma, ',', '<'),
+    (KeyCode::Period, '.', '>'),
+    (KeyCode::Slash, '/', '?'),
+    (KeyCode::Backquote, '`', '~'),
+    (KeyCode::IntlYen, '\\', '|'),
+    (KeyCode::IntlRo, '_', '_'),
+];
+
+/// Keypad keys. Their keysyms are in the daemon's Pass A table
+/// (0xFFB0..0xFFB9 -> 0x52..0x5C, 0xFFBD -> 0x51).
+///
+/// TODO(JIS): the daemon has no keysym for the JIS input keys (yen, henkan,
+/// muhenkan, kana, eisu); pB's J.1/J.3 show Pass A and Pass B carry none of
+/// them, so they are logged as unsupported instead of guessed at.
+static SPECIAL_KEYS: &[(KeyCode, u32)] = &[
+    (KeyCode::Numpad0, 0xffb0),
+    (KeyCode::Numpad1, 0xffb1),
+    (KeyCode::Numpad2, 0xffb2),
+    (KeyCode::Numpad3, 0xffb3),
+    (KeyCode::Numpad4, 0xffb4),
+    (KeyCode::Numpad5, 0xffb5),
+    (KeyCode::Numpad6, 0xffb6),
+    (KeyCode::Numpad7, 0xffb7),
+    (KeyCode::Numpad8, 0xffb8),
+    (KeyCode::Numpad9, 0xffb9),
+    (KeyCode::NumpadEnter, 0xff8d),
+    (KeyCode::NumpadAdd, 0xffab),
+    (KeyCode::NumpadSubtract, 0xffad),
+    (KeyCode::NumpadMultiply, 0xffaa),
+    (KeyCode::NumpadDivide, 0xffaf),
+    (KeyCode::NumpadDecimal, 0xffae),
+    (KeyCode::NumpadEqual, 0xffbd),
+    (KeyCode::NumpadComma, 0xffac),
+];
+
+static US: Keymap = Keymap {
+    name: "us",
+    rows: US_ROWS,
+    special: SPECIAL_KEYS,
+};
+static JIS: Keymap = Keymap {
+    name: "jis",
+    rows: JIS_ROWS,
+    special: SPECIAL_KEYS,
+};
+
+impl Keymap {
+    fn by_name(name: &str) -> Option<&'static Keymap> {
+        match name {
+            "us" => Some(&US),
+            "jis" => Some(&JIS),
+            _ => None,
+        }
     }
-    if c.is_ascii_lowercase() || c.is_ascii_digit() {
-        return Some((c as u32, false));
+
+    fn row(&self, code: KeyCode) -> Option<(char, char)> {
+        self.rows
+            .iter()
+            .find(|(c, _, _)| *c == code)
+            .map(|(_, plain, shifted)| (*plain, *shifted))
     }
-    if c.is_ascii_uppercase() {
-        return Some(((c.to_ascii_lowercase()) as u32, true));
+
+    fn special(&self, code: KeyCode) -> Option<u32> {
+        self.special
+            .iter()
+            .find(|(c, _)| *c == code)
+            .map(|(_, ks)| *ks)
     }
-    let shifted = match c {
-        '!' => ('1', true),
-        '@' => ('2', true),
-        '#' => ('3', true),
-        '$' => ('4', true),
-        '%' => ('5', true),
-        '^' => ('6', true),
-        '&' => ('7', true),
-        '*' => ('8', true),
-        '(' => ('9', true),
-        ')' => ('0', true),
-        '_' => ('-', true),
-        '+' => ('=', true),
-        '{' => ('[', true),
-        '}' => (']', true),
-        '|' => ('\\', true),
-        ':' => (';', true),
-        '"' => ('\'', true),
-        '<' => (',', true),
-        '>' => ('.', true),
-        '?' => ('/', true),
-        '~' => ('`', true),
-        _ => (c, false),
-    };
-    Some((shifted.0 as u32, shifted.1))
+
+    /// The inverse table: which position (and shift level) types `c`.
+    fn char_position(&self, c: char) -> Option<(KeyCode, bool)> {
+        for (code, plain, shifted) in self.rows {
+            if *plain == c {
+                return Some((*code, false));
+            }
+            if *shifted == c {
+                return Some((*code, true));
+            }
+        }
+        None
+    }
+
+    /// The keysym to put on the wire for a position at a shift level.
+    ///
+    /// Measured on the lab build (probe: 0x5B typed `[`, 0x40 typed `@`,
+    /// Shift + 0x32 typed `2`): the daemon resolves a keysym through the
+    /// REMOTE layout and ignores the Shift modifier for printable keys, so the
+    /// wire form is this layout's character for the position at that shift
+    /// level. A US-position keysym would type the wrong key (0x5B lands on the
+    /// remote's `[` key, not its `@` key).
+    fn wire_keysym(&self, code: KeyCode, shift: bool) -> Option<u32> {
+        if let Some(ks) = self.special(code) {
+            return Some(ks);
+        }
+        let (plain, shifted) = self.row(code)?;
+        let c = if shift { shifted } else { plain };
+        Some(c as u32)
+    }
+}
+
+/// JIS input keys the daemon cannot express: pB's J.1/J.3 show no keysym for
+/// them in Pass A or Pass B, so they are logged rather than guessed at.
+fn is_unsupported_jis_code(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Lang1
+            | KeyCode::Lang2
+            | KeyCode::Lang3
+            | KeyCode::Lang4
+            | KeyCode::Lang5
+            | KeyCode::Convert
+            | KeyCode::NonConvert
+            | KeyCode::KanaMode
+    )
+}
+
+/// Resolve a typed character to a keysym on the TARGET (remote) layout.
+///
+/// The character comes from the event, already composed under the *local*
+/// layout, so the local layout never needs to be named. `--keymap` therefore
+/// means one thing: which layout the remote runs.
+///
+/// Order: the target's position for that character; then the physical
+/// position (only when the target can type something there); then `None` so
+/// the caller can log and fall back to a Unicode keysym.
+fn character_keysym(
+    map: &Keymap,
+    code: Option<KeyCode>,
+    c: char,
+    shift: bool,
+) -> Option<u32> {
+    if let Some(code) = code {
+        if let Some(special) = map.special(code) {
+            return Some(special);
+        }
+    }
+    if let Some((position, shifted)) = map.char_position(c) {
+        return map.wire_keysym(position, shifted);
+    }
+    if let Some(code) = code {
+        if map.row(code).is_some() {
+            return map.wire_keysym(code, shift);
+        }
+    }
+    None
+}
+
+/// A keysym for composed text (the `--ime` path only). Non-ASCII uses the X11
+/// Unicode convention; this is the one place a bare character keysym is sent.
+fn text_keysym(c: char) -> u32 {
+    if c.is_ascii() {
+        c as u32
+    } else {
+        0x0100_0000 | c as u32
+    }
 }
 
 fn named_keysym(key: &NamedKey) -> Option<u32> {
@@ -458,6 +687,8 @@ struct App {
     /// Last absolute path the remote clipboard carried, used only when a pull
     /// gets no archive at all.
     remote_path: Arc<std::sync::Mutex<Option<String>>>,
+    /// The remote's layout table: which key sits where on the far end.
+    keymap: &'static Keymap,
     /// `--demo-cursor`: scripted remote pointer tour to exercise cursor shapes.
     demo_cursor: bool,
     demo_step: usize,
@@ -522,6 +753,7 @@ impl App {
         file_dest: String,
         pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
+        keymap: &'static Keymap,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -550,6 +782,7 @@ impl App {
             file_dest,
             pull_pending,
             remote_path,
+            keymap,
             demo_cursor,
             demo_step: 0,
             demo_next: Some(Instant::now() + Duration::from_millis(600)),
@@ -592,17 +825,20 @@ impl App {
         }
     }
 
-    /// Make the remote's modifier state match `target` (Shift excluded).
+    /// Make the remote's modifier state match `target`.
     ///
-    /// Downs go out in a fixed order, ups in reverse, and the tracked state is
-    /// only advanced for what was actually sent, so a missed or reordered
-    /// `ModifiersChanged` can never leave a modifier stuck down.
+    /// Shift is a real modifier now that keys are physical: the remote layout
+    /// decides the shifted symbol. Downs go out in a fixed order, ups in
+    /// reverse, and the tracked state is only advanced for what was actually
+    /// sent, so a missed or reordered `ModifiersChanged` can never leave a
+    /// modifier stuck down.
     fn sync_modifiers(&mut self, target: ModifiersState) {
         // Option is Meta_L (0xFFE7) on this server: Alt_L (0xFFE9) is accepted
         // as a key but never raises the Option flag, which silently turned
         // Option+Cmd+C into a plain Cmd+C.
         let bits = [
-            (ModifiersState::CONTROL, 0xffe3u32),
+            (ModifiersState::SHIFT, 0xffe1u32),
+            (ModifiersState::CONTROL, 0xffe3),
             (ModifiersState::ALT, 0xffe7),
             (ModifiersState::SUPER, 0xffeb),
         ];
@@ -1350,10 +1586,9 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("IME commit {text:?}");
                 }
                 for c in text.chars() {
-                    if let Some((ks, _)) = keysym_for(c) {
-                        self.send(key_event(ks, true));
-                        self.send(key_event(ks, false));
-                    }
+                    let ks = text_keysym(c);
+                    self.send(key_event(ks, true));
+                    self.send(key_event(ks, false));
                 }
             }
             WindowEvent::Ime(Ime::Preedit(text, _)) => {
@@ -1586,7 +1821,10 @@ impl ApplicationHandler<UserEvent> for App {
                 let needed = self.modifiers;
                 let synthesized = if pressed {
                     needed
-                        & (ModifiersState::CONTROL | ModifiersState::ALT | ModifiersState::SUPER)
+                        & (ModifiersState::SHIFT
+                            | ModifiersState::CONTROL
+                            | ModifiersState::ALT
+                            | ModifiersState::SUPER)
                         & !self.forwarded_mods
                 } else {
                     ModifiersState::empty()
@@ -1594,26 +1832,93 @@ impl ApplicationHandler<UserEvent> for App {
                 if !synthesized.is_empty() {
                     self.sync_modifiers(needed);
                 }
+                // Send the CHARACTER's keysym, not a US physical position:
+                // the server's keysym table is built from the *remote* layout
+                // (a JIS remote maps '\' to its Yen key and '[' to its own
+                // bracket key), so a US-position keysym lands on the wrong key.
+                // The server derives the keycode and Shift from the keysym,
+                // which is why Shift+2 must arrive as '"' and '@' as '@'.
+                let code = match event.physical_key {
+                    PhysicalKey::Code(code) => Some(code),
+                    PhysicalKey::Unidentified(_) => None,
+                };
                 match &event.logical_key {
+                    // Modifier keys are owned by `sync_modifiers`; winit also
+                    // reports them as key events, which would double them.
+                    Key::Named(
+                        NamedKey::Shift
+                        | NamedKey::Control
+                        | NamedKey::Alt
+                        | NamedKey::Super
+                        | NamedKey::Meta,
+                    ) => {}
                     Key::Named(named) => {
-                        if let Some(ks) = named_keysym(named) {
+                        if let Some(ks) = named_keysym(named)
+                            .or_else(|| code.and_then(|code| self.keymap.special(code)))
+                        {
                             self.send(key_event(ks, pressed));
+                        } else if pressed && !event.repeat {
+                            eprintln!(
+                                "key: unmapped named {named:?} (physical {:?})",
+                                event.physical_key
+                            );
                         }
                     }
                     Key::Character(s) => {
                         for c in s.chars() {
-                            if let Some((ks, shifted)) = keysym_for(c) {
-                                if shifted && pressed {
-                                    self.send(key_event(0xffe1, true));
-                                }
-                                self.send(key_event(ks, pressed));
-                                if shifted && !pressed {
-                                    self.send(key_event(0xffe1, false));
+                            // TODO(JIS): the daemon has no keysym for the JIS
+                            // input keys; they need a keycode-space bypass,
+                            // not a guessed keysym.
+                            if let Some(code) = code {
+                                if is_unsupported_jis_code(code) {
+                                    if pressed && !event.repeat {
+                                        eprintln!(
+                                            "key: JIS input key {code:?} has no keysym in the daemon's table; not sent"
+                                        );
+                                    }
+                                    continue;
                                 }
                             }
+                            // Character first: winit already composed `c`
+                            // under the local layout, so ask the target layout
+                            // which position and shift level type it. The
+                            // server turns that into an ordinary keypress, so
+                            // remote IME composition is untouched. A bare
+                            // character keysym is only a logged last resort.
+                            let ks = character_keysym(
+                                self.keymap,
+                                code,
+                                c,
+                                self.modifiers.shift_key(),
+                            );
+                            let ks = ks.unwrap_or_else(|| {
+                                if pressed && !event.repeat {
+                                    eprintln!(
+                                        "key: no {} position for {c:?}; sending the Unicode keysym",
+                                        self.keymap.name
+                                    );
+                                }
+                                text_keysym(c)
+                            });
+                            self.send(key_event(ks, pressed));
                         }
                     }
-                    _ => {}
+                    // Dead keys and unidentified keys have no character; send
+                    // the physical position so the remote can compose.
+                    _ => match code.and_then(|code| {
+                        self.keymap
+                            .wire_keysym(code, self.modifiers.shift_key())
+                    }) {
+                        Some(ks) => self.send(key_event(ks, pressed)),
+                        None => {
+                            if pressed && !event.repeat {
+                                eprintln!(
+                                    "key: unmapped physical {:?} (logical {:?})",
+                                    event.physical_key, event.logical_key
+                                );
+                            }
+                        }
+                    },
                 }
                 if !synthesized.is_empty() {
                     self.sync_modifiers(needed - synthesized);
@@ -1802,6 +2107,9 @@ fn main() -> Result<()> {
     // `--pull <path>`: pull an absolute remote path without touching the
     // remote clipboard. Works even when the clipboard carries no path at all.
     let mut pull_paths: Vec<String> = Vec::new();
+    // The remote's layout table (`us`, `jis`); the local layout is whatever
+    // the OS composes, so it never needs naming.
+    let mut keymap_name: Option<String> = None;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
@@ -1880,6 +2188,10 @@ fn main() -> Result<()> {
                 ime = true;
                 i += 1;
             }
+            "--keymap" if i + 1 < args.len() => {
+                keymap_name = Some(args[i + 1].to_ascii_lowercase());
+                i += 2;
+            }
             "--pull" if i + 1 < args.len() => {
                 pull_paths.push(args[i + 1].clone());
                 i += 2;
@@ -1942,6 +2254,18 @@ fn main() -> Result<()> {
     } else {
         bands
     };
+
+    let keymap = match keymap_name.as_deref() {
+        None => &US,
+        Some(name) => match Keymap::by_name(name) {
+            Some(map) => map,
+            None => {
+                eprintln!("unknown --keymap {name:?}; expected us or jis");
+                std::process::exit(2);
+            }
+        },
+    };
+    eprintln!("keymap: {} (remote layout)", keymap.name);
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
@@ -2496,7 +2820,75 @@ fn main() -> Result<()> {
         file_dest.clone(),
         pull_pending.clone(),
         remote_path.clone(),
+        keymap,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn us_table_positions_and_inverse() {
+        assert_eq!(US.wire_keysym(KeyCode::KeyA, false), Some(0x61));
+        assert_eq!(US.wire_keysym(KeyCode::KeyA, true), Some(0x41));
+        assert_eq!(US.wire_keysym(KeyCode::Digit2, false), Some(0x32));
+        assert_eq!(US.wire_keysym(KeyCode::Digit2, true), Some(0x40));
+        assert_eq!(US.wire_keysym(KeyCode::BracketRight, false), Some(0x5d));
+        assert_eq!(US.char_position('@'), Some((KeyCode::Digit2, true)));
+        assert_eq!(US.char_position(']'), Some((KeyCode::BracketRight, false)));
+        assert_eq!(US.char_position('€'), None);
+    }
+
+    #[test]
+    fn jis_table_matches_the_measured_layout() {
+        // Measured on the lab server: @ at BracketLeft, ^ at Equal, : at
+        // Quote, [ at BracketRight, ] at Backslash.
+        assert_eq!(JIS.wire_keysym(KeyCode::BracketLeft, false), Some(0x40));
+        assert_eq!(JIS.wire_keysym(KeyCode::BracketLeft, true), Some(0x60));
+        assert_eq!(JIS.wire_keysym(KeyCode::Equal, false), Some(0x5e));
+        assert_eq!(JIS.wire_keysym(KeyCode::Equal, true), Some(0x7e));
+        assert_eq!(JIS.wire_keysym(KeyCode::Quote, false), Some(0x3a));
+        assert_eq!(JIS.wire_keysym(KeyCode::Quote, true), Some(0x2a));
+        assert_eq!(JIS.wire_keysym(KeyCode::BracketRight, false), Some(0x5b));
+        assert_eq!(JIS.wire_keysym(KeyCode::Backslash, false), Some(0x5d));
+        assert_eq!(JIS.wire_keysym(KeyCode::Digit2, true), Some(0x22));
+        assert_eq!(JIS.wire_keysym(KeyCode::Minus, true), Some(0x3d));
+        assert_eq!(JIS.wire_keysym(KeyCode::Semicolon, true), Some(0x2b));
+        // The inverse table is what a translate mode would use.
+        assert_eq!(JIS.char_position('@'), Some((KeyCode::BracketLeft, false)));
+        assert_eq!(JIS.char_position('~'), Some((KeyCode::Equal, true)));
+        assert_eq!(JIS.char_position('"'), Some((KeyCode::Digit2, true)));
+    }
+
+    #[test]
+    fn keypad_and_jis_input_keys() {
+        // Keypad keys are positions, not digit characters.
+        assert_eq!(US.special(KeyCode::Numpad0), Some(0xffb0));
+        assert_eq!(US.special(KeyCode::NumpadEnter), Some(0xff8d));
+        // The JIS input keys have no keysym in the daemon's tables, so they
+        // must not be given one here; they are logged as unsupported.
+        for code in [
+            KeyCode::Lang1,
+            KeyCode::Lang2,
+            KeyCode::Convert,
+            KeyCode::NonConvert,
+            KeyCode::KanaMode,
+        ] {
+            assert_eq!(JIS.special(code), None);
+            assert!(is_unsupported_jis_code(code));
+        }
+        // The Yen key is a character position, not a special keysym.
+        assert_eq!(JIS.row(KeyCode::IntlYen), Some(('\\', '|')));
+    }
+
+    #[test]
+    fn named_and_ime_keysyms_unchanged() {
+        assert_eq!(named_keysym(&NamedKey::Enter), Some(0xff0d));
+        assert_eq!(named_keysym(&NamedKey::ArrowLeft), Some(0xff51));
+        assert_eq!(text_keysym('@'), 0x40);
+        assert_eq!(text_keysym('あ'), 0x0100_3042);
+    }
 }
