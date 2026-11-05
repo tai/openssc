@@ -750,6 +750,238 @@ fn write_png(path: &str, width: u16, height: u16, bgrx: &[u32]) -> Result<()> {
     Ok(())
 }
 
+/// One dirty region of a decoded frame: geometry plus the pixels of that
+/// region only, so the reader never copies the whole framebuffer.
+type FrameRect = (u16, u16, u16, u16, Vec<u32>);
+/// A decoded frame: geometry, the dirty regions since the last publish, and
+/// whether it covered the whole framebuffer.
+type Frame = (u16, u16, Vec<FrameRect>, bool);
+
+/// Decodes framebuffer rects and hands the UI the changed region.
+///
+/// Owned by the session reader thread. Decoding is the expensive part of a
+/// frame (an MVS rect can be 12,000 DCT blocks) and must never run on the UI
+/// thread, where it starved the event loop and froze the window.
+///
+/// The decoder keeps the authoritative framebuffer, so partial (incremental)
+/// rects accumulate correctly. Each publish copies the union of everything
+/// that changed since the UI last took a frame, which means a slow UI skips
+/// intermediate publishes without losing content.
+struct Decoder {
+    fb: Vec<u32>,
+    w: u16,
+    h: u16,
+    mvs: Option<MvsDecoder>,
+    /// BGRX canvas the MVS decoder paints into.
+    mvs_bytes: Vec<u8>,
+    /// Union of the rects decoded since the last publish.
+    dirty: Option<(u16, u16, u16, u16)>,
+    full: bool,
+    debug: bool,
+}
+
+impl Decoder {
+    fn new(w: u16, h: u16, mvs: bool, debug: bool) -> Self {
+        Self {
+            fb: vec![0u32; w as usize * h as usize],
+            w,
+            h,
+            mvs: mvs.then(|| MvsDecoder::new(w, h)),
+            mvs_bytes: Vec::new(),
+            dirty: None,
+            full: false,
+            debug,
+        }
+    }
+
+    fn resize(&mut self, w: u16, h: u16) {
+        self.w = w;
+        self.h = h;
+        self.fb = vec![0u32; w as usize * h as usize];
+        self.mvs_bytes.clear();
+        self.dirty = None;
+        if let Some(dec) = self.mvs.as_mut() {
+            dec.resize(w, h);
+        }
+    }
+
+    fn mark(&mut self, x: u16, y: u16, w: u16, h: u16) {
+        self.dirty = Some(match self.dirty {
+            None => (x, y, w, h),
+            Some((x0, y0, w0, h0)) => {
+                let nx = x0.min(x);
+                let ny = y0.min(y);
+                let nx1 = (x0 + w0).max(x + w);
+                let ny1 = (y0 + h0).max(y + h);
+                (nx, ny, nx1 - nx, ny1 - ny)
+            }
+        });
+        if w == self.w && h == self.h && x == 0 && y == 0 {
+            self.full = true;
+        }
+    }
+
+    fn apply(&mut self, r: &rfb_proto::RectUpdate) {
+        if r.encoding == 0x3f3 {
+            self.apply_mvs(r);
+        } else {
+            self.apply_raw(r);
+        }
+    }
+
+    fn apply_raw(&mut self, r: &rfb_proto::RectUpdate) {
+        if r.pixels.is_empty() || r.w == 0 || r.h == 0 {
+            return;
+        }
+        if r.x == 0
+            && r.y == 0
+            && (r.w > self.w || r.h > self.h)
+            && r.pixels.len() == r.w as usize * r.h as usize * 4
+        {
+            self.resize(r.w, r.h);
+        }
+        let dst_w = self.w as usize;
+        let src_row = r.w as usize * 4;
+        let x = r.x as usize;
+        let y = r.y as usize;
+        for row in 0..r.h as usize {
+            let dy = y + row;
+            if dy >= self.h as usize || x + r.w as usize > dst_w {
+                continue;
+            }
+            let src = row * src_row;
+            if src + src_row > r.pixels.len() {
+                break;
+            }
+            let dst = dy * dst_w + x;
+            let out = &mut self.fb[dst..dst + r.w as usize];
+            for (px, chunk) in out
+                .iter_mut()
+                .zip(r.pixels[src..src + src_row].chunks_exact(4))
+            {
+                *px = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
+            }
+        }
+        self.mark(r.x, r.y, r.w, r.h);
+    }
+
+    fn apply_mvs(&mut self, r: &rfb_proto::RectUpdate) {
+        if self.mvs.is_none() {
+            return;
+        }
+        if r.x == 0 && r.y == 0 && (r.w > self.w || r.h > self.h) {
+            self.resize(r.w, r.h);
+        }
+        let need = self.w as usize * self.h as usize * 4;
+        if self.mvs_bytes.len() != need {
+            self.mvs_bytes = vec![0u8; need];
+        }
+        let rect = Rect::new(r.x, r.y, r.w, r.h);
+        let debug = self.debug;
+        let body_type = r.pixels.first().copied().unwrap_or(255);
+        let applied = {
+            let Self { mvs, mvs_bytes, .. } = self;
+            let Some(dec) = mvs.as_mut() else { return };
+            grab::note(&format!("mvs apply {}x{}+{}+{}", r.w, r.h, r.x, r.y));
+            match dec.apply(&r.pixels, rect, mvs_bytes) {
+                Ok(Some(stats)) => {
+                    if debug {
+                        if body_type == 1 {
+                            eprintln!(
+                                "[{:6} ms] t1 {}x{}+{}+{} applied: {} tiles, {} refined",
+                                now_ms(),
+                                r.w,
+                                r.h,
+                                r.x,
+                                r.y,
+                                stats.tiles,
+                                stats.dct_blocks
+                            );
+                        } else {
+                            eprintln!(
+                                "[{:6} ms] t0 {}x{}+{}+{} applied: {} tiles, {} dct",
+                                now_ms(),
+                                r.w,
+                                r.h,
+                                r.x,
+                                r.y,
+                                stats.tiles,
+                                stats.dct_blocks
+                            );
+                        }
+                    }
+                    true
+                }
+                Ok(None) => false,
+                Err(e) => {
+                    eprintln!("mvs decode {}x{}+{}+{}: {e:#}", r.w, r.h, r.x, r.y);
+                    false
+                }
+            }
+        };
+        if !applied {
+            return;
+        }
+        // Expand just this rect from the BGRX canvas into the framebuffer.
+        let w = self.w as usize;
+        let rw = r.w as usize;
+        for row in r.y as usize..(r.y as usize + r.h as usize).min(self.h as usize) {
+            let start = (row * w + r.x as usize) * 4;
+            let end = start + rw * 4;
+            if end > self.mvs_bytes.len() {
+                break;
+            }
+            let dst = row * w + r.x as usize;
+            let out = &mut self.fb[dst..dst + rw];
+            for (px, chunk) in out
+                .iter_mut()
+                .zip(self.mvs_bytes[start..end].chunks_exact(4))
+            {
+                *px = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
+            }
+        }
+        self.mark(r.x, r.y, r.w, r.h);
+    }
+}
+
+/// Hand the changed region to the UI. The region is the union of everything
+/// changed since the UI last took a frame, so replacing an unconsumed frame
+/// never loses content: the next publish covers both.
+fn publish_frame(dec: &mut Decoder, slot: &std::sync::Mutex<Option<Frame>>) {
+    let Some(mut region) = dec.dirty.take() else {
+        return;
+    };
+    let full = std::mem::take(&mut dec.full);
+    let w = dec.w as usize;
+    let h = dec.h as usize;
+    if let Ok(mut slot) = slot.lock() {
+        // Fold in a frame the UI has not taken yet.
+        if let Some((_, _, old, old_full)) = slot.as_ref() {
+            if let Some((x, y, ow, oh)) = old.first().map(|(x, y, w, h, _)| (*x, *y, *w, *h)) {
+                let (x0, y0, x1, y1) = (
+                    region.0.min(x),
+                    region.1.min(y),
+                    (region.0 + region.2).max(x + ow),
+                    (region.1 + region.3).max(y + oh),
+                );
+                region = (x0, y0, x1 - x0, y1 - y0);
+            }
+            let _ = old_full;
+        }
+        let (x, y, rw, rh) = region;
+        let (x, y, rw, rh) = (x as usize, y as usize, rw as usize, rh as usize);
+        if x + rw > w || y + rh > h {
+            return;
+        }
+        let mut pixels = Vec::with_capacity(rw * rh);
+        for row in y..y + rh {
+            let start = row * w + x;
+            pixels.extend_from_slice(&dec.fb[start..start + rw]);
+        }
+        *slot = Some((dec.w, dec.h, vec![(x as u16, y as u16, rw as u16, rh as u16, pixels)], full));
+    }
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -846,7 +1078,12 @@ struct App {
     context: softbuffer::Context<DisplayHandle<'static>>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>>,
+    /// The presented framebuffer. The reader sends dirty regions; the UI only
+    /// blits them and presents.
     fb: Vec<u32>,
+    /// One-slot handoff: the reader replaces the frame; a newer frame always
+    /// wins and a stale one is dropped, never queued.
+    frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
     fb_w: u16,
     fb_h: u16,
     /// Input coordinates stay in the server's original (backing) space even
@@ -933,6 +1170,10 @@ struct App {
     scroll_gesture_start: Option<Instant>,
     /// `--scroll-test stop`: when to send the touch that stops the glide.
     scroll_stop_at: Option<Instant>,
+    /// `--scroll-test stress`: remaining scripted flicks and when the next
+    /// one starts.
+    scroll_stress: u32,
+    scroll_stress_next: Option<Instant>,
     /// `--scroll-test`: scripted gesture to exercise the scroll model.
     scroll_test: String,
     /// Open pinch/rotate gesture and when it last saw input.
@@ -945,10 +1186,6 @@ struct App {
     /// `--debug-input` samples of input event -> first painted rectangle.
     lat: Vec<f64>,
     lat_next_report: u32,
-    /// MultiVariant (0x3f3) decoder; `Some` when `--mvs` advertised it.
-    mvs: Option<MvsDecoder>,
-    /// BGRX canvas the MVS decoder paints into before we convert to words.
-    mvs_bytes: Vec<u8>,
 }
 
 impl App {
@@ -967,7 +1204,6 @@ impl App {
         debug_input: bool,
         ime: bool,
         deadline: Option<Instant>,
-        mvs: bool,
         demo_cursor: bool,
         file_dest: String,
         pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
@@ -975,6 +1211,7 @@ impl App {
         keymap: &'static Keymap,
         grab: Option<GrabHandle>,
         scroll_test: String,
+        frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -988,6 +1225,7 @@ impl App {
             window: None,
             surface: None,
             fb: vec![0u32; fb_w as usize * fb_h as usize],
+            frame_slot,
             fb_w,
             fb_h,
             input_w,
@@ -1040,6 +1278,8 @@ impl App {
             scroll_sample_at: Instant::now(),
             scroll_gesture_start: None,
             scroll_stop_at: None,
+            scroll_stress: 0,
+            scroll_stress_next: None,
             pinch_active: false,
             pinch_last: None,
             rotate_active: false,
@@ -1048,8 +1288,6 @@ impl App {
             pinch_y: 0,
             lat: Vec::new(),
             lat_next_report: 50,
-            mvs: mvs.then(|| MvsDecoder::new(fb_w, fb_h)),
-            mvs_bytes: Vec::new(),
         })
     }
 
@@ -1553,99 +1791,6 @@ impl App {
     }
 
     /// Decode an MVS (0x3f3) rectangle into `self.fb`.
-    fn apply_mvs(&mut self, r: &rfb_proto::RectUpdate) {
-        if self.mvs.is_none() {
-            return;
-        }
-        // Grow if the server ignored our scale request (full-size rect).
-        if r.x == 0 && r.y == 0 && (r.w > self.fb_w || r.h > self.fb_h) {
-            self.fb_w = r.w;
-            self.fb_h = r.h;
-            self.fb = vec![0u32; r.w as usize * r.h as usize];
-            self.mvs_bytes.clear();
-            if let Some(dec) = self.mvs.as_mut() {
-                // Keep the quantisation tables learned from type-2 bodies.
-                dec.resize(r.w, r.h);
-            }
-        }
-        let need = self.fb_w as usize * self.fb_h as usize * 4;
-        if self.mvs_bytes.len() != need {
-            self.mvs_bytes = vec![0u8; need];
-        }
-        let rect = Rect::new(r.x, r.y, r.w, r.h);
-        let debug = self.debug_input;
-        let body_type = r.pixels.first().copied().unwrap_or(255);
-        let applied = {
-            // Disjoint field borrows: the decoder paints into mvs_bytes.
-            let Self { mvs, mvs_bytes, .. } = self;
-            let Some(dec) = mvs.as_mut() else { return };
-            match dec.apply(&r.pixels, rect, mvs_bytes) {
-                Ok(Some(stats)) => {
-                    if debug {
-                        if body_type == 1 {
-                            eprintln!(
-                                "[{:6} ms] t1 {}x{}+{}+{} applied: {} tiles, {} refined",
-                                now_ms(),
-                                r.w,
-                                r.h,
-                                r.x,
-                                r.y,
-                                stats.tiles,
-                                stats.dct_blocks
-                            );
-                        } else {
-                            eprintln!(
-                                "[{:6} ms] t0 {}x{}+{}+{} applied: {} cmds, {} dct, {} bits",
-                                now_ms(),
-                                r.w,
-                                r.h,
-                                r.x,
-                                r.y,
-                                stats.commands,
-                                stats.dct_blocks,
-                                stats.dct_bits
-                            );
-                        }
-                    }
-                    true
-                }
-                Ok(None) => false, // quant table update
-                Err(e) => {
-                    // Never kill the session for one bad body.
-                    eprintln!(
-                        "mvs body t{body_type} {}x{}+{}+{} failed: {e:#}",
-                        r.w, r.h, r.x, r.y
-                    );
-                    false
-                }
-            }
-        };
-        if !applied {
-            return;
-        }
-        let stride = self.fb_w as usize * 4;
-        let width = self.fb_w as usize;
-        let x = r.x as usize;
-        let y0 = r.y as usize;
-        for row in 0..r.h as usize {
-            let dy = y0 + row;
-            if dy >= self.fb_h as usize || x + r.w as usize > width {
-                continue;
-            }
-            let src = dy * stride + x * 4;
-            let dst = dy * width + x;
-            let out = &mut self.fb[dst..dst + r.w as usize];
-            for (slot, chunk) in out
-                .iter_mut()
-                .zip(self.mvs_bytes[src..src + r.w as usize * 4].chunks_exact(4))
-            {
-                *slot = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
-            }
-        }
-        self.dirty = true;
-    }
-
-    /// `--debug-input`: close the oldest pending input once a rect is painted.
     fn record_input_latency(&mut self) {
         if !self.debug_input {
             return;
@@ -1750,48 +1895,6 @@ impl App {
             if let Some(w) = &self.window {
                 w.request_redraw();
             }
-        }
-        for r in update.rects {
-            if r.encoding == 0x3f3 {
-                self.apply_mvs(&r);
-                continue;
-            }
-            if r.pixels.is_empty() || r.w == 0 || r.h == 0 {
-                continue;
-            }
-            // If the server did not honour our scale request, grow to the
-            // actual framebuffer geometry instead of dropping the frame.
-            if r.x == 0
-                && r.y == 0
-                && (r.w > self.fb_w || r.h > self.fb_h)
-                && r.pixels.len() == r.w as usize * r.h as usize * 4
-            {
-                self.fb_w = r.w;
-                self.fb_h = r.h;
-                self.fb = vec![0u32; r.w as usize * r.h as usize];
-            }
-            let dst_w = self.fb_w as usize;
-            let src_row = r.w as usize * 4;
-            let x = r.x as usize;
-            let y = r.y as usize;
-            for row in 0..r.h as usize {
-                let dy = y + row;
-                if dy >= self.fb_h as usize || x + r.w as usize > dst_w {
-                    continue;
-                }
-                let src = row * src_row;
-                if src + src_row > r.pixels.len() {
-                    break;
-                }
-                let dst = dy * dst_w + x;
-                // Convert BGRX bytes to words once, here, so presentation is a
-                // straight memcpy per row.
-                let out = &mut self.fb[dst..dst + r.w as usize];
-                for (px, chunk) in out.iter_mut().zip(r.pixels[src..src + src_row].chunks_exact(4)) {
-                    *px = u32::from_le_bytes([chunk[0], chunk[1], chunk[2], 0]);
-                }
-            }
-            self.dirty = true;
         }
     }
 
@@ -2473,6 +2576,7 @@ impl ApplicationHandler<UserEvent> for App {
                 "medium" => (10.0, 20, false),
                 "stop" => (40.0, 10, true),
                 "hardflick" => (80.0, 10, false),
+                "stress" => (40.0, 10, false),
                 "jitter" => (10.0, 20, false),
                 "diagonal" => (10.0, 20, false),
                 "turn" => (10.0, 38, false),
@@ -2505,6 +2609,11 @@ impl ApplicationHandler<UserEvent> for App {
                 thread::sleep(Duration::from_millis(16));
             }
             self.queue_scroll(step(0.0, Phase::Ended));
+            if kind == "stress" {
+                // Repeat the flick so a sustained scroll can be measured.
+                self.scroll_stress = 8;
+                self.scroll_stress_next = Some(Instant::now() + Duration::from_millis(700));
+            }
             if stop_after {
                 // Do not block the event loop: the glide is ticked from
                 // about_to_wait, so the touch is scheduled instead of slept.
@@ -2522,6 +2631,42 @@ impl ApplicationHandler<UserEvent> for App {
                     precise: true,
                     momentum: None,
                 });
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
+        }
+        if let Some(at) = self.scroll_stress_next {
+            if Instant::now() >= at {
+                if self.scroll_stress > 0 {
+                    self.scroll_stress -= 1;
+                    self.scroll_stress_next = Some(Instant::now() + Duration::from_millis(700));
+                    self.queue_scroll(Gesture::Scroll {
+                        dx: 0.0,
+                        dy: 0.0,
+                        phase: Phase::Began,
+                        precise: true,
+                        momentum: None,
+                    });
+                    for _ in 0..10 {
+                        self.queue_scroll(Gesture::Scroll {
+                            dx: 0.0,
+                            dy: -40.0,
+                            phase: Phase::Changed,
+                            precise: true,
+                            momentum: None,
+                        });
+                        thread::sleep(Duration::from_millis(16));
+                    }
+                    self.queue_scroll(Gesture::Scroll {
+                        dx: 0.0,
+                        dy: 0.0,
+                        phase: Phase::Ended,
+                        precise: true,
+                        momentum: None,
+                    });
+                } else {
+                    self.scroll_stress_next = None;
+                }
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
             }
@@ -2567,35 +2712,54 @@ impl ApplicationHandler<UserEvent> for App {
             self.send(gesture_rotate(0.0, 4, 31, self.pinch_x, self.pinch_y));
             self.rotate_active = false;
         }
-        let mut got_pixels = false;
+        // Metadata (display, cursor, clipboard, file copy) from the reader.
         while let Ok(update) = self.rx.try_recv() {
-            let had_pixels = update.rects.iter().any(|r| !r.pixels.is_empty());
-            let full = update.rects.iter().any(|r| {
-                !r.pixels.is_empty()
-                    && r.x == 0
-                    && r.y == 0
-                    && r.w == self.fb_w
-                    && r.h == self.fb_h
-            });
             self.apply_update(update);
-            if had_pixels {
-                self.frames += 1;
-                got_pixels = true;
-                LAST_APPLIED_MS.store(now_ms(), Ordering::Relaxed);
-                PUSH_PAINTED.store(true, Ordering::Relaxed);
-                self.record_input_latency();
-                if self.frames >= self.lat_next_report {
-                    self.report_input_latency("latency report");
-                    self.lat_next_report = self.frames + 50;
+        }
+        // The newest decoded frame, if the reader produced one since the last
+        // paint. Older frames were already replaced in the slot, never queued.
+        let frame = self
+            .frame_slot
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some((w, h, rects, full)) = frame {
+            if (w, h) != (self.fb_w, self.fb_h) {
+                self.fb_w = w;
+                self.fb_h = h;
+                self.fb = vec![0u32; w as usize * h as usize];
+                // Force the draw mapping to be rebuilt for the new geometry.
+                self.render_size = (0, 0);
+            }
+            let dst_w = w as usize;
+            if self.debug_input {
+                for (x, y, rw, rh, _) in &rects {
+                    eprintln!("ui frame {}x{} rect {}x{}+{}+{}", w, h, rw, rh, x, y);
                 }
             }
-            if full {
-                self.full_frame = true;
+            for (x, y, rw, rh, pixels) in rects {
+                let (x, y, rw, rh) = (x as usize, y as usize, rw as usize, rh as usize);
+                if x + rw > dst_w || y + rh > h as usize {
+                    continue;
+                }
+                for row in 0..rh {
+                    let dst = (y + row) * dst_w + x;
+                    let src = row * rw;
+                    self.fb[dst..dst + rw].copy_from_slice(&pixels[src..src + rw]);
+                }
             }
-        }
-        if got_pixels {
-            if let Some(w) = &self.window {
-                w.request_redraw();
+            self.frames += 1;
+            self.full_frame |= full;
+            LAST_APPLIED_MS.store(now_ms(), Ordering::Relaxed);
+            PUSH_PAINTED.store(true, Ordering::Relaxed);
+            self.record_input_latency();
+            if self.frames >= self.lat_next_report {
+                self.report_input_latency("latency report");
+                self.lat_next_report = self.frames + 50;
+            }
+            self.dirty = true;
+            if let Some(win) = &self.window {
+                win.request_redraw();
             }
         }
         if let Some(deadline) = self.deadline {
@@ -3004,6 +3168,11 @@ fn main() -> Result<()> {
     // Bounded: if the GUI cannot keep up, apply backpressure instead of
     // queueing stale frames (which makes interaction feel sluggish).
     let (tx_upd, rx_upd) = mpsc::channel::<Update>();
+    // One-slot frame handoff: the reader decodes, the UI presents. A newer
+    // frame always replaces an older one, so a slow UI skips ahead instead of
+    // replaying a backlog.
+    let frame_slot: Arc<std::sync::Mutex<Option<Frame>>> =
+        Arc::new(std::sync::Mutex::new(None));
 
     // File copy: received items always land in ~/Downloads; dropped files are
     // sent to /Users/<remote user>/Downloads (the native client's shape).
@@ -3194,9 +3363,11 @@ fn main() -> Result<()> {
     let remote_path_reader = remote_path.clone();
     let recv_dir_reader = recv_dir.clone();
     let reader_proxy = proxy.clone();
+    let frame_slot_reader = frame_slot.clone();
     let debug_reader = debug_input;
     thread::spawn(move || {
         let mut reader = reader;
+        let mut decoder = Decoder::new(fb_w, fb_h, mvs, debug_reader);
         if debug_reader {
             thread::spawn(|| loop {
                 thread::sleep(Duration::from_secs(2));
@@ -3378,7 +3549,17 @@ fn main() -> Result<()> {
                         .rects
                         .iter()
                         .any(|r| r.encoding == 0x3f3 && r.w == fb_w && r.h == fb_h);
-                    if tx_upd.send(update).is_err() {
+                    // Decode here, on the reader thread: an MVS rect can be
+                    // 12,000 DCT blocks, and doing that on the event loop
+                    // starved the window. The UI gets a ready frame.
+                    for r in &update.rects {
+                        decoder.apply(r);
+                    }
+                    publish_frame(&mut decoder, &frame_slot_reader);
+                    // The UI has no use for the encoded rects any more.
+                    let mut meta = update;
+                    meta.rects.clear();
+                    if tx_upd.send(meta).is_err() {
                         break;
                     }
                     let _ = reader_proxy.send_event(UserEvent::Refresh);
@@ -3486,7 +3667,6 @@ fn main() -> Result<()> {
         debug_input,
         ime,
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
-        mvs,
         demo_cursor,
         file_dest.clone(),
         pull_pending.clone(),
@@ -3494,6 +3674,7 @@ fn main() -> Result<()> {
         keymap,
         grab,
         scroll_test,
+        frame_slot.clone(),
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
