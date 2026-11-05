@@ -9,7 +9,8 @@ use gesture_input::{AxisFilter, Gesture, Momentum, Phase, SCROLL_POINTS_PER_LINE
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
-    gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_smart_magnify, gesture_swipe,
+    gesture_magnify, gesture_mouse_scroll, gesture_rotate, gesture_scroll, gesture_smart_magnify,
+    gesture_swipe,
     key_event, image_item, pasteboard_archive, pasteboard_image,
     pointer_event, viewer_clipboard_send, AppleSession, CursorUpdate, Update,
 };
@@ -62,6 +63,11 @@ struct PendingScroll {
     /// Last sample's delta, for the debug log.
     raw: (f32, f32),
 }
+
+/// EXPERIMENT: which Apple scroll subtype to send for precise input.
+/// 11 = line-unit MouseScroll (the verified path), 8 = gesture scroll with
+/// pixel deltas (untested on this server). Set with `SS_SCROLL_SUBTYPE=8`.
+static SCROLL_SUBTYPE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(11);
 
 /// Scroll coalescing interval: ~120 Hz, so a fast flick does not flood the
 /// session with one 58-byte message per trackpad sample.
@@ -116,6 +122,12 @@ fn scroll_message(
         return (None, remainder, (0, 0), (0, 0));
     };
     let points_per_line = (PIXELS_PER_LINE / scroll_speed()).max(0.5);
+    if SCROLL_SUBTYPE.load(std::sync::atomic::Ordering::Relaxed) == 8 {
+        // Gesture scroll: the same finger deltas as f32 pixels, with the
+        // gesture phase. No line conversion at all.
+        let msg = gesture_scroll(dx, dy, 0.0, 1, phase.code(), 0, x, y);
+        return (Some(msg), (0.0, 0.0), (0, 0), (0, 0));
+    }
     let total = (
         remainder.0 + dx / points_per_line,
         remainder.1 + dy / points_per_line,
@@ -2557,12 +2569,21 @@ impl ApplicationHandler<UserEvent> for App {
             // Put the remote pointer over the target document; synthetic
             // local mouse moves do not reach winit in this environment.
             self.cursor = (600, 400);
-            self.send(pointer_event(0, 600, 400));
-            thread::sleep(Duration::from_millis(80));
-            self.send(pointer_event(1, 600, 400));
-            thread::sleep(Duration::from_millis(60));
-            self.send(pointer_event(0, 600, 400));
-            thread::sleep(Duration::from_millis(120));
+            // Move only: a click could select a Finder item or follow a link.
+            // SS_SCROLL_AT=x,y overrides the target point for measurements.
+            let at = std::env::var("SS_SCROLL_AT")
+                .ok()
+                .and_then(|v| {
+                    let mut it = v.split(',');
+                    Some((
+                        it.next()?.trim().parse::<u16>().ok()?,
+                        it.next()?.trim().parse::<u16>().ok()?,
+                    ))
+                })
+                .unwrap_or((600, 400));
+            self.cursor = at;
+            self.send(pointer_event(0, at.0, at.1));
+            thread::sleep(Duration::from_millis(150));
             let step = |dy: f32, phase: Phase| Gesture::Scroll {
                 dx: 0.0,
                 dy,
@@ -2577,6 +2598,8 @@ impl ApplicationHandler<UserEvent> for App {
                 "stop" => (40.0, 10, true),
                 "hardflick" => (80.0, 10, false),
                 "stress" => (40.0, 10, false),
+                "precise100" => (5.0, 20, false),
+                "precise5" => (5.0, 1, false),
                 "jitter" => (10.0, 20, false),
                 "diagonal" => (10.0, 20, false),
                 "turn" => (10.0, 38, false),
@@ -3041,6 +3064,16 @@ fn main() -> Result<()> {
         },
     };
     eprintln!("keymap: {} (remote layout)", keymap.name);
+    if let Ok(v) = std::env::var("SS_SCROLL_SUBTYPE") {
+        match v.trim().parse::<u8>() {
+            Ok(8) => {
+                SCROLL_SUBTYPE.store(8, std::sync::atomic::Ordering::Relaxed);
+                eprintln!("scroll: EXPERIMENTAL subtype 8 (gesture scroll, pixel deltas)");
+            }
+            Ok(11) => {}
+            _ => eprintln!("scroll: SS_SCROLL_SUBTYPE must be 8 or 11; using 11"),
+        }
+    }
 
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
