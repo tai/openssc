@@ -36,6 +36,8 @@ pub const MAX_DATA: usize = 65536;
 /// NewItem type byte for a regular file (the native sender's `(type & ~2) == 1`
 /// branch copies the data-fork sizes).
 pub const ITEM_TYPE_FILE: u8 = 1;
+pub const ITEM_TYPE_DIR: u8 = 2;
+pub const ITEM_TYPE_SYMLINK: u8 = 3;
 
 /// A parsed server→viewer file-copy event.
 #[derive(Debug, Clone, PartialEq, Eq)]

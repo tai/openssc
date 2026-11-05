@@ -108,7 +108,11 @@ There is **no uid/gid** in the block. The three mistakes that cost the time:
 mode belongs at `+0x66` (not `+0x0a`), nameLen excludes the NUL, and the dates
 are `UTCDateTime` (a 16.32 fixed point) rather than a bare 64-bit value.
 
-Folder items recurse: each entry is a `NewItem` with `level` set to its depth.
+Folder items recurse: a directory is a `NewItem` with its own item type, and each
+entry below it is another `NewItem` with `level` set to its depth. Empty
+directories get their own `NewItem` and survive a round trip. Symlinks are
+deliberately **not** recreated on receive (they are skipped and logged); they are
+the classic escape vector for a file-sync feature.
 
 ## 6. cmd 102 FileData
 
@@ -130,12 +134,15 @@ and re-frames the transport header.
 
 | direction | trigger | destination |
 |---|---|---|
-| local → remote | drop a file on the ss-gui window (`WindowEvent::DroppedFile`) | `/Users/<remote user>/Downloads` |
+| local → remote | drop a file **or a folder** on the ss-gui window (`WindowEvent::DroppedFile`) | `/Users/<remote user>/Downloads` |
 | remote → local | incoming transfer | `~/Downloads`, collisions suffixed `" 2"` |
 
-Transfers run on a worker thread, so the UI keeps painting. Directory drops are
-refused with a message — a folder would recurse into many `NewItem`s and that is
-not wired yet.
+Transfers run on a worker thread, so the UI keeps painting.
+
+Pulling something from the remote has no gesture (drag-out is out of scope), so
+it is explicit: launch with `--recv-file /absolute/remote/path` and it is fetched
+at connect into `~/Downloads`. A folder arrives as a folder, tree intact, with
+`" 2"` applied to the top-level name on collision.
 
 Test hooks (not user-facing): `--send-file <path>` and `--recv-file <remote
 path>` exercise the two directions without a drag.

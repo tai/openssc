@@ -1,26 +1,26 @@
-//! Local→remote file drop: enumeration and transfer-loop scaffolding.
+//! Local↔remote file copy: enumeration, transfer loop and the receive worker.
 //!
-//! The verified native sequence is `StartFileReceive` (cmd 2), `ItemInfo`
-//! (cmd 100), `NewItem` (101), `FileData` (102, 65536-byte chunks) and
-//! `EndSession` (104). The byte layouts are still being specced, so this
-//! module defines only the semantic calls behind [`FileCopySender`] and ships
-//! a [`DryRunSender`] that logs the sequence. The real sender will wrap the
-//! RFB writer and slot into the same trait.
+//! Verified wire sequence (`artifacts/filecopy-recon.md`): cmd 2
+//! StartFileReceive, 100 ItemInfo, 101 NewItem per item, 102 FileData in
+//! 65536-byte chunks, 104 EndSession. Directories are NewItem type 2 with
+//! `level` = depth and bare names; symlinks are type 3 and are skipped on
+//! both sides. The NewItem layout (size at +0x36, mode u16 at +0x66, nameLen
+//! excluding NUL at +0x6c, name + NUL at +0x70) was recovered from a genuine
+//! server-sent NewItem.
 //!
-//! Entry point: [`enumerate_drop`] + [`run_transfer`], called from the winit
-//! `WindowEvent::DroppedFile` handler on a worker thread.
+//! Entry points: [`enumerate_drop`] + [`run_transfer`] for a drop, and
+//! [`receive_worker`] for the server→viewer stream.
 
 use anyhow::{bail, Context, Result};
 use rfb_proto::filecopy as proto;
 use sha1::{Digest, Sha1};
 use std::fs::File;
 use std::io::{Read, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 
-/// Data chunk size observed from the native client (65536 data bytes; the
-/// on-wire message adds the daemon wrapper and the FileData header).
+/// Data chunk size observed from the native client (65536 data bytes).
 pub const CHUNK_SIZE: usize = 65536;
 
 /// Destination folder the viewer asks the remote to write into. The native
@@ -30,79 +30,176 @@ pub fn remote_destination(user: &str) -> String {
     format!("/Users/{user}/Downloads")
 }
 
-/// One file selected by a drop.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct DropFile {
-    /// Local path to read bytes from.
-    pub source: PathBuf,
-    /// Name to create on the remote side (basename for a single file).
-    pub name: String,
-    pub size: u64,
-    /// POSIX mode including the file-type bits (0o100644 on macOS/Linux).
-    pub mode: u32,
-    pub uid: u32,
-    pub gid: u32,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ItemKind {
+    File,
+    Dir,
 }
 
-/// A drop resolved into the files to send and the remote destination.
+impl ItemKind {
+    fn type_byte(self) -> u8 {
+        match self {
+            ItemKind::File => proto::ITEM_TYPE_FILE,
+            ItemKind::Dir => proto::ITEM_TYPE_DIR,
+        }
+    }
+}
+
+/// One item in a drop. Regular files carry a source path; directories don't.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DropItem {
+    pub kind: ItemKind,
+    pub source: Option<PathBuf>,
+    /// Bare name on the remote (the parent comes from `level`).
+    pub name: String,
+    pub size: u64,
+    /// POSIX mode including the file-type bits.
+    pub mode: u32,
+    /// 0 for the top-level item, +1 per directory level.
+    pub level: u16,
+}
+
+/// A drop resolved into the items to send and the remote destination.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TransferPlan {
     pub destination: String,
-    pub files: Vec<DropFile>,
+    pub items: Vec<DropItem>,
+    pub skipped_symlinks: Vec<PathBuf>,
 }
 
 impl TransferPlan {
     pub fn total_bytes(&self) -> u64 {
-        self.files.iter().map(|file| file.size).sum()
+        self.items
+            .iter()
+            .filter(|item| item.kind == ItemKind::File)
+            .map(|item| item.size)
+            .sum()
     }
+
+    pub fn file_count(&self) -> u32 {
+        self.items
+            .iter()
+            .filter(|item| item.kind == ItemKind::File)
+            .count() as u32
+    }
+
+    pub fn folder_count(&self) -> u32 {
+        self.items
+            .iter()
+            .filter(|item| item.kind == ItemKind::Dir)
+            .count() as u32
+    }
+}
+
+#[cfg(unix)]
+fn mode_of(metadata: &std::fs::Metadata) -> u32 {
+    use std::os::unix::fs::PermissionsExt;
+    metadata.permissions().mode()
+}
+
+#[cfg(not(unix))]
+fn mode_of(_metadata: &std::fs::Metadata) -> u32 {
+    0o100644
+}
+
+fn utf8_name(path: &Path) -> Result<String> {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(str::to_string)
+        .ok_or_else(|| anyhow::anyhow!("file name is not valid UTF-8: {}", path.display()))
 }
 
 /// Resolve a winit `DroppedFile` path into a transfer plan.
 ///
-/// Single files are supported now. Directory drops need the folder-item
-/// semantics (`NewItem` levels, `folderCount`, relative names) that the spec
-/// has not pinned down yet, so they are rejected with a clear message instead
-/// of guessed. The plan shape already carries a name per file, so directory
-/// entries can be added without changing the sender interface.
+/// Files become one level-0 item. Directories become a level-0 directory item
+/// followed by a depth-first walk: every directory precedes its children, its
+/// children are level+1, and empty directories are emitted. Symlinks (and
+/// other special files) are skipped and reported; the remote receives only
+/// regular files and real directories.
 pub fn enumerate_drop(path: &Path) -> Result<TransferPlan> {
-    let metadata =
-        std::fs::metadata(path).with_context(|| format!("stat dropped path {}", path.display()))?;
-    if metadata.is_dir() {
-        bail!(
-            "directory drops are not wired yet (single-file drop first): {}",
-            path.display()
-        );
+    let metadata = std::fs::symlink_metadata(path)
+        .with_context(|| format!("stat dropped path {}", path.display()))?;
+    if metadata.file_type().is_symlink() {
+        bail!("symlink drops are not supported: {}", path.display());
     }
-    if !metadata.is_file() {
-        bail!("dropped path is not a regular file: {}", path.display());
-    }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| anyhow::anyhow!("file name is not valid UTF-8: {}", path.display()))?
-        .to_string();
-    #[cfg(unix)]
-    let (mode, uid, gid) = {
-        use std::os::unix::fs::{MetadataExt, PermissionsExt};
-        (
-            metadata.permissions().mode(),
-            metadata.uid(),
-            metadata.gid(),
-        )
-    };
-    #[cfg(not(unix))]
-    let (mode, uid, gid) = (0o100644, 501, 20);
-    Ok(TransferPlan {
+    let mut plan = TransferPlan {
         destination: String::new(),
-        files: vec![DropFile {
-            source: path.to_path_buf(),
-            name,
+        items: Vec::new(),
+        skipped_symlinks: Vec::new(),
+    };
+    if metadata.is_file() {
+        plan.items.push(DropItem {
+            kind: ItemKind::File,
+            source: Some(path.to_path_buf()),
+            name: utf8_name(path)?,
             size: metadata.len(),
-            mode,
-            uid,
-            gid,
-        }],
-    })
+            mode: mode_of(&metadata),
+            level: 0,
+        });
+        return Ok(plan);
+    }
+    if !metadata.is_dir() {
+        bail!("dropped path is not a regular file or directory: {}", path.display());
+    }
+    plan.items.push(DropItem {
+        kind: ItemKind::Dir,
+        source: None,
+        name: utf8_name(path)?,
+        size: 0,
+        mode: mode_of(&metadata),
+        level: 0,
+    });
+    walk_dir(path, 1, &mut plan)?;
+    Ok(plan)
+}
+
+/// Depth-first walk. The receiver keeps one FSRef slot per level
+/// (`g+0x1ba + level*80`) and resolves a child's parent from the slot at
+/// `level-1`, so the stream must be DFS-ordered: a directory item, then its
+/// descendants, before the next sibling. Pre-order satisfies that; files and
+/// subdirectories may be interleaved as long as no sibling is visited between
+/// a directory and its children.
+fn walk_dir(dir: &Path, level: u16, plan: &mut TransferPlan) -> Result<()> {
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("read directory {}", dir.display()))?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .collect();
+    entries.sort();
+    for entry in entries {
+        let metadata = std::fs::symlink_metadata(&entry)
+            .with_context(|| format!("stat {}", entry.display()))?;
+        let file_type = metadata.file_type();
+        if file_type.is_symlink() {
+            // Security: never recreate a symlink on the remote.
+            plan.skipped_symlinks.push(entry);
+            continue;
+        }
+        let name = utf8_name(&entry)?;
+        if file_type.is_dir() {
+            plan.items.push(DropItem {
+                kind: ItemKind::Dir,
+                source: None,
+                name,
+                size: 0,
+                mode: mode_of(&metadata),
+                level,
+            });
+            walk_dir(&entry, level.saturating_add(1), plan)?;
+        } else if file_type.is_file() {
+            plan.items.push(DropItem {
+                kind: ItemKind::File,
+                source: Some(entry),
+                name,
+                size: metadata.len(),
+                mode: mode_of(&metadata),
+                level,
+            });
+        } else {
+            // FIFOs, sockets, devices: not part of a file copy.
+            plan.skipped_symlinks.push(entry);
+        }
+    }
+    Ok(())
 }
 
 /// Semantic file-copy messages. Implementations own the byte layouts; this
@@ -116,7 +213,14 @@ pub trait FileCopySender {
         file_count: u32,
         folder_count: u32,
     ) -> Result<()>;
-    fn new_item(&mut self, level: u32, name: &str, mode: u32, size: u64) -> Result<()>;
+    fn new_item(
+        &mut self,
+        level: u32,
+        item_type: u8,
+        name: &str,
+        mode: u32,
+        size: u64,
+    ) -> Result<()>;
     fn file_data(&mut self, offset: u64, data: &[u8]) -> Result<()>;
     fn end_session(&mut self) -> Result<()>;
 }
@@ -124,34 +228,56 @@ pub trait FileCopySender {
 #[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
 pub struct TransferStats {
     pub files: u32,
+    pub folders: u32,
     pub bytes: u64,
     pub chunks: u32,
 }
 
-/// Drive the verified sequence for one plan. Reads the files in 64 KiB chunks
-/// and hands each chunk to the sender. No acks are visible in the native
-/// capture, so this is a straight write loop; the real sender can apply
-/// backpressure on the socket.
+/// Drive the verified sequence for one plan.
 pub fn run_transfer<S: FileCopySender>(
     sender: &mut S,
     plan: &TransferPlan,
 ) -> Result<TransferStats> {
     let total = plan.total_bytes();
-    let physical: u64 = plan.files.iter().map(|file| physical_size(&file.source)).sum();
+    let physical: u64 = plan
+        .items
+        .iter()
+        .filter_map(|item| item.source.as_deref())
+        .map(physical_size)
+        .sum();
     sender.start_file_receive(&plan.destination)?;
-    sender.item_info(total, physical, plan.files.len() as u32, 0)?;
+    sender.item_info(
+        total,
+        physical,
+        plan.file_count(),
+        plan.folder_count(),
+    )?;
 
     let mut stats = TransferStats::default();
-    for file in &plan.files {
-        sender.new_item(0, &file.name, file.mode, file.size)?;
-        let mut handle = File::open(&file.source)
-            .with_context(|| format!("open dropped file {}", file.source.display()))?;
+    for item in &plan.items {
+        sender.new_item(
+            item.level as u32,
+            item.kind.type_byte(),
+            &item.name,
+            item.mode,
+            item.size,
+        )?;
+        if item.kind == ItemKind::Dir {
+            stats.folders += 1;
+            continue;
+        }
+        let source = item
+            .source
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("file item {} has no source", item.name))?;
+        let mut handle = File::open(source)
+            .with_context(|| format!("open dropped file {}", source.display()))?;
         let mut buffer = vec![0u8; CHUNK_SIZE];
         let mut offset = 0u64;
         loop {
             let n = handle
                 .read(&mut buffer)
-                .with_context(|| format!("read {}", file.source.display()))?;
+                .with_context(|| format!("read {}", source.display()))?;
             if n == 0 {
                 break;
             }
@@ -160,11 +286,11 @@ pub fn run_transfer<S: FileCopySender>(
             stats.chunks += 1;
             stats.bytes += n as u64;
         }
-        if offset != file.size {
+        if offset != item.size {
             bail!(
                 "{} changed size during transfer (planned {}, read {})",
-                file.source.display(),
-                file.size,
+                source.display(),
+                item.size,
                 offset
             );
         }
@@ -174,8 +300,7 @@ pub fn run_transfer<S: FileCopySender>(
     Ok(stats)
 }
 
-/// Physical (allocated) size hint for ItemInfo, matching the native client's
-/// `pFileSize` (300000 → 303104 for a 300 KB file: 592 blocks × 512).
+/// Physical (allocated) size hint for ItemInfo.
 fn physical_size(path: &Path) -> u64 {
     let Ok(meta) = std::fs::metadata(path) else {
         return 0;
@@ -232,7 +357,6 @@ impl NetworkSender {
     pub fn sha1_hex(&self) -> String {
         hex_digest(&self.hash.clone().finalize())
     }
-
 }
 
 impl FileCopySender for NetworkSender {
@@ -264,11 +388,18 @@ impl FileCopySender for NetworkSender {
         self.send(message)
     }
 
-    fn new_item(&mut self, level: u32, name: &str, mode: u32, size: u64) -> Result<()> {
+    fn new_item(
+        &mut self,
+        level: u32,
+        item_type: u8,
+        name: &str,
+        mode: u32,
+        size: u64,
+    ) -> Result<()> {
         let message = proto::new_item(
             self.session,
             level as u16,
-            proto::ITEM_TYPE_FILE,
+            item_type,
             name,
             mode,
             size,
@@ -289,7 +420,7 @@ impl FileCopySender for NetworkSender {
     }
 }
 
-/// Enumerate + send one dropped file. Runs on a worker thread.
+/// Enumerate + send one dropped path. Runs on a worker thread.
 pub fn send_file(
     tx: Sender<Vec<u8>>,
     source: PathBuf,
@@ -300,17 +431,24 @@ pub fn send_file(
     plan.destination = destination;
     let session = next_session();
     eprintln!(
-        "filecopy: sending {} -> {} (session {session}, {} bytes)",
+        "filecopy: sending {} -> {} (session {session}, {} file(s), {} folder(s), {} bytes, {} symlink(s) skipped)",
         source.display(),
         plan.destination,
-        plan.total_bytes()
+        plan.file_count(),
+        plan.folder_count(),
+        plan.total_bytes(),
+        plan.skipped_symlinks.len()
     );
+    for skipped in &plan.skipped_symlinks {
+        eprintln!("filecopy: skipped symlink/special {}", skipped.display());
+    }
     let mut sender = NetworkSender::new(tx, session, verbose);
     match run_transfer(&mut sender, &plan) {
         Ok(stats) => {
             eprintln!(
-                "filecopy: sent {} file(s), {} bytes, {} chunk(s), sha1={} dest={}",
+                "filecopy: sent {} file(s), {} folder(s), {} bytes, {} chunk(s), sha1={} dest={}",
                 stats.files,
+                stats.folders,
                 stats.bytes,
                 stats.chunks,
                 sender.sha1_hex(),
@@ -361,6 +499,35 @@ pub fn unique_path(directory: &Path, name: &str) -> PathBuf {
     directory.join(name)
 }
 
+/// One safe path component from a peer-supplied item name.
+///
+/// Rejects anything that is not exactly one normal component: absolute paths,
+/// separators (`/`, `\`), `.`/`..`, empty names, and embedded NULs. This is
+/// the receive-side security boundary, not a cosmetic check.
+pub fn safe_component(name: &str) -> Option<&str> {
+    if name.is_empty()
+        || name == "."
+        || name == ".."
+        || name.contains('/')
+        || name.contains('\\')
+        || name.contains('\0')
+    {
+        return None;
+    }
+    let mut components = Path::new(name).components();
+    match (components.next(), components.next()) {
+        (Some(Component::Normal(part)), None) => part.to_str(),
+        _ => None,
+    }
+}
+
+/// Join a peer name under `parent`, validating the component. The result is
+/// guaranteed to be inside `parent`.
+pub fn safe_join(parent: &Path, name: &str) -> Option<PathBuf> {
+    let component = safe_component(name)?;
+    Some(parent.join(component))
+}
+
 struct Incoming {
     file: File,
     path: PathBuf,
@@ -383,20 +550,23 @@ fn finish_incoming(current: &mut Option<Incoming>) {
 
 /// Write a server→viewer file-copy stream into `out_dir`.
 ///
-/// Runs on a worker thread; the reader thread only forwards events. Files are
-/// created under `out_dir` (top-level items) or under the most recent folder
-/// with a smaller `level`; collisions get a Finder-style " 2"/" 3" suffix.
-pub fn receive_worker(
-    events: Receiver<proto::FileCopyEvent>,
-    out_dir: PathBuf,
-    verbose: bool,
-) {
+/// Runs on a worker thread. Directories are created and tracked by `level`;
+/// files are written into the most recent directory with a smaller level.
+/// A peer-supplied name that is not one safe component is rejected (and a
+/// rejected directory swallows its descendants). Symlinks (type 3) are
+/// skipped. Top-level name collisions get the Finder-style " 2" suffix, so a
+/// re-received folder keeps its whole tree together.
+pub fn receive_worker(events: Receiver<proto::FileCopyEvent>, out_dir: PathBuf, verbose: bool) {
     if let Err(error) = std::fs::create_dir_all(&out_dir) {
-        eprintln!("filecopy: cannot create receive directory {}: {error}", out_dir.display());
+        eprintln!(
+            "filecopy: cannot create receive directory {}: {error}",
+            out_dir.display()
+        );
         return;
     }
     let mut current: Option<Incoming> = None;
-    let mut folders: Vec<(u16, PathBuf)> = Vec::new();
+    // (level, Some(path)) for a real directory, None for a rejected one.
+    let mut folders: Vec<(u16, Option<PathBuf>)> = Vec::new();
 
     for event in events {
         match event {
@@ -422,44 +592,84 @@ pub fn receive_worker(
                     .rev()
                     .find(|(folder_level, _)| *folder_level < level)
                     .map(|(_, path)| path.clone())
-                    .unwrap_or_else(|| out_dir.clone());
-                let is_file = (item_type & !2) == 1;
-                let path = unique_path(&parent, &name);
-                if is_file {
-                    match File::create(&path) {
+                    .unwrap_or(Some(out_dir.clone()));
+                let Some(parent) = parent else {
+                    eprintln!(
+                        "filecopy: skipping {name:?} at level {level} inside a rejected directory"
+                    );
+                    if item_type == proto::ITEM_TYPE_DIR {
+                        folders.retain(|(folder_level, _)| *folder_level < level);
+                        folders.push((level, None));
+                    }
+                    continue;
+                };
+                let Some(component) = safe_component(&name) else {
+                    eprintln!(
+                        "filecopy: rejecting unsafe item name {name:?} at level {level}"
+                    );
+                    if item_type == proto::ITEM_TYPE_DIR {
+                        folders.retain(|(folder_level, _)| *folder_level < level);
+                        folders.push((level, None));
+                    }
+                    continue;
+                };
+                let Some(base) = safe_join(&parent, component) else {
+                    continue;
+                };
+                if !base.starts_with(&out_dir) {
+                    eprintln!(
+                        "filecopy: rejecting path outside the receive directory: {}",
+                        base.display()
+                    );
+                    continue;
+                }
+                let target = unique_path(&parent, component);
+                match item_type {
+                    proto::ITEM_TYPE_FILE => match File::create(&target) {
                         Ok(file) => {
                             if verbose {
                                 eprintln!(
                                     "filecopy: new file level={level} {name:?} -> {}",
-                                    path.display()
+                                    target.display()
                                 );
                             }
                             current = Some(Incoming {
                                 file,
-                                path,
+                                path: target,
                                 bytes: 0,
                                 hash: Sha1::new(),
                             });
                         }
                         Err(error) => {
-                            eprintln!("filecopy: create {}: {error}", path.display());
+                            eprintln!("filecopy: create {}: {error}", target.display());
                         }
-                    }
-                } else {
-                    match std::fs::create_dir_all(&path) {
+                    },
+                    proto::ITEM_TYPE_DIR => match std::fs::create_dir_all(&target) {
                         Ok(()) => {
                             folders.retain(|(folder_level, _)| *folder_level < level);
                             if verbose {
                                 eprintln!(
                                     "filecopy: new folder level={level} {name:?} -> {}",
-                                    path.display()
+                                    target.display()
                                 );
                             }
-                            folders.push((level, path));
+                            folders.push((level, Some(target)));
                         }
                         Err(error) => {
-                            eprintln!("filecopy: mkdir {}: {error}", path.display());
+                            eprintln!("filecopy: mkdir {}: {error}", target.display());
+                            folders.retain(|(folder_level, _)| *folder_level < level);
+                            folders.push((level, None));
                         }
+                    },
+                    proto::ITEM_TYPE_SYMLINK => {
+                        eprintln!(
+                            "filecopy: skipping symlink {name:?} at level {level} (not recreated)"
+                        );
+                    }
+                    other => {
+                        eprintln!(
+                            "filecopy: skipping unknown item type {other} ({name:?}, level {level})"
+                        );
                     }
                 }
             }
@@ -502,21 +712,28 @@ pub fn receive_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Write;
+    use std::os::unix::fs::symlink;
     use std::sync::atomic::{AtomicU32, Ordering};
 
     static NEXT: AtomicU32 = AtomicU32::new(0);
 
-    fn temp_file(len: usize) -> PathBuf {
-        let path = std::env::temp_dir().join(format!(
-            "ss-filecopy-test-{}-{}-{}",
+    fn temp_dir(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ss-filecopy-{tag}-{}-{}",
             std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed),
-            len
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
-        let mut file = File::create(&path).unwrap();
-        file.write_all(&vec![0xABu8; len]).unwrap();
-        path
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn write_file(path: &Path, data: &[u8]) {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent).unwrap();
+        }
+        let mut file = File::create(path).unwrap();
+        file.write_all(data).unwrap();
     }
 
     #[derive(Default)]
@@ -541,8 +758,15 @@ mod tests {
             Ok(())
         }
 
-        fn new_item(&mut self, level: u32, name: &str, _mode: u32, _size: u64) -> Result<()> {
-            self.calls.push(format!("item:{level}:{name}"));
+        fn new_item(
+            &mut self,
+            level: u32,
+            item_type: u8,
+            name: &str,
+            _mode: u32,
+            _size: u64,
+        ) -> Result<()> {
+            self.calls.push(format!("item:{level}:{item_type}:{name}"));
             Ok(())
         }
 
@@ -559,110 +783,60 @@ mod tests {
 
     #[test]
     fn enumerate_single_file() {
-        let path = temp_file(10);
+        let dir = temp_dir("single");
+        let path = dir.join("one.bin");
+        write_file(&path, b"abc");
         let plan = enumerate_drop(&path).unwrap();
-        assert_eq!(plan.files.len(), 1);
-        assert_eq!(plan.files[0].size, 10);
-        assert_eq!(plan.files[0].source, path);
+        assert_eq!(plan.items.len(), 1);
+        assert_eq!(plan.items[0].kind, ItemKind::File);
+        assert_eq!(plan.items[0].level, 0);
+        assert_eq!(plan.items[0].name, "one.bin");
+        assert_eq!(plan.items[0].size, 3);
         assert!(plan.destination.is_empty());
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
-    fn enumerate_rejects_directories() {
-        let path = std::env::temp_dir().join(format!(
-            "ss-filecopy-dir-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        std::fs::create_dir_all(&path).unwrap();
-        let error = enumerate_drop(&path).unwrap_err().to_string();
-        assert!(error.contains("directory drops"), "{error}");
-        let _ = std::fs::remove_dir(path);
-    }
+    fn enumerate_tree_levels_and_symlink_skip() {
+        let dir = temp_dir("tree");
+        let root = dir.join("tree");
+        write_file(&root.join("a.bin"), b"aaaa");
+        write_file(&root.join("sub/b.bin"), b"bb");
+        write_file(&root.join("sub/deep/c.bin"), b"c");
+        std::fs::create_dir_all(root.join("empty")).unwrap();
+        symlink("a.bin", root.join("link")).unwrap();
 
-    #[test]
-    fn unique_path_appends_counter_before_extension() {
-        let dir = std::env::temp_dir().join(format!(
-            "ss-filecopy-unique-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        File::create(dir.join("report.txt")).unwrap();
-        assert_eq!(unique_path(&dir, "report.txt"), dir.join("report 2.txt"));
-        File::create(dir.join("report 2.txt")).unwrap();
-        assert_eq!(unique_path(&dir, "report.txt"), dir.join("report 3.txt"));
-        assert_eq!(unique_path(&dir, "notes"), dir.join("notes"));
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn receive_worker_writes_files_and_handles_collisions() {
-        let dir = std::env::temp_dir().join(format!(
-            "ss-filecopy-recv-{}-{}",
-            std::process::id(),
-            NEXT.fetch_add(1, Ordering::Relaxed)
-        ));
-        let _ = std::fs::remove_dir_all(&dir);
-        std::fs::create_dir_all(&dir).unwrap();
-        let worker_dir = dir.clone();
-        let (tx, rx) = std::sync::mpsc::channel();
-        let worker = std::thread::spawn(move || receive_worker(rx, worker_dir, false));
-        tx.send(proto::FileCopyEvent::ItemInfo {
-            session: 1,
-            total_size: 11,
-            physical_size: 4096,
-            file_count: 1,
-            fork_count: 0,
-            folder_count: 0,
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::NewItem {
-            session: 1,
-            level: 0,
-            item_type: proto::ITEM_TYPE_FILE,
-            name: "r.bin".to_string(),
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::FileData {
-            session: 1,
-            data: b"hello ".to_vec(),
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::FileData {
-            session: 1,
-            data: b"world".to_vec(),
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::EndSession { session: 1, error: 0 })
-            .unwrap();
-        // Same name again: the worker must not overwrite.
-        tx.send(proto::FileCopyEvent::NewItem {
-            session: 2,
-            level: 0,
-            item_type: proto::ITEM_TYPE_FILE,
-            name: "r.bin".to_string(),
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::FileData {
-            session: 2,
-            data: b"x".to_vec(),
-        })
-        .unwrap();
-        tx.send(proto::FileCopyEvent::EndSession { session: 2, error: 0 })
-            .unwrap();
-        drop(tx);
-        worker.join().unwrap();
-        assert_eq!(std::fs::read(dir.join("r.bin")).unwrap(), b"hello world");
-        assert_eq!(std::fs::read(dir.join("r 2.bin")).unwrap(), b"x");
-        let _ = std::fs::remove_dir_all(&dir);
+        let plan = enumerate_drop(&root).unwrap();
+        let names: Vec<_> = plan
+            .items
+            .iter()
+            .map(|item| (item.level, item.kind, item.name.as_str()))
+            .collect();
+        assert_eq!(
+            names,
+            vec![
+                (0, ItemKind::Dir, "tree"),
+                (1, ItemKind::File, "a.bin"),
+                (1, ItemKind::Dir, "empty"),
+                (1, ItemKind::Dir, "sub"),
+                (2, ItemKind::File, "b.bin"),
+                (2, ItemKind::Dir, "deep"),
+                (3, ItemKind::File, "c.bin"),
+            ]
+        );
+        assert_eq!(plan.file_count(), 3);
+        assert_eq!(plan.folder_count(), 4);
+        assert_eq!(plan.total_bytes(), 7);
+        assert_eq!(plan.skipped_symlinks.len(), 1);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn transfer_sequence_and_chunking() {
-        let path = temp_file(150_000);
+        let dir = temp_dir("chunk");
+        let path = dir.join("big.bin");
+        let data = vec![0xABu8; 150_000];
+        write_file(&path, &data);
         let mut plan = enumerate_drop(&path).unwrap();
         plan.destination = "/Users/tai/Downloads".to_string();
         let mut sender = RecordingSender::default();
@@ -671,6 +845,7 @@ mod tests {
             stats,
             TransferStats {
                 files: 1,
+                folders: 0,
                 bytes: 150_000,
                 chunks: 3
             }
@@ -678,15 +853,237 @@ mod tests {
         let calls = sender.calls;
         assert_eq!(calls[0], "start:/Users/tai/Downloads");
         assert_eq!(calls[1], "info:150000:1:0");
-        assert!(
-            calls[2].starts_with("item:0:ss-filecopy-test-"),
-            "{}",
-            calls[2]
-        );
+        assert!(calls[2].starts_with("item:0:1:big.bin"), "{}", calls[2]);
         assert!(calls[3].starts_with("data:0:65536"), "{}", calls[3]);
         assert!(calls[4].starts_with("data:65536:65536"), "{}", calls[4]);
         assert!(calls[5].starts_with("data:131072:18928"), "{}", calls[5]);
         assert_eq!(calls[6], "end");
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sender_order_is_dfs_even_when_a_file_sorts_after_a_directory() {
+        let dir = temp_dir("dfs");
+        let root = dir.join("tree");
+        // Lexicographic order: "Alpha" (dir), "Beta" (dir), "zeta.bin" (file).
+        write_file(&root.join("Alpha/inner.bin"), b"i");
+        write_file(&root.join("Beta/deep.bin"), b"d");
+        write_file(&root.join("zeta.bin"), b"z");
+        let plan = enumerate_drop(&root).unwrap();
+        let order: Vec<_> = plan
+            .items
+            .iter()
+            .map(|item| (item.level, item.name.as_str()))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                (0, "tree"),
+                (1, "Alpha"),
+                (2, "inner.bin"),
+                (1, "Beta"),
+                (2, "deep.bin"),
+                (1, "zeta.bin"),
+            ]
+        );
+        // zeta.bin at level 1 still resolves its parent from slot[0].
+        assert_eq!(plan.items.last().unwrap().level, 1);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn receive_worker_accepts_native_fts_order() {
+        // The native sender emits directories pre-order but files after the
+        // subdirectories (captured order for /Users/tai/fc-dir):
+        // root, empty, sub, deep, c.bin, b.bin, a.bin, link.
+        let dir = temp_dir("fts");
+        let out = dir.join("Downloads");
+        let worker_out = out.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || receive_worker(rx, worker_out, false));
+        let item = |level: u16, item_type: u8, name: &str| proto::FileCopyEvent::NewItem {
+            session: 1,
+            level,
+            item_type,
+            name: name.to_string(),
+        };
+        tx.send(proto::FileCopyEvent::ItemInfo {
+            session: 1,
+            total_size: 7,
+            physical_size: 4096,
+            file_count: 3,
+            fork_count: 0,
+            folder_count: 3,
+        })
+        .unwrap();
+        tx.send(item(0, proto::ITEM_TYPE_DIR, "tree")).unwrap();
+        tx.send(item(1, proto::ITEM_TYPE_DIR, "empty")).unwrap();
+        tx.send(item(1, proto::ITEM_TYPE_DIR, "sub")).unwrap();
+        tx.send(item(2, proto::ITEM_TYPE_DIR, "deep")).unwrap();
+        tx.send(item(3, proto::ITEM_TYPE_FILE, "c.bin")).unwrap();
+        tx.send(proto::FileCopyEvent::FileData {
+            session: 1,
+            data: b"c".to_vec(),
+        })
+        .unwrap();
+        tx.send(item(2, proto::ITEM_TYPE_FILE, "b.bin")).unwrap();
+        tx.send(proto::FileCopyEvent::FileData {
+            session: 1,
+            data: b"bb".to_vec(),
+        })
+        .unwrap();
+        tx.send(item(1, proto::ITEM_TYPE_FILE, "a.bin")).unwrap();
+        tx.send(proto::FileCopyEvent::FileData {
+            session: 1,
+            data: b"aaaa".to_vec(),
+        })
+        .unwrap();
+        tx.send(item(1, proto::ITEM_TYPE_SYMLINK, "link")).unwrap();
+        tx.send(proto::FileCopyEvent::EndSession {
+            session: 1,
+            error: 0,
+        })
+        .unwrap();
+        drop(tx);
+        worker.join().unwrap();
+        assert_eq!(std::fs::read(out.join("tree/a.bin")).unwrap(), b"aaaa");
+        assert_eq!(std::fs::read(out.join("tree/sub/b.bin")).unwrap(), b"bb");
+        assert_eq!(
+            std::fs::read(out.join("tree/sub/deep/c.bin")).unwrap(),
+            b"c"
+        );
+        assert!(out.join("tree/empty").is_dir());
+        assert!(!out.join("tree/link").exists());
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn safe_component_rejects_traversal_and_separators() {
+        assert_eq!(safe_component("../../evil"), None);
+        assert_eq!(safe_component("/abs"), None);
+        assert_eq!(safe_component("a/b"), None);
+        assert_eq!(safe_component("a\\b"), None);
+        assert_eq!(safe_component(".."), None);
+        assert_eq!(safe_component("."), None);
+        assert_eq!(safe_component(""), None);
+        assert_eq!(safe_component("a\0b"), None);
+        assert_eq!(safe_component("normal.bin"), Some("normal.bin"));
+        assert_eq!(safe_component("with space.txt"), Some("with space.txt"));
+        let root = Path::new("/tmp/recv");
+        assert_eq!(safe_join(root, "../../evil"), None);
+        assert_eq!(
+            safe_join(root, "ok.bin"),
+            Some(PathBuf::from("/tmp/recv/ok.bin"))
+        );
+    }
+
+    #[test]
+    fn receive_worker_tree_collision_and_traversal() {
+        let dir = temp_dir("recv");
+        let out = dir.join("Downloads");
+        let worker_out = out.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || receive_worker(rx, worker_out, false));
+
+        let send_tree = |tx: &std::sync::mpsc::Sender<proto::FileCopyEvent>| {
+            tx.send(proto::FileCopyEvent::ItemInfo {
+                session: 1,
+                total_size: 10,
+                physical_size: 4096,
+                file_count: 3,
+                fork_count: 0,
+                folder_count: 3,
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 0,
+                item_type: proto::ITEM_TYPE_DIR,
+                name: "tree".to_string(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 1,
+                item_type: proto::ITEM_TYPE_FILE,
+                name: "a.bin".to_string(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::FileData {
+                session: 1,
+                data: b"aaaa".to_vec(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 1,
+                item_type: proto::ITEM_TYPE_DIR,
+                name: "empty".to_string(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 1,
+                item_type: proto::ITEM_TYPE_DIR,
+                name: "sub".to_string(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 2,
+                item_type: proto::ITEM_TYPE_FILE,
+                name: "b.bin".to_string(),
+            })
+            .unwrap();
+            tx.send(proto::FileCopyEvent::FileData {
+                session: 1,
+                data: b"bb".to_vec(),
+            })
+            .unwrap();
+            // A symlink must not be recreated.
+            tx.send(proto::FileCopyEvent::NewItem {
+                session: 1,
+                level: 1,
+                item_type: proto::ITEM_TYPE_SYMLINK,
+                name: "link".to_string(),
+            })
+            .unwrap();
+            // Traversal attempts must not escape the receive directory.
+            for evil in ["../../evil", "/abs", "a/b"] {
+                tx.send(proto::FileCopyEvent::NewItem {
+                    session: 1,
+                    level: 1,
+                    item_type: proto::ITEM_TYPE_FILE,
+                    name: evil.to_string(),
+                })
+                .unwrap();
+                tx.send(proto::FileCopyEvent::FileData {
+                    session: 1,
+                    data: b"x".to_vec(),
+                })
+                .unwrap();
+            }
+            tx.send(proto::FileCopyEvent::EndSession {
+                session: 1,
+                error: 0,
+            })
+            .unwrap();
+        };
+        send_tree(&tx);
+        // Same folder again: the whole tree lands in "tree 2".
+        send_tree(&tx);
+        drop(tx);
+        worker.join().unwrap();
+
+        assert_eq!(std::fs::read(out.join("tree/a.bin")).unwrap(), b"aaaa");
+        assert_eq!(std::fs::read(out.join("tree/sub/b.bin")).unwrap(), b"bb");
+        assert!(out.join("tree/empty").is_dir());
+        assert!(!out.join("tree/link").exists());
+        assert!(!dir.join("evil").exists());
+        assert!(!out.join("tree/a").exists());
+        assert_eq!(std::fs::read(out.join("tree 2/a.bin")).unwrap(), b"aaaa");
+        assert_eq!(std::fs::read(out.join("tree 2/sub/b.bin")).unwrap(), b"bb");
+        assert!(out.join("tree 2/empty").is_dir());
+        let _ = std::fs::remove_dir_all(dir);
     }
 }
