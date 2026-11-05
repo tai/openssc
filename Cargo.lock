@@ -544,7 +544,7 @@ dependencies = [
 
 [[package]]
 name = "gesture-input"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "libc",
 ]
@@ -1367,7 +1367,7 @@ dependencies = [
 
 [[package]]
 name = "rfb-proto"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "aes",
  "anyhow",
@@ -1614,7 +1614,7 @@ dependencies = [
 
 [[package]]
 name = "ss-client"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
  "png",
@@ -1624,9 +1624,11 @@ dependencies = [
 
 [[package]]
 name = "ss-gui"
-version = "1.4.0"
+version = "1.4.1"
 dependencies = [
  "anyhow",
+ "core-foundation",
+ "core-graphics",
  "gesture-input",
  "png",
  "raw-window-handle",

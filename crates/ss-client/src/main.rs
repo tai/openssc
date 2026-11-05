@@ -12,7 +12,36 @@ use std::io::BufWriter;
 use std::time::Duration;
 
 fn usage() -> &'static str {
-    "usage:\n  ss-client probe    [--host mm.local] [--port 5900] [--user tai] [--password <password>]\n  ss-client snapshot --out artifacts/rust.png [--mvs] [connection opts]\n  ss-client stream   --frames 3 --out artifacts/stream.png [--mvs] [--dump-mvs PREFIX] [connection opts]\n  ss-client mvs-file --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]\n  ss-client mvs-compare --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]\n  ss-client mvs-sequence --manifest artifacts/push-pC/manifest.txt [--out artifacts/push-rust.png] [--hashes artifacts/push-rust-hashes.txt]\n  ss-client gesture  --kind swipe|scroll [gesture opts] --out artifacts/gesture.png\n  ss-client demo-input --x 1000 --y 800 --text hello --out artifacts/input.png\n  ss-client clipboard --text hello [--no-auto]\n\n--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.\nmvs-compare decodes one MVS and one Zlib full frame (one session each) and reports\nlatency plus pixel agreement.\n\ngesture opts:\n  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series\n  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series\n  common: --delay-ms N"
+    "usage:
+  ss-client probe         [connection opts]
+  ss-client snapshot      --out artifacts/rust.png [--mvs] [connection opts]
+  ss-client stream        --frames 3 --out artifacts/stream.png [stream opts] [connection opts]
+  ss-client gesture       --kind swipe|scroll [gesture opts] --out artifacts/gesture.png
+  ss-client demo-input    --x 1000 --y 800 --text hello --out artifacts/input.png
+  ss-client clipboard     --text hello [--no-auto]
+  ss-client clipboard-sync --text \"ss-clone sync test\" [--wait-ms 3000]
+  ss-client clipboard-read [--wait-ms 4000] [--no-auto] [--poll-fetch] [--fetch-len N] [--dump] [--quiet]
+  ss-client mvs-file      --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]
+  ss-client mvs-compare   --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]
+  ss-client mvs-sequence  --manifest artifacts/push-pC/manifest.txt [--out artifacts/push-rust.png]
+                          [--hashes artifacts/push-rust-hashes.txt] [--width 2560] [--height 1600]
+
+connection opts:
+  --host mm.local --port 5900 --user tai --password <password> --debug-controls
+
+stream opts:
+  --frames N --passes N --out PATH --mvs --dump-mvs PREFIX --encoding ID
+  --bands N --scale F --auto --auto-screen N --auto-version N --poll-fetch
+  --logical --move --quiet
+
+--mvs advertises MultiVariant (0x3f3) only and decodes tiles into the framebuffer.
+mvs-compare decodes one MVS and one Zlib full frame (one session each) and reports
+latency plus pixel agreement.
+
+gesture opts:
+  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series
+  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series
+  common: --delay-ms N"
 }
 
 /// Replay a captured push sequence offline: apply every body in manifest

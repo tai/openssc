@@ -34,6 +34,23 @@ use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 
 mod filecopy;
 
+#[cfg(target_os = "macos")]
+mod grab;
+
+/// The keyboard grab handle. A no-op stub off macOS so the rest of the app
+/// does not need cfg branches.
+#[cfg(target_os = "macos")]
+type GrabHandle = grab::Grab;
+#[cfg(not(target_os = "macos"))]
+struct GrabHandle;
+#[cfg(not(target_os = "macos"))]
+impl GrabHandle {
+    fn set_enabled(&self, _on: bool) {}
+    fn is_enabled(&self) -> bool {
+        false
+    }
+}
+
 /// One Cmd+Shift+V pull: how many fetches went out and what the last archive
 /// actually contained, so the refusal can quote it.
 struct PullState {
@@ -316,6 +333,57 @@ fn text_keysym(c: char) -> u32 {
         0x0100_0000 | c as u32
     }
 }
+
+/// Usage text for `-h` / `--help`.
+///
+/// Keep this in sync with the parser below: `usage_documents_every_flag` scans
+/// this file for flag literals and fails if one is missing here.
+const USAGE: &str = "\
+ss-gui — Apple Screen Sharing client (RFB 003.889 + Apple extensions)
+
+Usage: ss-gui [options]
+
+Connection:
+  --host <host>            server host                         (default mm.local)
+  --port <port>            server port                         (default 5900)
+  --user <name>            account on the remote                (default tai)
+  --password <password>    password for that account            (or SS_PASSWORD)
+
+Display and codec:
+  --scale <f>              present the framebuffer at this scale (default 1.0)
+  --mvs                    advertise MultiVariant (0x3f3); server push by default
+  --poll                   MVS request loop instead of server push
+  --push                   accepted no-op (push is the default with --mvs)
+  --encoding <id>          advertise a single framebuffer encoding (6 = Zlib)
+  --bands <n>              banded refresh bands, 1-64 (default 8; forced to 1 in the MVS request loop)
+  --pipeline <n>           framebuffer requests kept in flight, 1-8 (default 3)
+  --auto                   experimental: server-pushed dirty rectangles
+
+Input and keyboard:
+  --keymap us|jis          layout the REMOTE runs (default us)
+  --ime                    enable IME; composed text arrives via Ime::Commit
+  --evdev                  Linux only: raw multitouch gestures from /dev/input
+  --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
+  --release-grab <chord>   macOS release chord, e.g. cmd+shift or ctrl+alt+cmd+esc
+                           (default: hold Left-Cmd+Shift for 350 ms)
+
+Clipboard and file copy:
+  --clipboard              automatic duplex clipboard (default on)
+  --no-clipboard           disable the automatic clipboard
+  --send-clipboard         send the local clipboard on connect
+  --pull <path>            pull an absolute remote path into ~/Downloads (repeatable)
+  --send-file <path>       send a local file to the remote Downloads (repeatable)
+  --recv-file <path>       request a remote file into ~/Downloads (repeatable)
+
+Lab and debugging:
+  --dump <path>            write the composited window to a PNG
+  --dump-after <n>         dump after n frames (default 4)
+  --exit-after-dump        exit once the dump is written
+  --exit-after-secs <s>    exit after s seconds
+  --debug-input            trace input, clipboard, keys and framebuffer timing
+  --demo-cursor            scripted pointer tour that dumps a PNG per cursor shape
+  -h, --help               show this message and exit
+";
 
 fn named_keysym(key: &NamedKey) -> Option<u32> {
     Some(match key {
@@ -650,6 +718,9 @@ enum UserEvent {
     Disconnected(String),
     /// Status text for the window title after a pull attempt.
     PullStatus(String),
+    /// A keyboard event captured by the macOS event tap.
+    #[cfg(target_os = "macos")]
+    Grab(grab::GrabEvent),
 }
 
 struct App {
@@ -689,6 +760,11 @@ struct App {
     remote_path: Arc<std::sync::Mutex<Option<String>>>,
     /// The remote's layout table: which key sits where on the far end.
     keymap: &'static Keymap,
+    /// macOS keyboard grab, when it could be created.
+    grab: Option<GrabHandle>,
+    /// The release chord fired: stay ungrabbed until focus is lost and
+    /// regained (the user pressed it because something was wrong).
+    grab_suspended: bool,
     /// `--demo-cursor`: scripted remote pointer tour to exercise cursor shapes.
     demo_cursor: bool,
     demo_step: usize,
@@ -754,6 +830,7 @@ impl App {
         pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
         keymap: &'static Keymap,
+        grab: Option<GrabHandle>,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -783,6 +860,8 @@ impl App {
             pull_pending,
             remote_path,
             keymap,
+            grab,
+            grab_suspended: false,
             demo_cursor,
             demo_step: 0,
             demo_next: Some(Instant::now() + Duration::from_millis(600)),
@@ -822,6 +901,181 @@ impl App {
     fn send(&self, body: Vec<u8>) {
         if self.tx.send(body).is_err() && self.debug_input {
             eprintln!("input channel closed (writer thread exited)");
+        }
+    }
+
+    /// The one place that decides what a key event puts on the wire. Shared by
+    /// winit's `KeyboardInput` and the macOS event tap (`grab.rs`).
+    fn handle_key(
+        &mut self,
+        code: Option<KeyCode>,
+        logical: &Key,
+        pressed: bool,
+        repeat: bool,
+    ) {
+        if repeat {
+            return;
+        }
+        // Cmd+Shift+V is local: pull the file/folder named on the
+        // remote clipboard. Do not forward the V key (Cmd+V alone is
+        // still a normal remote paste). Match the physical key so a
+        // Japanese/IME layout cannot hide the V.
+        let is_v = code == Some(KeyCode::KeyV)
+            || matches!(
+                logical,
+                Key::Character(s) if s.as_str().eq_ignore_ascii_case("v")
+            );
+        // Cmd+Shift+V is the advertised shortcut; Ctrl+Shift+V is a
+        // fallback for setups where another app owns Cmd+Shift+V.
+        if is_v
+            && self.modifiers.shift_key()
+            && (self.modifiers.super_key() || self.modifiers.control_key())
+        {
+            if pressed {
+                self.pull_from_remote();
+            }
+            return;
+        }
+        // Test shortcuts for gesture calibration on macOS: Ctrl+Alt+arrows
+        // emit a swipe; Ctrl+Alt+=/- emit a magnify.
+        if self.modifiers.control_key() && self.modifiers.alt_key() && pressed {
+            match logical {
+                Key::Named(NamedKey::ArrowLeft) => {
+                    self.send_swipe(1, 4);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowRight) => {
+                    self.send_swipe(1, 8);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowUp) => {
+                    self.send_swipe(2, 1);
+                    return;
+                }
+                Key::Named(NamedKey::ArrowDown) => {
+                    self.send_swipe(2, 2);
+                    return;
+                }
+                Key::Character(s) if s.as_str() == "=" || s.as_str() == "+" => {
+                    let (x, y) = self.cursor;
+                    self.send(gesture_magnify(0.1, 2, 0, x, y));
+                    return;
+                }
+                Key::Character(s) if s.as_str() == "-" => {
+                    let (x, y) = self.cursor;
+                    self.send(gesture_magnify(-0.1, 2, 0, x, y));
+                    return;
+                }
+                _ => {}
+            }
+        }
+        // With IME enabled, composed text arrives via Ime::Commit.
+        if self.ime && matches!(logical, Key::Character(_)) {
+            return;
+        }
+        // If the event reports modifiers we never forwarded (a
+        // dropped or reordered ModifiersChanged), put them down before
+        // the key and lift them again after it, in reverse order.
+        let needed = self.modifiers;
+        let synthesized = if pressed {
+            needed
+                & (ModifiersState::SHIFT
+                    | ModifiersState::CONTROL
+                    | ModifiersState::ALT
+                    | ModifiersState::SUPER)
+                & !self.forwarded_mods
+        } else {
+            ModifiersState::empty()
+        };
+        if !synthesized.is_empty() {
+            self.sync_modifiers(needed);
+        }
+        // Send the CHARACTER's keysym, not a US physical position:
+        // the server's keysym table is built from the *remote* layout
+        // (a JIS remote maps '\' to its Yen key and '[' to its own
+        // bracket key), so a US-position keysym lands on the wrong key.
+        // The server derives the keycode and Shift from the keysym,
+        // which is why Shift+2 must arrive as '"' and '@' as '@'.
+        match logical {
+            // Modifier keys are owned by `sync_modifiers`; winit also
+            // reports them as key events, which would double them.
+            Key::Named(
+                NamedKey::Shift
+                | NamedKey::Control
+                | NamedKey::Alt
+                | NamedKey::Super
+                | NamedKey::Meta,
+            ) => {}
+            Key::Named(named) => {
+                if let Some(ks) = named_keysym(named)
+                    .or_else(|| code.and_then(|code| self.keymap.special(code)))
+                {
+                    self.send(key_event(ks, pressed));
+                } else if pressed && !repeat {
+                    eprintln!(
+                        "key: unmapped named {named:?} (physical {:?})",
+                        code
+                    );
+                }
+            }
+            Key::Character(s) => {
+                for c in s.chars() {
+                    // TODO(JIS): the daemon has no keysym for the JIS
+                    // input keys; they need a keycode-space bypass,
+                    // not a guessed keysym.
+                    if let Some(code) = code {
+                        if is_unsupported_jis_code(code) {
+                            if pressed && !repeat {
+                                eprintln!(
+                                    "key: JIS input key {code:?} has no keysym in the daemon's table; not sent"
+                                );
+                            }
+                            continue;
+                        }
+                    }
+                    // Character first: winit already composed `c`
+                    // under the local layout, so ask the target layout
+                    // which position and shift level type it. The
+                    // server turns that into an ordinary keypress, so
+                    // remote IME composition is untouched. A bare
+                    // character keysym is only a logged last resort.
+                    let ks = character_keysym(
+                        self.keymap,
+                        code,
+                        c,
+                        self.modifiers.shift_key(),
+                    );
+                    let ks = ks.unwrap_or_else(|| {
+                        if pressed && !repeat {
+                            eprintln!(
+                                "key: no {} position for {c:?}; sending the Unicode keysym",
+                                self.keymap.name
+                            );
+                        }
+                        text_keysym(c)
+                    });
+                    self.send(key_event(ks, pressed));
+                }
+            }
+            // Dead keys and unidentified keys have no character; send
+            // the physical position so the remote can compose.
+            _ => match code.and_then(|code| {
+                self.keymap
+                    .wire_keysym(code, self.modifiers.shift_key())
+            }) {
+                Some(ks) => self.send(key_event(ks, pressed)),
+                None => {
+                    if pressed && !repeat {
+                        eprintln!(
+                            "key: unmapped physical {:?} (logical {:?})",
+                            code, logical
+                        );
+                    }
+                }
+            },
+        }
+        if !synthesized.is_empty() {
+            self.sync_modifiers(needed - synthesized);
         }
     }
 
@@ -1511,6 +1765,56 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_title(&status);
                 }
             }
+            #[cfg(target_os = "macos")]
+            UserEvent::Grab(event) => match event {
+                grab::GrabEvent::Key {
+                    keycode,
+                    chars,
+                    flags,
+                    pressed,
+                    repeat,
+                    modifier_only,
+                } => {
+                    self.modifiers = grab::modifiers_from_flags(flags);
+                    let target = self.modifiers;
+                    self.sync_modifiers(target);
+                    if modifier_only {
+                        return;
+                    }
+                    note_input();
+                    let code = grab::keycode_to_winit(keycode);
+                    let logical = grab::logical_for(keycode, chars.as_deref());
+                    if self.debug_input {
+                        eprintln!(
+                            "tap key {:?} code={code:?} logical={logical:?} mods={:?}",
+                            if pressed { "down" } else { "up" },
+                            self.modifiers
+                        );
+                    }
+                    self.handle_key(code, &logical, pressed, repeat);
+                }
+                grab::GrabEvent::Released { held } => {
+                    self.grab_suspended = true;
+                    eprintln!(
+                        "grab: released by the chord after {} ms; local shortcuts are back until the window loses and regains focus",
+                        held.as_millis()
+                    );
+                    self.modifiers = ModifiersState::empty();
+                    self.sync_modifiers(ModifiersState::empty());
+                    if let Some(w) = &self.window {
+                        w.set_title("ss-clone — grab released — click away to re-arm");
+                    }
+                }
+                grab::GrabEvent::HoldCancelled { held } => {
+                    eprintln!(
+                        "grab: release chord cancelled after {} ms (another key went down)",
+                        held.as_millis()
+                    );
+                }
+                grab::GrabEvent::Reenabled { reason } => {
+                    eprintln!("grab: macOS disabled the event tap ({reason}); re-enabled it");
+                }
+            },
         }
     }
 
@@ -1557,9 +1861,19 @@ impl ApplicationHandler<UserEvent> for App {
                 if self.debug_input {
                     eprintln!("window focused={focused}");
                 }
+                if let Some(grab) = &self.grab {
+                    if focused && !self.grab_suspended {
+                        grab.set_enabled(true);
+                        eprintln!("grab: enabled (window focused)");
+                    } else if !focused {
+                        grab.set_enabled(false);
+                        eprintln!("grab: disabled (window lost focus)");
+                    }
+                }
                 if !focused {
-                    // Never leave a modifier down on the remote when focus
-                    // leaves us mid-chord.
+                    // Re-arm the chord on the next focus, and never leave a
+                    // modifier down on the remote when focus leaves us.
+                    self.grab_suspended = false;
                     self.modifiers = ModifiersState::empty();
                     self.sync_modifiers(ModifiersState::empty());
                 }
@@ -1748,181 +2062,22 @@ impl ApplicationHandler<UserEvent> for App {
             }
             WindowEvent::KeyboardInput { event, .. } => {
                 note_input();
-                let pressed = event.state == ElementState::Pressed;
-                if event.repeat {
-                    return;
-                }
                 if self.debug_input {
                     eprintln!(
                         "key {:?} physical={:?} logical={:?} text={:?} mods={:?}",
                         event.state, event.physical_key, event.logical_key, event.text, self.modifiers
                     );
                 }
-                // Cmd+Shift+V is local: pull the file/folder named on the
-                // remote clipboard. Do not forward the V key (Cmd+V alone is
-                // still a normal remote paste). Match the physical key so a
-                // Japanese/IME layout cannot hide the V.
-                let is_v = matches!(event.physical_key, PhysicalKey::Code(KeyCode::KeyV))
-                    || matches!(
-                        &event.logical_key,
-                        Key::Character(s) if s.as_str().eq_ignore_ascii_case("v")
-                    );
-                // Cmd+Shift+V is the advertised shortcut; Ctrl+Shift+V is a
-                // fallback for setups where another app owns Cmd+Shift+V.
-                if is_v
-                    && self.modifiers.shift_key()
-                    && (self.modifiers.super_key() || self.modifiers.control_key())
-                {
-                    if pressed {
-                        self.pull_from_remote();
-                    }
-                    return;
-                }
-                // Test shortcuts for gesture calibration on macOS: Ctrl+Alt+arrows
-                // emit a swipe; Ctrl+Alt+=/- emit a magnify.
-                if self.modifiers.control_key() && self.modifiers.alt_key() && pressed {
-                    match &event.logical_key {
-                        Key::Named(NamedKey::ArrowLeft) => {
-                            self.send_swipe(1, 4);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowRight) => {
-                            self.send_swipe(1, 8);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowUp) => {
-                            self.send_swipe(2, 1);
-                            return;
-                        }
-                        Key::Named(NamedKey::ArrowDown) => {
-                            self.send_swipe(2, 2);
-                            return;
-                        }
-                        Key::Character(s) if s.as_str() == "=" || s.as_str() == "+" => {
-                            let (x, y) = self.cursor;
-                            self.send(gesture_magnify(0.1, 2, 0, x, y));
-                            return;
-                        }
-                        Key::Character(s) if s.as_str() == "-" => {
-                            let (x, y) = self.cursor;
-                            self.send(gesture_magnify(-0.1, 2, 0, x, y));
-                            return;
-                        }
-                        _ => {}
-                    }
-                }
-                // With IME enabled, composed text arrives via Ime::Commit.
-                if self.ime && matches!(&event.logical_key, Key::Character(_)) {
-                    return;
-                }
-                // If the event reports modifiers we never forwarded (a
-                // dropped or reordered ModifiersChanged), put them down before
-                // the key and lift them again after it, in reverse order.
-                let needed = self.modifiers;
-                let synthesized = if pressed {
-                    needed
-                        & (ModifiersState::SHIFT
-                            | ModifiersState::CONTROL
-                            | ModifiersState::ALT
-                            | ModifiersState::SUPER)
-                        & !self.forwarded_mods
-                } else {
-                    ModifiersState::empty()
-                };
-                if !synthesized.is_empty() {
-                    self.sync_modifiers(needed);
-                }
-                // Send the CHARACTER's keysym, not a US physical position:
-                // the server's keysym table is built from the *remote* layout
-                // (a JIS remote maps '\' to its Yen key and '[' to its own
-                // bracket key), so a US-position keysym lands on the wrong key.
-                // The server derives the keycode and Shift from the keysym,
-                // which is why Shift+2 must arrive as '"' and '@' as '@'.
                 let code = match event.physical_key {
                     PhysicalKey::Code(code) => Some(code),
                     PhysicalKey::Unidentified(_) => None,
                 };
-                match &event.logical_key {
-                    // Modifier keys are owned by `sync_modifiers`; winit also
-                    // reports them as key events, which would double them.
-                    Key::Named(
-                        NamedKey::Shift
-                        | NamedKey::Control
-                        | NamedKey::Alt
-                        | NamedKey::Super
-                        | NamedKey::Meta,
-                    ) => {}
-                    Key::Named(named) => {
-                        if let Some(ks) = named_keysym(named)
-                            .or_else(|| code.and_then(|code| self.keymap.special(code)))
-                        {
-                            self.send(key_event(ks, pressed));
-                        } else if pressed && !event.repeat {
-                            eprintln!(
-                                "key: unmapped named {named:?} (physical {:?})",
-                                event.physical_key
-                            );
-                        }
-                    }
-                    Key::Character(s) => {
-                        for c in s.chars() {
-                            // TODO(JIS): the daemon has no keysym for the JIS
-                            // input keys; they need a keycode-space bypass,
-                            // not a guessed keysym.
-                            if let Some(code) = code {
-                                if is_unsupported_jis_code(code) {
-                                    if pressed && !event.repeat {
-                                        eprintln!(
-                                            "key: JIS input key {code:?} has no keysym in the daemon's table; not sent"
-                                        );
-                                    }
-                                    continue;
-                                }
-                            }
-                            // Character first: winit already composed `c`
-                            // under the local layout, so ask the target layout
-                            // which position and shift level type it. The
-                            // server turns that into an ordinary keypress, so
-                            // remote IME composition is untouched. A bare
-                            // character keysym is only a logged last resort.
-                            let ks = character_keysym(
-                                self.keymap,
-                                code,
-                                c,
-                                self.modifiers.shift_key(),
-                            );
-                            let ks = ks.unwrap_or_else(|| {
-                                if pressed && !event.repeat {
-                                    eprintln!(
-                                        "key: no {} position for {c:?}; sending the Unicode keysym",
-                                        self.keymap.name
-                                    );
-                                }
-                                text_keysym(c)
-                            });
-                            self.send(key_event(ks, pressed));
-                        }
-                    }
-                    // Dead keys and unidentified keys have no character; send
-                    // the physical position so the remote can compose.
-                    _ => match code.and_then(|code| {
-                        self.keymap
-                            .wire_keysym(code, self.modifiers.shift_key())
-                    }) {
-                        Some(ks) => self.send(key_event(ks, pressed)),
-                        None => {
-                            if pressed && !event.repeat {
-                                eprintln!(
-                                    "key: unmapped physical {:?} (logical {:?})",
-                                    event.physical_key, event.logical_key
-                                );
-                            }
-                        }
-                    },
-                }
-                if !synthesized.is_empty() {
-                    self.sync_modifiers(needed - synthesized);
-                }
+                self.handle_key(
+                    code,
+                    &event.logical_key,
+                    event.state == ElementState::Pressed,
+                    event.repeat,
+                );
             }
             _ => {}
         }
@@ -2055,6 +2210,14 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn exiting(&mut self, _event_loop: &ActiveEventLoop) {
         self.report_input_latency("exit summary");
+        // Never leave a modifier down on the remote when we go away, and drop
+        // the local keyboard grab before the window is destroyed.
+        if let Some(grab) = &self.grab {
+            grab.set_enabled(false);
+            eprintln!("grab: disabled (shutdown)");
+        }
+        self.modifiers = ModifiersState::empty();
+        self.sync_modifiers(ModifiersState::empty());
         self.surface = None;
         self.window = None;
     }
@@ -2110,11 +2273,18 @@ fn main() -> Result<()> {
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
     let mut keymap_name: Option<String> = None;
+    // macOS keyboard grab (`grab.rs`).
+    let mut no_grab = false;
+    let mut release_chord: Option<String> = None;
     let mut exit_after_secs: Option<f64> = None;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
             "--host" if i + 1 < args.len() => {
                 host = args[i + 1].clone();
                 i += 2;
@@ -2187,6 +2357,14 @@ fn main() -> Result<()> {
             "--ime" => {
                 ime = true;
                 i += 1;
+            }
+            "--no-grab" => {
+                no_grab = true;
+                i += 1;
+            }
+            "--release-grab" if i + 1 < args.len() => {
+                release_chord = Some(args[i + 1].clone());
+                i += 2;
             }
             "--keymap" if i + 1 < args.len() => {
                 keymap_name = Some(args[i + 1].to_ascii_lowercase());
@@ -2270,6 +2448,62 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
+    #[cfg(target_os = "macos")]
+    let grab = if no_grab {
+        eprintln!("grab: disabled (--no-grab); local shortcuts stay local");
+        None
+    } else {
+        grab::request_permission();
+        let chord = match release_chord.as_deref() {
+            None => grab::Chord::default_hold(),
+            Some(spec) => match grab::parse_chord(spec) {
+                Ok(chord) => chord,
+                Err(error) => {
+                    eprintln!("--release-grab {spec:?}: {error}; using the default");
+                    grab::Chord::default_hold()
+                }
+            },
+        };
+        eprintln!(
+            "grab: keyboard captured while focused; {} to release",
+            chord.describe()
+        );
+        let proxy = std::sync::Mutex::new(proxy.clone());
+        match grab::start(
+            move |event| {
+                if let Ok(proxy) = proxy.lock() {
+                    let _ = proxy.send_event(UserEvent::Grab(event));
+                }
+            },
+            chord,
+        ) {
+            Ok(handle) => Some(handle),
+            Err(reason) => {
+                eprintln!("grab: cannot create the keyboard event tap: {reason}");
+                let exe = std::env::current_exe()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|_| "ss-gui".to_string());
+                eprintln!(
+                    "grab: grant Accessibility to this binary: System Settings > Privacy & Security > Accessibility -> + -> {exe}"
+                );
+                eprintln!(
+                    "grab: also add it under Privacy & Security > Input Monitoring if it is listed there"
+                );
+                eprintln!(
+                    "grab: continuing without the grab; keyboard shortcuts stay local"
+                );
+                None
+            }
+        }
+    };
+    #[cfg(not(target_os = "macos"))]
+    let grab: Option<GrabHandle> = {
+        if !no_grab {
+            eprintln!("grab: not available on this platform");
+        }
+        None
+    };
+
 
     eprintln!("connecting to {host}:{port} as {user}...");
     let mut session = AppleSession::connect(&host, port, &user, &password)?;
@@ -2821,6 +3055,7 @@ fn main() -> Result<()> {
         pull_pending.clone(),
         remote_path.clone(),
         keymap,
+        grab,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -2884,6 +3119,42 @@ mod tests {
         assert_eq!(JIS.row(KeyCode::IntlYen), Some(('\\', '|')));
     }
 
+
+    #[test]
+    fn usage_documents_every_flag() {
+        // Every flag literal in the argument parser must appear in USAGE:
+        // adding a parser arm without documenting it fails here.
+        let src = include_str!("main.rs");
+        let start = src
+            .find("let args: Vec<String> = std::env::args")
+            .expect("argument parser not found");
+        let end = src[start..]
+            .find("// Apple's client is push-based")
+            .map(|offset| start + offset)
+            .expect("end of the argument parser not found");
+        let parser = &src[start..end];
+        let mut missing = Vec::new();
+        for line in parser.lines() {
+            let mut rest = line;
+            while let Some(start) = rest.find('"') {
+                rest = &rest[start + 1..];
+                let Some(end) = rest.find('"') else { break };
+                let lit = &rest[..end];
+                rest = &rest[end + 1..];
+                let is_flag = lit.starts_with("--")
+                    && lit.len() > 2
+                    && lit[2..]
+                        .chars()
+                        .all(|c| c.is_ascii_lowercase() || c == '-');
+                if is_flag && !USAGE.contains(lit) {
+                    missing.push(lit.to_string());
+                }
+            }
+        }
+        missing.sort();
+        missing.dedup();
+        assert!(missing.is_empty(), "flags missing from USAGE: {missing:?}");
+    }
     #[test]
     fn named_and_ime_keysyms_unchanged() {
         assert_eq!(named_keysym(&NamedKey::Enter), Some(0xff0d));

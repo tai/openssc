@@ -1,8 +1,17 @@
-# AGENTS.md — `ss-clone` — **v1.4.0**
+# AGENTS.md — `ss-clone` — **v1.4.1**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.4.1 — 2026-11-05.** Local shortcuts now go to the remote. While the
+> ss-gui window is focused a session-level `CGEventTap` captures the keyboard, so
+> `Ctrl+Space` (input source), `Cmd+Space`, `Cmd+Tab` and the rest reach the
+> remote instead of being eaten by macOS. Hold **Left Cmd+Shift for 350 ms** to
+> give them back — a modifier-only chord needs the hold, or `Cmd+Shift+V` would
+> release the grab on its way through. It needs Accessibility permission and
+> falls back to ungrabbed operation without it; the pointer is deliberately not
+> grabbed. `--help` exists now.
 
 > **v1.4.0 — 2026-11-05.** Japanese JIS keyboards now type correctly. The client
 > used to translate a character into a US physical key plus Shift; on JIS that is
@@ -54,11 +63,12 @@ contradicts this document, update this document in the same change.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** v1.4.0 on macOS. Live GUI, keyboard/pointer input (with
+- **Current phase:** v1.4.1 on macOS. Live GUI, keyboard/pointer input (with
   correct modifier forwarding), gesture backend, remote cursor, automatic duplex
   clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
-  pull), JIS keyboard support with layout tables, and MVS with **server push as
-  the default** including the full push vocabulary. Next: **Linux/Wayland packaging** — still the actual target
+  pull), JIS keyboard support with layout tables, keyboard grab so local
+  shortcuts reach the remote, and MVS with **server push as the default**
+  including the full push vocabulary. Next: **Linux/Wayland packaging** — still the actual target
   platform and still unwalked — then swipe semantic calibration and frame pacing.
 - **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
 
@@ -594,6 +604,19 @@ client plus a pcap and experiment note.
 ---
 
 ## 13. Current status snapshot
+
+### v1.4.1 — 2026-11-05
+
+- **Keyboard grab**: a `CGEventTap` consumes key events while the window is
+  focused and routes them through the same key mapping as winit, so global
+  shortcuts reach the remote. Release by holding Left Cmd+Shift 350 ms
+  (`--release-grab`), which passes through and is never forwarded. Pointer
+  deliberately not grabbed. Needs Accessibility/Input Monitoring; without it the
+  app logs the pane and runs ungrabbed. The tap re-enables itself if macOS
+  disables it, and every release path sends modifier key-ups.
+- **`--help` / `-h`** for ss-gui with grouped usage and a test that fails if a
+  parser flag is missing from the text. `ss-client` usage updated.
+- Not in v1.4.1: pointer grabbing, JIS-specific keys (no keysym exists), Wayland.
 
 ### v1.4.0 — 2026-11-05
 

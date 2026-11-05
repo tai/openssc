@@ -13,3 +13,7 @@ rfb-proto = { path = "../rfb-proto" }
 sha1 = "0.10"
 winit = "0.30"
 softbuffer = "0.4"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.9"
+core-graphics = "0.23"

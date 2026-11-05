@@ -306,6 +306,38 @@ flag, which silently turned `Option+Cmd+C` into `Cmd+C`. Shift is not forwarded
 for printable keys (the character carries case) and is synthesised only where an
 unshifted key needs it.
 
+## 7. Keyboard grab (macOS) — local shortcuts belong to the remote
+
+While the ss-gui window is focused, a session-level `CGEventTap`
+(`kCGSessionEventTap`, consume-capable) takes keyDown/keyUp/flagsChanged and
+routes them to the remote instead of letting macOS handle them. Without this,
+global shortcuts are consumed by the window server before any app sees them:
+`Ctrl+Space` switches the local input source, `Cmd+Space` opens Spotlight,
+`Cmd+Tab` switches apps — and the remote never receives them.
+
+Consumed events are translated through the same key-mapping code as winit events
+(virtual keycode → the layout tables, composed character from
+`CGEventKeyboardGetUnicodeString`), so there is one place that decides what goes
+on the wire. `--debug-input` prints them as `tap key ...`, distinct from winit's
+`key ...`, which makes it obvious which path delivered a key.
+
+- **Release chord**: hold **Left Command + Shift for 350 ms**. A modifier-only
+  chord needs the hold, otherwise `Cmd+Shift+V` (pull from remote),
+  `Cmd+Shift+3/4/5`, `Cmd+Shift+Z` and friends would drop the grab on their way
+  to the remote. Any third key or extra modifier cancels the countdown.
+  `--release-grab` overrides it. After it fires the grab stays off until the
+  window loses and regains focus — deliberately, and because a disabled tap
+  cannot observe the chord to toggle back.
+- **Pointer is not grabbed.** Doing so would break winit's mouse handling,
+  click-to-focus (the way out of the session) and the local cursor.
+- **Permission**: needs Accessibility / Input Monitoring. `AXIsProcessTrusted`
+  is checked once and the prompt requested; if it is refused the app logs the
+  exact System Settings pane and runs **without** the grab rather than failing.
+- **Safety**: `kCGEventTapDisabledByTimeout`/`ByUserInput` re-enable the tap and
+  log (a silent disable looks like "keys stopped working"); every release path
+  sends modifier key-ups so nothing sticks on the remote; `--no-grab` disables
+  the subsystem.
+
 ## 5. Calibration notes / open questions
 
 ### 5.1 Two-finger scroll — VERIFIED (2026-11-03, `mm.local` TextEdit)

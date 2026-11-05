@@ -1,5 +1,26 @@
 # Protocol status / agent handoff
 
+## 2026-11-05 — **v1.4.1**: keyboard grab, `--help` (VERIFIED)
+
+- Phase / milestone: local shortcuts now reach the remote.
+- Verified: with the window focused a session-level `CGEventTap` consumes
+  keyDown/keyUp/flagsChanged and routes them through the same key mapping as
+  winit; `--debug-input` shows 12 `tap key` events for a 6-character test. Focus
+  loss disables the tap and focus re-enables it; shutdown releases it.
+- Release chord: hold **Left Cmd+Shift 350 ms** (modifier-only chords need the
+  hold so `Cmd+Shift+V`, `Cmd+Shift+3/4/5` etc. do not drop the grab on the way
+  through). `--release-grab` overrides.
+- Needs Accessibility/Input Monitoring; without it the app logs the pane and
+  runs ungrabbed rather than failing. Pointer is deliberately NOT grabbed.
+- Also: `--help`/`-h` in ss-gui (exit 0, grouped usage), with a test that fails
+  if a parser flag is missing from the text; unknown flags still exit 2.
+  `ss-client`'s usage brought up to date.
+- Changed: new `crates/ss-gui/src/grab.rs` (tap, chords, keycode mapping,
+  permission); main.rs routes tap events and prints usage.
+- Open: mouse-grab not implemented (by choice); JIS-specific keys still have no
+  keysym; `cmd 200` frames; Wayland packaging.
+- Lab state: `mm.local` healthy, no client running.
+
 ## 2026-11-05 — **v1.4.0**: JIS keyboard (VERIFIED)
 
 - Phase / milestone: input fidelity on a Japanese keyboard.
