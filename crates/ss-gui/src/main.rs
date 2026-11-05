@@ -124,10 +124,14 @@ fn scroll_message(
     let whole_y = total.1.trunc();
     let lx = whole_x.clamp(-40.0, 40.0) as i16;
     let ly = whole_y.clamp(-40.0, 40.0) as i16;
-    // Carry the sub-line remainder into the next event. Without this, every
-    // event restarts from zero and a slow drag never accumulates enough to
-    // move at all - which is exactly the "small motion does nothing" report.
-    let carried = (total.0 - whole_x, total.1 - whole_y);
+    // The whole delta goes out in `fixed`, which the server accumulates, so
+    // carrying a remainder here would count the same motion twice (measured:
+    // carrying + fixed=total moved a 5-line drag 10 lines). MEASURED rule:
+    // when `fixed` is non-zero the server uses it and IGNORES the line field
+    // (line=4+fixed=1 moved 1 line; line=4+fixed=4 moved 4; fixed=0 uses the
+    // line field), so both fields carry the same total and the fraction is
+    // never lost.
+    let carried = (0.0, 0.0);
     // `fixedDelta` is in 16.16 fixed point and is the only channel that
     // carries sub-line motion. MEASURED matrix (30 points of finger travel,
     // TextEdit on mm.local):
@@ -907,8 +911,12 @@ struct App {
     scroll_velocity: (f32, f32),
     /// When the previous scroll sample arrived.
     scroll_sample_at: Instant,
-    /// `--scroll-test`: scripted flick to exercise the glide without a pad.
-    scroll_test: bool,
+    /// When the current scroll gesture began (Began phase), for the flick test.
+    scroll_gesture_start: Option<Instant>,
+    /// `--scroll-test stop`: when to send the touch that stops the glide.
+    scroll_stop_at: Option<Instant>,
+    /// `--scroll-test`: scripted gesture to exercise the scroll model.
+    scroll_test: String,
     /// Open pinch/rotate gesture and when it last saw input.
     pinch_active: bool,
     pinch_last: Option<Instant>,
@@ -948,7 +956,7 @@ impl App {
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
         keymap: &'static Keymap,
         grab: Option<GrabHandle>,
-        scroll_test: bool,
+        scroll_test: String,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -1009,6 +1017,8 @@ impl App {
             scroll_momentum: Momentum::new(),
             scroll_velocity: (0.0, 0.0),
             scroll_sample_at: Instant::now(),
+            scroll_gesture_start: None,
+            scroll_stop_at: None,
             pinch_active: false,
             pinch_last: None,
             rotate_active: false,
@@ -1374,9 +1384,16 @@ impl App {
         }
         self.scroll_sample_at = now;
         match phase {
-            Phase::Began | Phase::Changed => self.scroll_momentum.stop(),
+            Phase::Began => {
+                self.scroll_momentum.stop();
+                self.scroll_gesture_start = Some(now);
+            }
+            Phase::Changed => self.scroll_momentum.stop(),
             Phase::Ended => {}
-            Phase::Cancelled => self.scroll_momentum.stop(),
+            Phase::Cancelled => {
+                self.scroll_momentum.stop();
+                self.scroll_gesture_start = None;
+            }
         }
         let pending = self.scroll_pending.get_or_insert(PendingScroll {
             dx: 0.0,
@@ -1401,9 +1418,17 @@ impl App {
         }
         if phase == Phase::Ended {
             let (vx, vy) = self.scroll_velocity;
-            if self.scroll_momentum.start(vx, vy, now) && self.debug_input {
+            let gesture = self
+                .scroll_gesture_start
+                .take()
+                .map(|start| now.duration_since(start))
+                .unwrap_or_default();
+            let speed = (vx * vx + vy * vy).sqrt();
+            let started = self.scroll_momentum.start(vx, vy, gesture, now);
+            if self.debug_input {
                 eprintln!(
-                    "scroll momentum start v=({vx:.0},{vy:.0}) pt/s"
+                    "scroll release v=({vx:.0},{vy:.0}) speed={speed:.0} pt/s gesture={} ms -> momentum={started}",
+                    gesture.as_millis()
                 );
             }
         }
@@ -2374,34 +2399,60 @@ impl ApplicationHandler<UserEvent> for App {
         }
         // The post-release glide: one line per step at a decaying rate.
         let now = Instant::now();
-        if self.scroll_test
+        if !self.scroll_test.is_empty()
             && now >= *START.get_or_init(Instant::now) + Duration::from_secs(3)
         {
-            self.scroll_test = false;
-            eprintln!("scroll test: scripted flick");
+            let kind = std::mem::take(&mut self.scroll_test);
+            eprintln!("scroll test: {kind}");
             // Put the remote pointer over the target document; synthetic
             // local mouse moves do not reach winit in this environment.
             self.cursor = (600, 400);
             self.send(pointer_event(0, 600, 400));
             thread::sleep(Duration::from_millis(80));
-            // Click so the target window is active, then move back.
             self.send(pointer_event(1, 600, 400));
             thread::sleep(Duration::from_millis(60));
             self.send(pointer_event(0, 600, 400));
             thread::sleep(Duration::from_millis(120));
-            let flick = |dx: f32, dy: f32, phase: Phase| Gesture::Scroll {
-                dx,
+            let step = |dy: f32, phase: Phase| Gesture::Scroll {
+                dx: 0.0,
                 dy,
                 phase,
                 precise: true,
                 momentum: None,
             };
-            self.queue_scroll(flick(0.0, 0.0, Phase::Began));
-            for _ in 0..10 {
-                self.queue_scroll(flick(0.0, -40.0, Phase::Changed));
+            // points per event, events, and whether a touch stops the glide.
+            let (per_event, events, stop_after) = match kind.as_str() {
+                "drag" => (3.0, 20, false),
+                "medium" => (10.0, 20, false),
+                "stop" => (40.0, 10, true),
+                _ => (40.0, 10, false),
+            };
+            self.queue_scroll(step(0.0, Phase::Began));
+            for _ in 0..events {
+                self.queue_scroll(step(-per_event, Phase::Changed));
                 thread::sleep(Duration::from_millis(16));
             }
-            self.queue_scroll(flick(0.0, 0.0, Phase::Ended));
+            self.queue_scroll(step(0.0, Phase::Ended));
+            if stop_after {
+                // Do not block the event loop: the glide is ticked from
+                // about_to_wait, so the touch is scheduled instead of slept.
+                self.scroll_stop_at = Some(Instant::now() + Duration::from_millis(250));
+            }
+        }
+        if let Some(at) = self.scroll_stop_at {
+            if Instant::now() >= at {
+                self.scroll_stop_at = None;
+                eprintln!("scroll test: touch to stop the glide");
+                self.queue_scroll(Gesture::Scroll {
+                    dx: 0.0,
+                    dy: 0.0,
+                    phase: Phase::Began,
+                    precise: true,
+                    momentum: None,
+                });
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
         }
         while let Some(gesture) = self.scroll_momentum.tick(Instant::now()) {
             self.emit_scroll(&gesture, true);
@@ -2551,8 +2602,9 @@ fn main() -> Result<()> {
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
     let mut keymap_name: Option<String> = None;
-    // Lab hook: scripted flick for measuring the scroll glide.
-    let mut scroll_test = false;
+    // Lab hook: scripted gesture for measuring the scroll model
+    // (`flick`, `drag`, `medium`, `stop`).
+    let mut scroll_test = String::new();
     // macOS keyboard grab (`grab.rs`).
     let mut no_grab = false;
     let mut release_chord: Option<String> = None;
@@ -2638,9 +2690,9 @@ fn main() -> Result<()> {
                 ime = true;
                 i += 1;
             }
-            "--scroll-test" => {
-                scroll_test = true;
-                i += 1;
+            "--scroll-test" if i + 1 < args.len() => {
+                scroll_test = args[i + 1].clone();
+                i += 2;
             }
             "--no-grab" => {
                 no_grab = true;

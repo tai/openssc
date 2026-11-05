@@ -33,27 +33,32 @@ pub const SCROLL_POINTS_PER_LINE: f32 = 12.0;
 
 /// Inertia after the fingers lift.
 ///
-/// The server truncates every scroll delta to whole lines and never generates
-/// momentum itself, so the glide is a decaying *rate* of one-line steps: a
-/// decaying amplitude would round to zero.
-pub const MOMENTUM_START_HZ: f32 = 90.0;
-/// Each step lengthens the interval by this factor.
-pub const MOMENTUM_RATE_DECAY: f32 = 0.72;
-/// Stop when the step rate falls below this.
-pub const MOMENTUM_MIN_HZ: f32 = 8.0;
+/// The owner's model: momentum is for a *flick* only. It requires both a high
+/// release velocity and a short gesture; a deliberate drag or a pause-then-
+/// release must not glide. The glide decays the VELOCITY and sends its
+/// integral (sub-line, via the 16.16 fixed field), so the tail is smooth
+/// rather than a series of whole-line steps.
+pub const MOMENTUM_MIN_SPEED: f32 = 1200.0;
+/// A gesture longer than this is a drag, not a flick.
+pub const MOMENTUM_MAX_GESTURE: std::time::Duration = std::time::Duration::from_millis(280);
+/// Glide tick interval (~60 Hz).
+pub const MOMENTUM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
+/// Velocity e-folding rate: v *= exp(-DECAY * dt).
+pub const MOMENTUM_DECAY_PER_SEC: f32 = 5.0;
+/// Stop the glide when the decaying speed drops below this (points/second).
+pub const MOMENTUM_STOP_SPEED: f32 = 40.0;
 /// Hard stop, so a flick cannot glide forever.
-pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1100);
-/// Below this finger speed (points/second) a release does not glide.
-pub const MOMENTUM_MIN_SPEED: f32 = 120.0;
+pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1200);
 
 /// Drives the post-release glide. Portable: any backend that knows the last
-/// scroll velocity can start it, and the GUI ticks it.
+/// scroll velocity and how long the gesture lasted can start it, and the GUI
+/// ticks it.
 #[derive(Debug)]
 pub struct Momentum {
-    dir: (i32, i32),
+    v: (f32, f32),
     active: bool,
+    last: std::time::Instant,
     next_at: std::time::Instant,
-    interval: std::time::Duration,
     deadline: std::time::Instant,
 }
 
@@ -67,29 +72,32 @@ impl Momentum {
     pub fn new() -> Self {
         let now = std::time::Instant::now();
         Self {
-            dir: (0, 0),
+            v: (0.0, 0.0),
             active: false,
+            last: now,
             next_at: now,
-            interval: std::time::Duration::from_millis(11),
             deadline: now,
         }
     }
 
-    /// Start a glide from the last scroll velocity (points per second).
-    /// Returns false when the release was too slow to deserve one.
-    pub fn start(&mut self, vx: f32, vy: f32, now: std::time::Instant) -> bool {
+    /// Start a glide from the release velocity (points/second) and the
+    /// gesture duration. Returns false for a slow release or a long drag.
+    pub fn start(
+        &mut self,
+        vx: f32,
+        vy: f32,
+        gesture: std::time::Duration,
+        now: std::time::Instant,
+    ) -> bool {
         let speed = (vx * vx + vy * vy).sqrt();
-        if speed < MOMENTUM_MIN_SPEED {
+        if speed < MOMENTUM_MIN_SPEED || gesture > MOMENTUM_MAX_GESTURE {
             self.active = false;
             return false;
         }
-        self.dir = (
-            if vx.abs() > speed * 0.2 { vx.signum() as i32 } else { 0 },
-            if vy.abs() > speed * 0.2 { vy.signum() as i32 } else { 0 },
-        );
+        self.v = (vx, vy);
         self.active = true;
-        self.interval = std::time::Duration::from_secs_f32(1.0 / MOMENTUM_START_HZ);
-        self.next_at = now + self.interval;
+        self.last = now;
+        self.next_at = now + MOMENTUM_TICK;
         self.deadline = now + MOMENTUM_MAX;
         true
     }
@@ -106,29 +114,36 @@ impl Momentum {
         self.active.then_some(self.next_at)
     }
 
-    /// Emit the next glide step if one is due: exactly one line, in the
-    /// direction of the flick, at the current (decaying) rate.
+    /// Emit the velocity's integral since the last tick, then decay it. The
+    /// delta is in points, so the synthesis sends sub-line motion through the
+    /// fixed field instead of whole-line steps.
     pub fn tick(&mut self, now: std::time::Instant) -> Option<Gesture> {
         if !self.active || now < self.next_at {
             return None;
         }
-        if now >= self.deadline {
-            self.active = false;
-            return None;
-        }
-        self.interval = std::time::Duration::from_secs_f32(
-            self.interval.as_secs_f32() / MOMENTUM_RATE_DECAY,
-        );
-        self.next_at = now + self.interval;
-        if 1.0 / self.interval.as_secs_f32() < MOMENTUM_MIN_HZ {
+        let dt = now
+            .duration_since(self.last)
+            .as_secs_f32()
+            .clamp(0.001, 0.05);
+        let (dx, dy) = (self.v.0 * dt, self.v.1 * dt);
+        let decay = (-MOMENTUM_DECAY_PER_SEC * dt).exp();
+        self.v = (self.v.0 * decay, self.v.1 * decay);
+        self.last = now;
+        self.next_at = now + MOMENTUM_TICK;
+        if (self.v.0 * self.v.0 + self.v.1 * self.v.1).sqrt() < MOMENTUM_STOP_SPEED
+            || now >= self.deadline
+        {
             self.active = false;
         }
         Some(Gesture::Scroll {
-            dx: self.dir.0 as f32 * SCROLL_POINTS_PER_LINE,
-            dy: self.dir.1 as f32 * SCROLL_POINTS_PER_LINE,
+            dx,
+            dy,
             phase: Phase::Changed,
             precise: true,
-            momentum: Some(Phase::Changed),
+            // Keep momentumPhase zero on the wire: this server ignores a
+            // scroll message that carries one (measured: a 42-line glide
+            // applied 0 lines with it set, and lands when it is cleared).
+            momentum: None,
         })
     }
 }
@@ -484,41 +499,49 @@ mod momentum_tests {
     use std::time::{Duration, Instant};
 
     #[test]
-    fn glide_is_a_decaying_rate_of_one_line_steps() {
+    fn a_flick_glides_with_a_decaying_sub_line_integral() {
         let mut m = Momentum::new();
         let t0 = Instant::now();
-        assert!(m.start(0.0, -600.0, t0));
-        let mut steps = 0;
-        let mut times = Vec::new();
+        assert!(m.start(0.0, -2400.0, Duration::from_millis(160), t0));
+        let mut total = 0.0f32;
         let mut now = t0;
-        // Advance in 1 ms slices for 2 s; count the steps and their spacing.
+        let mut ticks = 0;
         for _ in 0..2000 {
             now += Duration::from_millis(1);
-            if let Some(g) = m.tick(now) {
-                match g {
-                    Gesture::Scroll { dx, dy, phase, momentum, .. } => {
-                        assert_eq!(dx, 0.0);
-                        assert_eq!(dy, -SCROLL_POINTS_PER_LINE);
-                        assert_eq!(phase, Phase::Changed);
-                        assert_eq!(momentum, Some(Phase::Changed));
-                    }
-                    _ => panic!("momentum must emit scroll"),
-                }
-                times.push(now);
-                steps += 1;
+            if let Some(Gesture::Scroll { dy, phase, momentum, .. }) = m.tick(now) {
+                assert_eq!(phase, Phase::Changed);
+                assert_eq!(momentum, None);
+                assert!(dy < 0.0 && dy > -SCROLL_POINTS_PER_LINE * 10.0, "dy={dy}");
+                total += dy;
+                ticks += 1;
             }
         }
-        assert!(steps >= 5, "expected a glide, got {steps} steps");
+        assert!(ticks >= 10, "expected a glide, got {ticks} ticks");
         assert!(!m.active(), "the glide must stop");
-        // Each interval is longer than the last (decaying rate).
-        let gaps: Vec<_> = times.windows(2).map(|w| w[1] - w[0]).collect();
-        assert!(gaps.windows(2).all(|w| w[1] >= w[0]), "rate must decay: {gaps:?}");
+        // Integral of v0*exp(-k t) = v0/k, independent of the tick rate.
+        let expected = -2400.0 / MOMENTUM_DECAY_PER_SEC;
+        assert!(
+            (total - expected).abs() < expected.abs() * 0.25,
+            "glide distance {total} should be near {expected}"
+        );
     }
 
     #[test]
-    fn a_slow_release_does_not_glide() {
+    fn a_slow_release_or_a_long_drag_does_not_glide() {
         let mut m = Momentum::new();
-        assert!(!m.start(10.0, 10.0, Instant::now()));
-        assert!(m.tick(Instant::now() + Duration::from_secs(1)).is_none());
+        let now = Instant::now();
+        assert!(!m.start(0.0, -200.0, Duration::from_millis(160), now));
+        assert!(!m.start(0.0, -2400.0, Duration::from_millis(600), now));
+        assert!(m.tick(now + Duration::from_secs(1)).is_none());
+    }
+
+    #[test]
+    fn stopping_is_immediate() {
+        let mut m = Momentum::new();
+        let t0 = Instant::now();
+        assert!(m.start(0.0, -2400.0, Duration::from_millis(160), t0));
+        m.tick(t0 + Duration::from_millis(16));
+        m.stop();
+        assert!(m.tick(t0 + Duration::from_millis(32)).is_none());
     }
 }
