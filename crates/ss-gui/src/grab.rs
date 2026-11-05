@@ -515,9 +515,39 @@ pub struct Grab {
     shared: Arc<Shared>,
 }
 
+/// Last time the application proved it was alive, in milliseconds since the
+/// process started. The tap watchdog uses it so a wedged app cannot keep the
+/// keyboard captured.
+static APP_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Whether the keyboard is currently captured. Mirrors `Shared::enabled` so
+/// the event loop can ask without holding the handle.
+static GRAB_ACTIVE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn is_active() -> bool {
+    GRAB_ACTIVE.load(Ordering::Relaxed)
+}
+
+/// Called from the event loop and the session reader. Cheap enough to call
+/// on every wake-up.
+pub fn beat() {
+    APP_HEARTBEAT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+    START.get_or_init(std::time::Instant::now).elapsed().as_millis() as u64
+}
+
+/// If the application stops ticking for this long while the keyboard is
+/// captured, the grab is released. A keyboard grab that outlives its
+/// application is a lockout: the user cannot even type the release chord.
+const WATCHDOG_STALL: std::time::Duration = std::time::Duration::from_millis(3000);
+
 impl Grab {
     pub fn set_enabled(&self, on: bool) {
         self.shared.enabled.store(on, Ordering::SeqCst);
+        GRAB_ACTIVE.store(on, Ordering::SeqCst);
         let tap = self.shared.tap.load(Ordering::SeqCst);
         if tap != 0 {
             unsafe { CGEventTapEnable(tap as CFMachPortRef, on) };
@@ -603,6 +633,34 @@ where
         return Err("CGEventTapCreate returned NULL (permission)".to_string());
     }
     shared.tap.store(tap as usize, Ordering::SeqCst);
+
+    // Watchdog: an unresponsive app must not keep the keyboard. Runs on its
+    // own thread and only touches atomics plus the tap handle, never the app.
+    {
+        let watch = Arc::clone(&shared);
+        std::thread::Builder::new()
+            .name("grab-watchdog".to_string())
+            .spawn(move || loop {
+                std::thread::sleep(std::time::Duration::from_millis(500));
+                if !watch.enabled.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let beat = APP_HEARTBEAT_MS.load(Ordering::Relaxed);
+                let now = now_ms();
+                if now.saturating_sub(beat) > WATCHDOG_STALL.as_millis() as u64 {
+                    eprintln!(
+                        "grab: application stalled for {} ms; releasing the keyboard so it cannot be a lockout",
+                        now.saturating_sub(beat)
+                    );
+                    watch.enabled.store(false, Ordering::SeqCst);
+                    let tap = watch.tap.load(Ordering::SeqCst);
+                    if tap != 0 {
+                        unsafe { CGEventTapEnable(tap as CFMachPortRef, false) };
+                    }
+                }
+            })
+            .ok();
+    }
 
     let thread_shared = Arc::clone(&shared);
     let tap_addr = tap as usize;

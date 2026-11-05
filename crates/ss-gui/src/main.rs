@@ -5,7 +5,7 @@
 //! events into RFB/Apple messages and presents BGRX frames.
 
 use anyhow::Result;
-use gesture_input::{Gesture, Momentum, Phase, SCROLL_POINTS_PER_LINE};
+use gesture_input::{AxisFilter, Gesture, Momentum, Phase, SCROLL_POINTS_PER_LINE};
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
@@ -498,7 +498,7 @@ Lab and debugging:
   --exit-after-dump        exit once the dump is written
   --exit-after-secs <s>    exit after s seconds
   --debug-input            trace input, clipboard, keys and framebuffer timing
-  --scroll-test            scripted flick that exercises the scroll glide
+  --scroll-test <kind>     scripted gesture for the scroll model
   --demo-cursor            scripted pointer tour that dumps a PNG per cursor shape
   -h, --help               show this message and exit
 ";
@@ -672,10 +672,14 @@ fn set_local_clipboard_image(uti: &str, data: &[u8]) {
             "set the clipboard to (read (POSIX file \"{}\") as «class {class}»)",
             path.display()
         );
-        let _ = std::process::Command::new("osascript")
-            .arg("-e")
-            .arg(script)
-            .status();
+        // Do not wait here: a blocked osascript (TCC prompt, busy pasteboard)
+        // must not stall the thread that pumps framebuffer updates.
+        std::thread::spawn(move || {
+            let _ = std::process::Command::new("osascript")
+                .arg("-e")
+                .arg(script)
+                .status();
+        });
     }
     #[cfg(not(target_os = "macos"))]
     {
@@ -708,16 +712,22 @@ fn set_local_clipboard(text: &str) {
     #[cfg(not(target_os = "macos"))]
     let (cmd, args): (&str, &[&str]) = ("wl-copy", &[]);
 
-    if let Ok(mut child) = std::process::Command::new(cmd)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .spawn()
-    {
-        if let Some(mut stdin) = child.stdin.take() {
-            let _ = stdin.write_all(text.as_bytes());
+    // Never wait on this here: a clipboard subprocess that blocks (a TCC
+    // prompt, a busy pasteboard server) must not stall the thread that pumps
+    // framebuffer updates. That stall is what made the window look frozen.
+    let text = text.to_string();
+    std::thread::spawn(move || {
+        if let Ok(mut child) = std::process::Command::new(cmd)
+            .args(args)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+        {
+            if let Some(mut stdin) = child.stdin.take() {
+                let _ = stdin.write_all(text.as_bytes());
+            }
+            let _ = child.wait();
         }
-        let _ = child.wait();
-    }
+    });
 }
 
 fn write_png(path: &str, width: u16, height: u16, bgrx: &[u32]) -> Result<()> {
@@ -907,6 +917,11 @@ struct App {
     scroll_last: Instant,
     /// Post-release glide, driven by the last scroll velocity.
     scroll_momentum: Momentum,
+    /// Continuous axis weighting from recent motion (no mode, no latch).
+    scroll_axis: AxisFilter,
+    /// Whether the glide was running on the previous frame (to reset history
+    /// when it ends).
+    scroll_gliding: bool,
     /// Last scroll velocity in points per second (for the glide).
     scroll_velocity: (f32, f32),
     /// When the previous scroll sample arrived.
@@ -1015,6 +1030,8 @@ impl App {
             scroll_pending: None,
             scroll_last: Instant::now(),
             scroll_momentum: Momentum::new(),
+            scroll_axis: AxisFilter::new(),
+            scroll_gliding: false,
             scroll_velocity: (0.0, 0.0),
             scroll_sample_at: Instant::now(),
             scroll_gesture_start: None,
@@ -1395,6 +1412,25 @@ impl App {
                 self.scroll_gesture_start = None;
             }
         }
+        if phase == Phase::Began {
+            self.scroll_axis.begin();
+        }
+        // Continuous axis weighting: the minor axis is scaled by how much of
+        // the recent motion it represents, so jitter disappears while a
+        // diagonal or a direction change still works.
+        let (dx, dy) = self.scroll_axis.apply(dx, dy, now);
+        if self.debug_input {
+            if let Some(t) = self.scroll_axis.take_transition() {
+                eprintln!(
+                    "scroll axis {} -> {} (ratio {:.2}, minor {:.1} pt/event, dwell {} ms)",
+                    t.from.name(),
+                    t.to.name(),
+                    t.ratio,
+                    t.minor_ema,
+                    t.dwell_ms
+                );
+            }
+        }
         let pending = self.scroll_pending.get_or_insert(PendingScroll {
             dx: 0.0,
             dy: 0.0,
@@ -1469,7 +1505,8 @@ impl App {
             } = *gesture
             {
                 eprintln!(
-                    "scroll raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) fixed=({},{}) phase={} precise={} momentum={from_momentum} speed={:.2}",
+                    "scroll t={} ms raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) fixed=({},{}) phase={} precise={} momentum={from_momentum} speed={:.2}",
+                    START.get_or_init(Instant::now).elapsed().as_millis(),
                     dx.round() as i32,
                     dy.round() as i32,
                     lines.0,
@@ -2337,6 +2374,7 @@ impl ApplicationHandler<UserEvent> for App {
     }
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
+        grab::beat();
         if !self.focused_once {
             if let Some(w) = &self.window {
                 w.focus_window();
@@ -2425,11 +2463,36 @@ impl ApplicationHandler<UserEvent> for App {
                 "drag" => (3.0, 20, false),
                 "medium" => (10.0, 20, false),
                 "stop" => (40.0, 10, true),
+                "hardflick" => (80.0, 10, false),
+                "jitter" => (10.0, 20, false),
+                "diagonal" => (10.0, 20, false),
+                "turn" => (10.0, 38, false),
                 _ => (40.0, 10, false),
             };
             self.queue_scroll(step(0.0, Phase::Began));
-            for _ in 0..events {
-                self.queue_scroll(step(-per_event, Phase::Changed));
+            for i in 0..events {
+                let (dx, dy) = match kind.as_str() {
+                    // Mostly vertical with deliberate sideways jitter.
+                    "jitter" => (if i % 2 == 0 { 3.0 } else { -3.0 }, -per_event),
+                    // Equal both ways.
+                    "diagonal" => (-per_event, -per_event),
+                    // Vertical for the first half, then a deliberate turn.
+                    "turn" => {
+                        if i < 19 {
+                            (0.0, -per_event)
+                        } else {
+                            (-per_event, 0.0)
+                        }
+                    }
+                    _ => (0.0, -per_event),
+                };
+                self.queue_scroll(Gesture::Scroll {
+                    dx,
+                    dy,
+                    phase: Phase::Changed,
+                    precise: true,
+                    momentum: None,
+                });
                 thread::sleep(Duration::from_millis(16));
             }
             self.queue_scroll(step(0.0, Phase::Ended));
@@ -2454,6 +2517,12 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
             }
         }
+        let gliding = self.scroll_momentum.active();
+        if self.scroll_gliding && !gliding {
+            // A glide just ended: the next gesture starts with fresh history.
+            self.scroll_axis.begin();
+        }
+        self.scroll_gliding = gliding;
         while let Some(gesture) = self.scroll_momentum.tick(Instant::now()) {
             self.emit_scroll(&gesture, true);
         }
@@ -2471,7 +2540,17 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
         } else if !self.demo_cursor && !self.scroll_momentum.active() {
-            event_loop.set_control_flow(ControlFlow::Wait);
+            // While the keyboard is captured, keep waking so the tap watchdog
+            // can tell "idle" from "wedged". An idle app that never ticks is
+            // indistinguishable from a hung one, and the watchdog would then
+            // release a perfectly healthy grab.
+            if grab::is_active() {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(
+                    Instant::now() + Duration::from_millis(400),
+                ));
+            } else {
+                event_loop.set_control_flow(ControlFlow::Wait);
+            }
         }
         if self.rotate_active
             && self.rotate_last.map_or(true, |t| t.elapsed() > Duration::from_millis(150))
@@ -2603,7 +2682,7 @@ fn main() -> Result<()> {
     // the OS composes, so it never needs naming.
     let mut keymap_name: Option<String> = None;
     // Lab hook: scripted gesture for measuring the scroll model
-    // (`flick`, `drag`, `medium`, `stop`).
+    // (`flick`, `drag`, `medium`, `stop`, `jitter`, `diagonal`, `turn`).
     let mut scroll_test = String::new();
     // macOS keyboard grab (`grab.rs`).
     let mut no_grab = false;
@@ -3132,6 +3211,7 @@ fn main() -> Result<()> {
         let mut next_band = 0usize;
         let clip_wanted = clipboard;
         let mut full_seen = !mvs;
+        grab::beat();
         if clip_wanted {
             let _ = tx_reader.send(clipboard_fetch());
         }
@@ -3139,6 +3219,9 @@ fn main() -> Result<()> {
             let read_started = Instant::now();
             let upd = reader.read_update();
             let read_ms = read_started.elapsed().as_secs_f64() * 1000.0;
+            // The reader is a second liveness witness: the tap watchdog only
+            // fires when neither the event loop nor the reader has ticked.
+            grab::beat();
             match upd {
                 Ok(update) => {
                     for event in update.filecopy.iter() {

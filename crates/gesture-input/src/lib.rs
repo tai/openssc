@@ -43,12 +43,242 @@ pub const MOMENTUM_MIN_SPEED: f32 = 1200.0;
 pub const MOMENTUM_MAX_GESTURE: std::time::Duration = std::time::Duration::from_millis(280);
 /// Glide tick interval (~60 Hz).
 pub const MOMENTUM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
-/// Velocity e-folding rate: v *= exp(-DECAY * dt).
-pub const MOMENTUM_DECAY_PER_SEC: f32 = 5.0;
+/// Velocity e-folding rate: v *= exp(-DECAY * dt). Fast, so a flick stops in
+/// about a second like the native client.
+pub const MOMENTUM_DECAY_PER_SEC: f32 = 9.0;
 /// Stop the glide when the decaying speed drops below this (points/second).
 pub const MOMENTUM_STOP_SPEED: f32 = 40.0;
 /// Hard stop, so a flick cannot glide forever.
-pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1200);
+pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(900);
+/// Total distance the glide may cover, whatever the release speed. This is
+/// the only way to guarantee "a few pages": the integral of the decay alone
+/// is v0/decay, which a hard flick pushes past a screen or two.
+pub const MOMENTUM_BUDGET: f32 = 400.0;
+
+/// Time constant of the axis dominance average (~100 ms of recent motion).
+pub const AXIS_TIME_CONSTANT: std::time::Duration = std::time::Duration::from_millis(100);
+/// Evidence needed to leave a single-axis mode for Both (ratio of the minor
+/// EMA to the major one), and the lower ratio that lets Both fall back to a
+/// single axis. Exit is deliberately harder than entry.
+pub const AXIS_ENTRY_BOTH: f32 = 0.55;
+pub const AXIS_EXIT_SINGLE: f32 = 0.25;
+/// A single-axis mode flips to the other axis only when that axis is clearly
+/// larger, sustained.
+pub const AXIS_FLIP_FACTOR: f32 = 1.6;
+/// Absolute travel (points per event, from the EMA) before the minor axis can
+/// count at all: sideways jitter must never trigger a transition.
+pub const AXIS_MIN_TRAVEL: f32 = 4.0;
+/// Evidence must persist this long before the mode changes.
+pub const AXIS_DWELL: std::time::Duration = std::time::Duration::from_millis(120);
+
+/// Which axes the current gesture is allowed to move.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AxisMode {
+    Vertical,
+    Horizontal,
+    Both,
+}
+
+impl AxisMode {
+    pub fn name(self) -> &'static str {
+        match self {
+            AxisMode::Vertical => "vertical",
+            AxisMode::Horizontal => "horizontal",
+            AxisMode::Both => "both",
+        }
+    }
+}
+
+/// A mode change, with the evidence that caused it (for `--debug-input`).
+#[derive(Clone, Copy, Debug)]
+pub struct AxisTransition {
+    pub from: AxisMode,
+    pub to: AxisMode,
+    pub ratio: f32,
+    pub minor_ema: f32,
+    pub dwell_ms: u128,
+}
+
+/// Three-state axis machine driven by recent motion.
+///
+/// Every gesture starts in **Vertical** (the dominant use case) and has to
+/// earn its way out: leaving a single-axis mode needs a higher ratio, an
+/// absolute minimum of travel on the minor axis, and the evidence must
+/// persist for `AXIS_DWELL`. A deadband keeps noise from flapping the mode.
+#[derive(Debug)]
+pub struct AxisFilter {
+    ax: f32,
+    ay: f32,
+    last: Option<std::time::Instant>,
+    mode: AxisMode,
+    pending: Option<(AxisMode, std::time::Instant)>,
+    transition: Option<AxisTransition>,
+}
+
+impl Default for AxisFilter {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl AxisFilter {
+    pub fn new() -> Self {
+        Self {
+            ax: 0.0,
+            ay: 0.0,
+            last: None,
+            mode: AxisMode::Vertical,
+            pending: None,
+            transition: None,
+        }
+    }
+
+    /// Reset the history: at the start of a gesture and when a glide ends.
+    /// The mode returns to the default, Vertical.
+    pub fn begin(&mut self) {
+        self.ax = 0.0;
+        self.ay = 0.0;
+        self.last = None;
+        self.mode = AxisMode::Vertical;
+        self.pending = None;
+        self.transition = None;
+    }
+
+    pub fn mode(&self) -> AxisMode {
+        self.mode
+    }
+
+    /// The last mode change, for the `--debug-input` log.
+    pub fn take_transition(&mut self) -> Option<AxisTransition> {
+        self.transition.take()
+    }
+
+    /// Weight one raw sample and return the delta to send.
+    pub fn apply(
+        &mut self,
+        dx: f32,
+        dy: f32,
+        now: std::time::Instant,
+    ) -> (f32, f32) {
+        let dt = self
+            .last
+            .map(|last| now.duration_since(last).as_secs_f32())
+            .unwrap_or(0.016)
+            .clamp(0.001, 0.1);
+        self.last = Some(now);
+        let alpha = 1.0 - (-dt / AXIS_TIME_CONSTANT.as_secs_f32()).exp();
+        self.ax += alpha * (dx.abs() - self.ax);
+        self.ay += alpha * (dy.abs() - self.ay);
+
+        let (minor, major) = if self.ax >= self.ay {
+            (self.ay, self.ax)
+        } else {
+            (self.ax, self.ay)
+        };
+        let ratio = if major <= 1e-3 { 0.0 } else { minor / major };
+        let dominant = if self.ax >= self.ay {
+            AxisMode::Horizontal
+        } else {
+            AxisMode::Vertical
+        };
+
+        // What would the evidence support right now?
+        let candidate = match self.mode {
+            // A single-axis mode only ever opens to Both: a direction change
+            // therefore goes Vertical -> Both -> Horizontal rather than
+            // jumping, and the horizontal motion is never delayed by it.
+            AxisMode::Vertical => {
+                if ratio > AXIS_ENTRY_BOTH && self.ax >= AXIS_MIN_TRAVEL {
+                    Some(AxisMode::Both)
+                } else if ratio < AXIS_EXIT_SINGLE
+                    && self.ax >= self.ay * AXIS_FLIP_FACTOR
+                    && self.ax >= AXIS_MIN_TRAVEL
+                {
+                    // Purely horizontal from the start: no diagonal band to
+                    // pass through, so the flip is direct.
+                    Some(AxisMode::Horizontal)
+                } else {
+                    None
+                }
+            }
+            AxisMode::Horizontal => {
+                if ratio > AXIS_ENTRY_BOTH && self.ay >= AXIS_MIN_TRAVEL {
+                    Some(AxisMode::Both)
+                } else if ratio < AXIS_EXIT_SINGLE
+                    && self.ay >= self.ax * AXIS_FLIP_FACTOR
+                    && self.ay >= AXIS_MIN_TRAVEL
+                {
+                    Some(AxisMode::Vertical)
+                } else {
+                    None
+                }
+            }
+            // Both is resistive: it falls back only when the minor axis has
+            // decisively dropped, by the exit ratio and the flip factor.
+            AxisMode::Both => {
+                if ratio < AXIS_EXIT_SINGLE
+                    && major >= minor * AXIS_FLIP_FACTOR
+                    && major >= AXIS_MIN_TRAVEL
+                {
+                    Some(dominant)
+                } else {
+                    None
+                }
+            }
+        };
+
+        match candidate {
+            Some(next) => match self.pending {
+                Some((pending, since)) if pending == next => {
+                    let dwell = now.duration_since(since);
+                    if dwell >= AXIS_DWELL {
+                        self.transition = Some(AxisTransition {
+                            from: self.mode,
+                            to: next,
+                            ratio,
+                            minor_ema: minor,
+                            dwell_ms: dwell.as_millis(),
+                        });
+                        self.mode = next;
+                        self.pending = None;
+                    }
+                }
+                // A Both candidate that is already pending wins over a flip:
+                // opening both axes first is harmless, and it is what makes a
+                // direction change read as Vertical -> Both -> Horizontal.
+                Some((AxisMode::Both, since)) => {
+                    let dwell = now.duration_since(since);
+                    if dwell >= AXIS_DWELL {
+                        self.transition = Some(AxisTransition {
+                            from: self.mode,
+                            to: AxisMode::Both,
+                            ratio,
+                            minor_ema: minor,
+                            dwell_ms: dwell.as_millis(),
+                        });
+                        self.mode = AxisMode::Both;
+                        self.pending = None;
+                    }
+                }
+                _ => self.pending = Some((next, now)),
+            },
+            // Evidence that dips without reversing keeps its place: a short
+            // dip must not restart the dwell, or a fast direction change
+            // would never accumulate enough.
+            None => {
+                if ratio < AXIS_EXIT_SINGLE {
+                    self.pending = None;
+                }
+            }
+        }
+
+        match self.mode {
+            AxisMode::Vertical => (0.0, dy),
+            AxisMode::Horizontal => (dx, 0.0),
+            AxisMode::Both => (dx, dy),
+        }
+    }
+}
 
 /// Drives the post-release glide. Portable: any backend that knows the last
 /// scroll velocity and how long the gesture lasted can start it, and the GUI
@@ -60,6 +290,8 @@ pub struct Momentum {
     last: std::time::Instant,
     next_at: std::time::Instant,
     deadline: std::time::Instant,
+    /// Points of glide still allowed.
+    budget_left: f32,
 }
 
 impl Default for Momentum {
@@ -77,6 +309,7 @@ impl Momentum {
             last: now,
             next_at: now,
             deadline: now,
+            budget_left: 0.0,
         }
     }
 
@@ -99,6 +332,7 @@ impl Momentum {
         self.last = now;
         self.next_at = now + MOMENTUM_TICK;
         self.deadline = now + MOMENTUM_MAX;
+        self.budget_left = MOMENTUM_BUDGET;
         true
     }
 
@@ -125,7 +359,22 @@ impl Momentum {
             .duration_since(self.last)
             .as_secs_f32()
             .clamp(0.001, 0.05);
-        let (dx, dy) = (self.v.0 * dt, self.v.1 * dt);
+        let (mut dx, mut dy) = (self.v.0 * dt, self.v.1 * dt);
+        // Distance budget: clamp the step to what is left, then stop.
+        let step = (dx * dx + dy * dy).sqrt();
+        if step >= self.budget_left {
+            let scale = if step > 0.0 {
+                self.budget_left / step
+            } else {
+                0.0
+            };
+            dx *= scale;
+            dy *= scale;
+            self.budget_left = 0.0;
+            self.active = false;
+        } else {
+            self.budget_left -= step;
+        }
         let decay = (-MOMENTUM_DECAY_PER_SEC * dt).exp();
         self.v = (self.v.0 * decay, self.v.1 * decay);
         self.last = now;
@@ -543,5 +792,113 @@ mod momentum_tests {
         m.tick(t0 + Duration::from_millis(16));
         m.stop();
         assert!(m.tick(t0 + Duration::from_millis(32)).is_none());
+    }
+}
+
+#[cfg(test)]
+mod axis_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    struct Run {
+        sx: f32,
+        sy: f32,
+        transitions: Vec<AxisTransition>,
+        modes: Vec<AxisMode>,
+    }
+
+    fn run(samples: &[(f32, f32)]) -> Run {
+        let mut f = AxisFilter::new();
+        f.begin();
+        let t0 = Instant::now();
+        let mut out = Run { sx: 0.0, sy: 0.0, transitions: Vec::new(), modes: Vec::new() };
+        for (i, (dx, dy)) in samples.iter().enumerate() {
+            let (ox, oy) = f.apply(*dx, *dy, t0 + Duration::from_millis(16 * i as u64));
+            out.sx += ox.abs();
+            out.sy += oy.abs();
+            out.modes.push(f.mode());
+            if let Some(t) = f.take_transition() {
+                out.transitions.push(t);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn default_mode_is_vertical() {
+        let mut f = AxisFilter::new();
+        f.begin();
+        assert_eq!(f.mode(), AxisMode::Vertical);
+    }
+
+    #[test]
+    fn pure_vertical_never_leaves_vertical() {
+        let samples: Vec<(f32, f32)> = (0..30).map(|_| (0.0, -10.0)).collect();
+        let r = run(&samples);
+        assert!(r.transitions.is_empty(), "{:?}", r.transitions);
+        assert!(r.sx == 0.0);
+        assert!((r.sy - 300.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn sideways_jitter_never_changes_the_mode() {
+        let samples: Vec<(f32, f32)> = (0..40)
+            .map(|i| (if i % 2 == 0 { 3.0 } else { -3.0 }, -10.0))
+            .collect();
+        let r = run(&samples);
+        assert!(r.transitions.is_empty(), "jitter flipped the mode: {:?}", r.transitions);
+        assert_eq!(r.sx, 0.0);
+    }
+
+    #[test]
+    fn a_diagonal_reaches_both() {
+        let samples: Vec<(f32, f32)> = (0..25).map(|_| (-10.0, -10.0)).collect();
+        let r = run(&samples);
+        assert_eq!(r.transitions.len(), 1, "{:?}", r.transitions);
+        assert_eq!(r.transitions[0].to, AxisMode::Both);
+        assert!(r.transitions[0].dwell_ms >= AXIS_DWELL.as_millis());
+        assert!(r.sx >= 130.0, "horizontal {}", r.sx);
+    }
+
+    #[test]
+    fn a_turn_goes_vertical_both_horizontal() {
+        let mut samples = Vec::new();
+        for _ in 0..25 {
+            samples.push((0.0, -10.0));
+        }
+        for _ in 0..25 {
+            samples.push((-10.0, 0.0));
+        }
+        let r = run(&samples);
+        let seq: Vec<&str> = r.transitions.iter().map(|t| t.to.name()).collect();
+        assert_eq!(seq, vec!["both", "horizontal"], "got {seq:?}");
+        assert!(r.sx >= 130.0, "horizontal distance {}", r.sx);
+    }
+}
+
+#[cfg(test)]
+mod budget_tests {
+    use super::*;
+    use std::time::{Duration, Instant};
+
+    #[test]
+    fn a_hard_flick_is_capped_by_the_distance_budget() {
+        let mut m = Momentum::new();
+        let t0 = Instant::now();
+        assert!(m.start(0.0, -8000.0, Duration::from_millis(120), t0));
+        let mut total = 0.0f32;
+        let mut now = t0;
+        let mut last_step = t0;
+        for _ in 0..2000 {
+            now += Duration::from_millis(1);
+            if let Some(Gesture::Scroll { dy, .. }) = m.tick(now) {
+                total += dy.abs();
+                last_step = now;
+            }
+        }
+        assert!(total <= MOMENTUM_BUDGET + 1.0, "glide {total} over budget");
+        assert!(!m.active());
+        let duration = last_step.duration_since(t0);
+        assert!(duration <= MOMENTUM_MAX, "glide lasted {duration:?}");
     }
 }
