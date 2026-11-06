@@ -1,6 +1,6 @@
 # Protocol status / agent handoff
 
-## 2026-11-06 — full-resolution MVS decode throughput (VERIFIED on the replay fixture)
+## 2026-11-06 — **v1.5.0**: full-resolution MVS decode throughput and visual-latency parity (VERIFIED on the replay fixture and on camera)
 
 - Phase / milestone: M1/M6 — the client must keep up with the server during a
   scroll at 2560x1600 without shrinking the image.

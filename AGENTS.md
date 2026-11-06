@@ -1,8 +1,23 @@
-# AGENTS.md — `ss-clone` — **v1.4.1**
+# AGENTS.md — `ss-clone` — **v1.5.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
+
+> **v1.5.0 — 2026-11-06.** The picture now keeps up with the remote. Filming
+> both screens at 30 fps and aligning their motion envelopes showed the client
+> presenting a scroll over 1.4x the remote's duration and finishing half a
+> second late, where `Screen Sharing.app` takes ~1.2x: the MVS decoder rendered
+> every intermediate state of a scroll and fell behind (backlog p50 183 ms, max
+> 640 ms), because its IDCT was a naive `f64` separable transform at ~140 Mpx/s
+> in a burst that needs ~190 Mpx/s before counting tile copies. A fixed-point
+> `islow` IDCT, direct-to-framebuffer tile writes and one publish per drained
+> batch take a captured burst from 1000 ms to 272 ms (94 to 347 Mpx/s) and the
+> live backlog to p50 2 ms; envelope lag went 483 to 157 ms against SS.app's
+> 237 ms, and the client is now on parity with it. Momentum is forwarded by
+> default again (`--no-coast` opts out), matching the real client. Two false
+> watchdogs are gone: an idle push screen is normal, and the keyboard grab no
+> longer releases itself when the screen sits still.
 
 > **v1.4.1 — 2026-11-05.** Local shortcuts now go to the remote. While the
 > ss-gui window is focused a session-level `CGEventTap` captures the keyboard, so
@@ -63,14 +78,16 @@ contradicts this document, update this document in the same change.
 - **Primary reason:** Apple Screen Sharing has substantially better trackpad and
   gesture fidelity than generic VNC/RDP clients. Gesture compatibility is a
   first-class requirement, not a nice-to-have.
-- **Current phase:** v1.4.1 on macOS. Live GUI, keyboard/pointer input (with
+- **Current phase:** v1.5.0 on macOS. Live GUI, keyboard/pointer input (with
   correct modifier forwarding), gesture backend, remote cursor, automatic duplex
   clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
   pull), JIS keyboard support with layout tables, keyboard grab so local
   shortcuts reach the remote, and MVS with **server push as the default**
-  including the full push vocabulary. Next: **Linux/Wayland packaging** — still the actual target
+  including the full push vocabulary. Visual latency is measurably on par with
+  `Screen Sharing.app` (envelope lag 157 ms against 237 ms) because the decoder
+  now keeps up at full 2560x1600 resolution. Next: **Linux/Wayland packaging** — still the actual target
   platform and still unwalked — then swipe semantic calibration and frame pacing.
-- **Last verified:** 2026-11-04 against `md.local` and `mm.local`.
+- **Last verified:** 2026-11-06 against `md.local` and `mm.local`.
 
 ---
 
@@ -605,7 +622,7 @@ client plus a pcap and experiment note.
 
 ## 13. Current status snapshot
 
-### Unreleased — 2026-11-06
+### v1.5.0 — 2026-11-06
 
 - **Visual latency is solved, and it was decode, not the wire.** Two prior fixes
   cut the *receive* path to link capacity (48-85 → 112 Mbit/s against a
