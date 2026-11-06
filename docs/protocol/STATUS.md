@@ -1,5 +1,11 @@
 # Protocol status / agent handoff
 
+Newest entry first. Each entry is a record of what was true **on that date**;
+older entries are history, not current behaviour. Current behaviour is the
+code, then `docs/protocol/*.md`; how to measure it is `docs/testing.md`. The
+top entry is the one to read first, and the one to update at the end of a
+session (template in `AGENTS.md` §10).
+
 ## 2026-11-06 — **v1.5.0**: full-resolution MVS decode throughput and visual-latency parity (VERIFIED on the replay fixture and on camera)
 
 - Phase / milestone: M1/M6 — the client must keep up with the server during a
@@ -34,8 +40,23 @@
   Also: the live client decodes a heavy body ~2.7x slower than the replay
   benchmark for the same bytes (UI blit and memory traffic on the same
   machine) — that gap is unmeasured and is the next thing to look at.
+- **Cursor geometry fix (2026-11-06):** `0x451` was only advertised in the Zlib
+  branch, so `--mvs` sized the cursor by framebuffer scaling (half size on a 2x
+  backing) and the push re-arm keyed on `0x451` could never fire. Now advertised
+  with MVS and `--encoding`; verified live (arrow 17x23 points -> 34x45 px).
+- **Docs audit (2026-11-06):** every document was compared against the sources
+  and corrected where they disagreed, taking the code as truth. New
+  `docs/testing.md` records the measurement layers, the harness in
+  `tools/measure/`, the recorded numbers and the pruning rule for `artifacts/`.
+  Corrected in this pass: the scroll contract (§8.1 — `fixedDelta` carries the
+  trackpad delta, it is not line-granular), `codecs.md`'s "pixel decoding
+  unverified" status and its deflate-tier latency conclusion (measured while
+  the reader decoded inline), the file-copy frame (pad byte at +1, body at +6,
+  `level` at +0x64), Shift forwarding, and the `--scale` / clipboard / push
+  claims that later work overturned.
 - Lab state: `mm.local` healthy; `Screen Sharing` re-shown on `md.local`;
-  no ss-gui running.
+  no ss-gui running. `artifacts/` pruned to the fixtures tests read (9 MB from
+  618 MB).
 
 ## 2026-11-05 — **v1.4.1**: keyboard grab, `--help` (VERIFIED)
 
@@ -93,7 +114,7 @@
   path. Sending `0xFFE7` (Meta_L) fixes it. Modifiers are now re-synced per key
   so a missed `ModifiersChanged` cannot drop one. Note this contradicts a static
   reading of the daemon's KeyMap table - empirical result wins, re-test if ever
-  revisited. `docs/protocol/input-and-gestures.md` §6.
+  revisited. `docs/protocol/input-and-gestures.md` §5.
 - Also verified: a plain Finder Cmd+C of a file genuinely cannot carry a path -
   the server strips the file URL from the archive and no client, Apple's
   included, can recover it. Finder's *Copy as Pathname* is the supported
@@ -237,6 +258,10 @@
   rectangles. The key is re-arming `0x09` + a non-incremental `0x03` on every
   `AppleDisplayLayout` (0x451). Verified with `ss-client stream --auto`:
   a later update was a 64×48 tile instead of a 2560×1600 full frame.
+**SUPERSEDED 2026-11-06**: the scaled path below does deliver incremental
+updates after all (a 1280×800 session measured a p50 15 ms decode backlog); the
+"stops incremental updates" conclusion was a 2026-11-03 observation.
+
 - `ScaleFactor` (0x08) at 0.5 produces 1280×800 full frames (4,096,000 bytes)
   instead of 2560×1600 (16,384,000), **but this server build stops sending
   incremental updates after the initial scaled frame**. The GUI therefore
@@ -361,7 +386,9 @@ Measured with 8 horizontal bands on `mm.local`:
 Full-screen update production time on `mm.local`: Raw 1590 ms, Zlib 880 ms,
 `0x3ea`/`0x3e9`/`0x3e8` all ~700 ms (33 KB and 632 KB payloads take the same
 time, so the cost is per-pixel conversion, not compression), **MVS `0x3f3`
-60 ms**. MVS is GPU-encoded by the server and is 12x faster; the deflate tiers
+60 ms**. MVS is GPU-encoded by the server and is 12x faster *(measured with the
+pre-fix client; see the caveat at the top of `codecs.md` — the deflate tiers'
+floor was at least partly our own receive path)*; the deflate tiers
 only reduce bandwidth.
 
 Implemented meanwhile: `0x3ea` (RGB555 **big-endian**, verified pixel-exact
@@ -449,9 +476,18 @@ less data per update) or making `AutoFrameBufferUpdate` work from the GUI.
   Root cause unknown; polling remains the shipping path.
 - Subtype-11 offsets corrected: two 4-byte words sit at `+0x1a` and `+0x2a`.
   With the corrected layout, `pointDelta*` and `fixedDelta*` (16.16) still do
-  not scroll, so the wire format is line-granular.
+  not scroll, so the wire format is line-granular. **SUPERSEDED 2026-11-05**:
+  `fixedDelta` does scroll once the whole delta is sent in it with the line
+  field zero — that is the native client's shape and what the client sends for
+  trackpad input (`input-and-gestures.md` §8.1). `pointDelta` is the only field
+  this server ignores.
 
 ### Verified 2026-11-03 — text clipboard
+
+**SUPERSEDED 2026-11-05 by v1.1.0** — the "cannot share one connection" and
+"closes the viewer after a fetch" findings below were caused by our own fetch
+being 1 byte instead of 8; the clipboard is now automatic and duplex. Keep this
+entry only as a record of the wrong turn.
 
 Remote→local and local→remote text sync both work, via `0x0b ClipboardFetch`
 (no AutoPasteboard) for reads and `0x06 ClientCutText` + `0x15
@@ -469,6 +505,11 @@ honours**: `dy > 0` scrolls up, `dy < 0` scrolls down, ≈1 line per unit, and a
 lone `phase = 2` frame is enough. `pointDelta*` had no visible effect. The
 previous 50-byte frame desynchronised the server (hang), now fixed. `ss-gui`
 uses this path for both winit wheel events and the evdev recogniser.
+
+*(Since 2026-11-05 the trackpad path sends the whole delta in `fixedDelta` as
+16.16 lines with the line field zero, because that is what the native client
+does and it makes the motion sub-line smooth. The line field above still applies
+to wheel input. See `docs/protocol/input-and-gestures.md` §8.1.)*
 
 Evidence: `artifacts/scroll-after-wheel.png`, `artifacts/dy-only.png`,
 `artifacts/dy-single-up.png`, `artifacts/gui-after.png`.

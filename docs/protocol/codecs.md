@@ -1,9 +1,13 @@
 # Apple framebuffer codecs
 
-**Current MVS framing: see §2.19 and [the verified experiment](../findings/2026-11-04-codex-mvs-streams.md). Earlier exploratory framing claims below are superseded. Pixel decoding remains unverified.**
+**Current MVS contract: §2.19 and §2.20, implemented in `crates/rfb-proto/src/mvs.rs`.
+Everything before §2.19 is the exploratory reverse-engineering log, kept only as
+a record of how the layout was found — do not code against it.**
 
-Status: **quality tiers (0x3e8/0x3e9/0x3ea) VERIFIED**, **MultiVariant (0x3f3)
-container VERIFIED, tile bitstream still being reverse engineered**.
+Status: **quality tiers (0x3e8/0x3e9/0x3ea) VERIFIED**; **MultiVariant (0x3f3)
+VERIFIED end to end** — container, both streams, commands 0-7, the coefficient
+ring, type-0/type-1 and push mode, decoded to pixels within 1 channel of the
+native oracle (2026-11-04, re-validated 2026-11-06).
 
 Measured on `mm.local` (2560×1600, macOS 12, LAN) — time for the server to
 produce one full-screen update:
@@ -17,14 +21,26 @@ produce one full-screen update:
 | `0x3e8` (4-bit) | **700 ms** | 33,474 |
 | **MVS `0x3f3`** | **60 ms** | 86,029 |
 
-Two conclusions:
+Measured 2026-11-04 with the then-current client, and **read the caveat before
+trusting the numbers**: at that time the session reader decoded inline, so it
+stopped draining the socket while it worked and the TCP window closed mid-frame.
+That bug was found on 2026-11-06 (`docs/findings/2026-11-06-visual-latency-parity.md`):
+after moving decode to its own thread, receive throughput went from 48-85 Mbit/s
+to 112 Mbit/s against a 114 Mbit/s link. So a client-side floor of ~700 ms for
+*every* deflate tier, independent of payload size, is at least partly our
+receive path, not the server's per-pixel cost as originally concluded.
 
-1. Every deflate tier hits the same ~700 ms floor regardless of payload size
-   (33 KB and 632 KB both take 700 ms), so the cost is the server's per-pixel
-   conversion, not compression. Changing the encoding does **not** reduce
-   latency, only bandwidth.
-2. MVS is 12× faster because the server encodes it on the GPU (OpenCL DCT
-   kernels). MVS is the only path to a responsive mirror.
+What survives, and what does not:
+
+1. ~~"Changing the encoding does not reduce latency, only bandwidth"~~ — not
+   supported. The tiers have not been re-measured since the reader fix. MVS is
+   still the right default because it is what the native client uses, it is the
+   only encoding this server pushes, and it decodes at 350-400 Mpx/s in our
+   decoder (272 ms for a 94 Mpx scroll burst).
+2. MVS is far cheaper on the wire: 86 KB against 600 KB-4 MB for a full frame.
+   Its advantage is bandwidth plus smooth server push; whether the deflate tiers
+   are also fast to decode after the receive fix is an open question, not a
+   settled one.
 
 ## 1. Quality tiers (0x3e8 / 0x3e9 / 0x3ea)
 
@@ -72,10 +88,13 @@ precedes the first tile stream. Example from `artifacts/mvs-3.bin`.
 Real captures (`artifacts/mvs-4.bin`, 2560×1600): `type=0, p1=0x0f, p2=0x19,
 data_off=4513`, total 85,987 bytes.
 
-### 2.2 Tile bitstream — OPEN
+### 2.2 Tile bitstream — historical probe notes (superseded by §2.19/§2.20)
 
-The layout is documented from static analysis of `EncodePartialUpdateMVS`
-(`docs/protocol/input-and-gestures.md` §8.9.4 of the RFC notes):
+What follows in §2.2-§2.18 is the state of the investigation before the two
+streams and the coefficient ring were understood. It is kept because it records
+which guesses failed and why; the contract is §2.19/§2.20.
+
+The layout was first read from static analysis of `EncodePartialUpdateMVS`:
 
 - commands 0–7: Skip, MatchPrevious, MatchAbove, TwoColor (8-byte mask + two
   YCbCr 8/6/6 colours), Solid (one colour), DCT (quantized coefficients),
@@ -786,7 +805,10 @@ instead of pushing.
 Polling MVS already delivers keystrokes in ~85–98 ms p50 on the lab LAN, and the
 floor is one server capture interval, not the request loop (during a repaint,
 applied rects arrive 6–9 ms apart). Push removes the request leg; whether it
-beats that floor is **not yet measured** — see STATUS.md.
+beats that floor is measured: push's request leg is gone, and keystroke→painted
+p50 is 92 ms against 85-98 ms for polling — inside the noise, because the floor
+is the server's capture cadence, not our request loop. See
+`docs/findings/2026-11-04-push-mode-mvs.md`.
 
 ## 2.21 Decoder throughput (2026-11-06)
 

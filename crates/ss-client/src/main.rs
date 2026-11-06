@@ -16,7 +16,8 @@ fn usage() -> &'static str {
   ss-client probe         [connection opts]
   ss-client snapshot      --out artifacts/rust.png [--mvs] [connection opts]
   ss-client stream        --frames 3 --out artifacts/stream.png [stream opts] [connection opts]
-  ss-client gesture       --kind swipe|scroll [gesture opts] --out artifacts/gesture.png
+  ss-client gesture       --kind swipe|scroll|wheel|magnify|rotate|smart|quicklook|buttonscroll
+                          [gesture opts] --out artifacts/gesture.png
   ss-client demo-input    --x 1000 --y 800 --text hello --out artifacts/input.png
   ss-client clipboard     --text hello [--no-auto]
   ss-client clipboard-sync --text \"ss-clone sync test\" [--wait-ms 3000]
@@ -39,9 +40,19 @@ mvs-compare decodes one MVS and one Zlib full frame (one session each) and repor
 latency plus pixel agreement.
 
 gesture opts:
-  swipe:  --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F --flags N --flavor N --series
-  scroll: --dx F --dy F --dz F --natural 0|1 --phase N --mask N --series
-  common: --delay-ms N"
+  common:  --kind K --x N --y N --phase N --series --delay-ms N
+  swipe:   --motion N --swipe-mask N --progress F --px F --py F --vx F --vy F --vz F
+           --flags N --flavor N
+  scroll:  --dx F --dy F --dz F --natural 0|1 --mask N    (subtype 8; inert on this
+           server, kept because the message is a real part of the dialect)
+  wheel:   --dx F --dy F --dz F --point-y N --fixed-y N --repeat N  (subtype 11, the
+           shape the real client uses for scrolling)
+  magnify / rotate: --value F --mask N
+  buttonscroll:     --notches N --dy -1|1                  (buttons 4/5)
+
+  --series sends begin/changed/end phases instead of a single message. The client
+  applies gestures only when the phase list is complete; a lone phase is accepted
+  by the server but does nothing visible."
 }
 
 /// Replay a captured push sequence offline: apply every body in manifest

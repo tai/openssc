@@ -1,8 +1,8 @@
 # Clipboard / pasteboard — Apple Screen Sharing
 
 Status: **text and images VERIFIED in both directions, automatic and duplex**
-(2026-11-05, `mm.local`). File copy is a separate protocol and is **not**
-implemented (§7).
+(2026-11-05, `mm.local`). File copy is a different channel on the same connection
+and is implemented separately — see `docs/protocol/filecopy.md`.
 
 Evidence: `artifacts/verify-clip.log` (this round: text both ways, PNG both ways
 with matching sha1), `artifacts/cb-impl-*.log`, `artifacts/cb-recon/` (native
@@ -127,15 +127,18 @@ replace with an NSPasteboard change-count watcher later.
   'the clipboard as text'`, or `sudo -n launchctl asuser 501 pbpaste` for real
   data.
 
-## 7. File copy (not implemented)
+## 7. File copy
 
-Native file copy is **not** a pasteboard flavour. The daemon has a dedicated
-`0x22 HandleFileCopyMessage` channel with `RFBFileCopy_StartFileSendMessage`
-(path + length) and `RFBFileCopy_StartFileReceiveMessage`, and the app has UI
-state for it (`FileTransferHistory` with direction, paths, byte counts). No
-`public.file-url` flavour was observed. Implementing it is a separate milestone:
-message numbering and the directional start handshake are known, the transfer
-framing is not.
+Native file copy is **not** a pasteboard flavour: it is the dedicated `0x22`
+channel on the same connection, with its own command numbering and start
+handshake. It is implemented and verified in both directions — see
+`docs/protocol/filecopy.md`.
+
+What matters here is the boundary: a pasteboard archive carries the file's
+*URL* only as a name in the common case (`public.file-url` is stripped by the
+server), so pulling a file is a separate `0x22` session, not a pasteboard read.
+`docs/protocol/filecopy.md` §"pulling" covers which clipboard shapes may be
+pulled at all.
 
 ## 8. Verifying on `mm.local`
 

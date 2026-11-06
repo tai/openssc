@@ -511,9 +511,9 @@ Input and keyboard:
                            (default: hold Left-Cmd+Shift for 350 ms)
 
 Clipboard and file copy:
-  --clipboard              automatic duplex clipboard (default on)
-  --no-clipboard           disable the automatic clipboard
-  --send-clipboard         send the local clipboard on connect
+  --clipboard              accepted no-op; the automatic clipboard is on by default
+  --no-clipboard           disable the automatic duplex clipboard
+  --send-clipboard         accepted no-op; the local clipboard is pushed when it changes
   --pull <path>            pull an absolute remote path into ~/Downloads (repeatable)
   --send-file <path>       send a local file to the remote Downloads (repeatable)
   --recv-file <path>       request a remote file into ~/Downloads (repeatable)
@@ -1689,14 +1689,16 @@ impl App {
         }
     }
 
-    /// Queue a two-finger scroll. macOS acts on the 16-bit line delta in the
-    /// Apple MouseScroll message (subtype 11); the pixel deltas are ignored by
-    /// this server build, and phase 2 alone is sufficient (VERIFIED live:
-    /// `dy=-10` moved TextEdit 15 lines, `dy=+10` moved it back 8).
-    /// Queue one scroll sample from the portable gesture model. Every sample
-    /// is eventually sent: the point deltas carry the smooth motion, the
-    /// integer line deltas are what this server honours today, and
-    /// Began/Ended/Cancelled are never coalesced away.
+    /// Queue one scroll sample from the portable gesture model. Every sample is
+    /// eventually sent; Began/Ended/Cancelled are never coalesced away.
+    ///
+    /// Wire shape for subtype 11, measured from the native client: for precise
+    /// (trackpad) input the line field is 0 and the whole delta goes in
+    /// `fixedDelta` as 16.16 lines, which the server accumulates — that is what
+    /// makes sub-line motion smooth. Wheel input sets the line fields and
+    /// leaves `fixedDelta` zero. `pointDelta` is ignored by this server build.
+    /// A lone `phase = 2` frame is enough (`dy = -10` moved TextEdit 15 lines).
+    /// See `docs/protocol/input-and-gestures.md` §8.1.
     fn queue_scroll(&mut self, gesture: Gesture) {
         let Gesture::Scroll {
             dx,
@@ -3289,11 +3291,15 @@ fn main() -> Result<()> {
     // warps; the server prefers 0x450 over RichCursor -239, so -239 stays out
     // of the list. Cursor rects only arrive while push (0x09) is armed.
     if let Some(enc) = encoding {
-        session.send_message(&rfb_proto::set_encodings(&[enc, 0x450, 0x44c]))?;
+        session.send_message(&rfb_proto::set_encodings(&[enc, 0x450, 0x44c, 0x451]))?;
         eprintln!("advertised encoding {enc} + cursor 0x450/0x44c");
     } else if mvs {
-        session.send_message(&rfb_proto::set_encodings(&[0x3f3, 0x450, 0x44c]))?;
-        eprintln!("advertised MVS (0x3f3) + cursor 0x450/0x44c");
+        // 0x451 carries the point/pixel geometry that sizes the cursor bitmap
+        // and is what a display-layout change arrives as. Without it the
+        // cursor falls back to framebuffer scaling (half size on a 2x backing)
+        // and the push re-arm keyed on 0x451 can never fire.
+        session.send_message(&rfb_proto::set_encodings(&[0x3f3, 0x450, 0x44c, 0x451]))?;
+        eprintln!("advertised MVS (0x3f3) + cursor 0x450/0x44c + DisplayInfo");
     } else {
         session.send_message(&rfb_proto::set_encodings(&[6, 0x450, 0x44c, 0x451, 0x453]))?;
         eprintln!("advertised Zlib (6) + cursor 0x450/0x44c + DisplayInfo");

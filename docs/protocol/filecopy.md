@@ -11,13 +11,14 @@ addresses), `tools/filecopy/arrival_harness.py` (sha1 verifier).
 
 ## 1. Transport
 
-Every frame starts with the ordinary RFB message type `0x22`, immediately
-followed by a 32-bit length — there is no `pad` byte and no rectangle header:
+Every frame starts with the ordinary RFB message type `0x22`, a zero pad byte
+and a 32-bit length — there is no rectangle header:
 
 ```
 +0x00 u8  0x22
-+0x01 u32 totalSize            # bytes after this field; must be < 0x100001
-+0x05 ... body
++0x01 u8  0                      # pad, always zero
++0x02 u32 totalSize              # body bytes, counted from +0x06; must be < 0x100001
++0x06 ... body
 ```
 
 Inside the body, every command shares a 8-byte prefix:
@@ -98,6 +99,7 @@ decrypt our own stream:
 +0x4a u64 attribute date       |
 +0x52 u64 access  date        /
 +0x5a u64 (fifth date)         # zero in captures
++0x64 u16 level                # folder depth; 0 for the dropped top-level item
 +0x66 u16 st_mode              # 0o100644 for a regular file; file-type bits included
 +0x68 u32 text encoding        # 0x7e in all captures
 +0x6c u16 nameLen              # EXCLUDING the trailing NUL
@@ -139,10 +141,11 @@ and re-frames the transport header.
 
 Transfers run on a worker thread, so the UI keeps painting.
 
-Pulling something from the remote has no gesture (drag-out is out of scope), so
-it is explicit: launch with `--recv-file /absolute/remote/path` and it is fetched
-at connect into `~/Downloads`. A folder arrives as a folder, tree intact, with
-`" 2"` applied to the top-level name on collision.
+Pulling something from the remote has no drag-out (out of scope), but it has a
+gesture: **`Cmd+Shift+V`** asks the remote clipboard for what to fetch (§8a).
+The explicit forms are `--recv-file /absolute/remote/path` (fetched at connect),
+`--pull <path>`, or dropping into the GUI. A folder arrives as a folder, tree
+intact, with `" 2"` applied to the top-level name on collision.
 
 Test hooks (not user-facing): `--send-file <path>` and `--recv-file <remote
 path>` exercise the two directions without a drag.
@@ -167,7 +170,7 @@ client, Apple's included. Finder's *Copy as Pathname* (Option+Cmd+C) puts the
 path on the pasteboard as text, which is the supported gesture.
 
 Requires Option to actually reach the remote - see
-`docs/protocol/input-and-gestures.md` §6; with the wrong Option keysym the remote
+`docs/protocol/input-and-gestures.md` §5; with the wrong Option keysym the remote
 performs a plain copy and the clipboard holds a name, which looks exactly like
 "no path on the remote clipboard".
 
@@ -181,4 +184,3 @@ performs a plain copy and the clipboard holds a name, which looks exactly like
   implemented.
 - Extended attributes / resource forks: the trailing block after the name
   (`extra amount`) is not emitted by us and not required for plain files.
-- Folder drops (recursion via `level`).

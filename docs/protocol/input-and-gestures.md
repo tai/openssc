@@ -221,7 +221,7 @@ client 0x17 gesture
 The agent log line is emitted immediately after parsing the struct and before
 posting.
 
-## 6. Modifier keys on this server — Option is 0xFFE7 (VERIFIED 2026-11-05)
+## 5. Modifier keys on this server — Option is 0xFFE7 (VERIFIED 2026-11-05)
 
 Modifiers must be sent as their own RFB KeyEvent messages, not folded into the
 key that follows. This client forwards Control, Option and Command as discrete
@@ -235,7 +235,7 @@ The keysym choice matters and is **not** the textbook mapping on this server:
 | Command | `0xFFEB` (Super_L) | works as expected |
 | Option | **`0xFFE7` (Meta_L)** | `0xFFE9` (Alt_L) is accepted as a key but never raises the Option flag |
 | Control | `0xFFE3` (Control_L) | works as expected |
-| Shift | synthesised around shifted characters | not forwarded separately |
+| Shift | `0xFFE1` (Shift_L) | forwarded like the others; the *server* still ignores it for printable keys because the character keysym carries case |
 
 Getting this wrong is silent: with `0xFFE9` the remote received `Cmd+C` instead
 of `Option+Cmd+C`, so Finder did a plain copy and the clipboard carried a file
@@ -299,12 +299,15 @@ keycodes), not a better table.
 
 ### Modifier keys
 
-Control, Option and Command are sent as discrete key events and re-synced per key
-so a missed event cannot leave one stuck. **Option is `0xFFE7` (Meta_L) on this
-server** — `0xFFE9` (Alt_L) is accepted as a key but never raises the Option
-flag, which silently turned `Option+Cmd+C` into `Cmd+C`. Shift is not forwarded
-for printable keys (the character carries case) and is synthesised only where an
-unshifted key needs it.
+Control, Option, Command and Shift are sent as discrete key events and re-synced
+per key so a missed event cannot leave one stuck. **Option is `0xFFE7` (Meta_L) on
+this server** — `0xFFE9` (Alt_L) is accepted as a key but never raises the Option
+flag, which silently turned `Option+Cmd+C` into `Cmd+C`.
+
+Shift needs both statements kept apart: we **do** forward it (`0xFFE1`), but the
+server **ignores** it for printable keys because the keysym we send is the
+character's own and already carries case (`A`, `@`, `:`). Forwarding it matters
+for chords (`Cmd+Shift+V`) and for named keys; it does not produce uppercase.
 
 ## 7. Keyboard grab (macOS) — local shortcuts belong to the remote
 
@@ -338,25 +341,24 @@ on the wire. `--debug-input` prints them as `tap key ...`, distinct from winit's
   sends modifier key-ups so nothing sticks on the remote; `--no-grab` disables
   the subsystem.
 
-## 5. Calibration notes / open questions
+## 8. Calibration notes / open questions
 
-### 5.1 Two-finger scroll — VERIFIED (2026-11-03, `mm.local` TextEdit)
+### 8.1 Two-finger scroll — VERIFIED (2026-11-03, revised 2026-11-05, `mm.local`)
 
-The working path is **subtype 11 (MouseScroll)**, not subtype 8.
+The working path is **subtype 11 (MouseScroll)**, not subtype 8. Subtype 8
+(gesture scroll, f32 pixels) is accepted and inert on this server; the messages
+below are the only ones that move anything.
 
 | Question | Result |
 |---|---|
-| Which delta field scrolls? | **`dy` (the 16-bit line delta), offsets +0x08..+0x0d.** `pointDelta*` (set with the documented offsets) and `fixedDelta*` (16.16 pt) both produced **no** movement on their own. `pointDelta` at most contributes ~1 line when `dy` is also non-zero, so scrolling is inherently line-granular. |
+| Which delta field scrolls? | **Both, and they mean different things.** For *precise* (trackpad) input the client sends **`line = 0` and the whole delta in `fixedDelta`** as 16.16 lines — the server accumulates the fraction, which is what makes sub-line motion smooth instead of stepped. For *wheel* input the 16-bit line fields carry the notches and `fixedDelta` stays zero. The earlier claim that `fixedDelta` alone does nothing was an artefact of the then-wrong field offsets (the two unlabelled words at `+0x1a`/`+0x2a` shift everything after them); with the layout corrected it moves the page. |
+| Why `fixedDelta` and not `line`? | Measured from the native client: 295 records of the same **82-byte** subtype-11 message over 22.9 s (~60 Hz), one per trackpad event, including deltas below one line. A locally truncated whole-line delta is what made our motion look step-wise. See `docs/findings/2026-11-06-visual-latency-parity.md` for the measurement harness. |
 | Is the phase series required? | **No.** A single `phase = 2` frame with `dy = +10` scrolled TextEdit up ~8 lines. `phase = 1/4` frames are harmless but optional. |
 | Sign | **`dy > 0` scrolls up (earlier content), `dy < 0` scrolls down.** |
-| Magnitude | ≈ **1 line of content per unit**: `dy=-10` moved 15 lines, `dy=+10` moved ~8, `dy=+5` moved ~4. |
+| Magnitude | ≈ **1 line of content per unit of `line`/`fixedDelta` divided by 65536**: `dy=-10` moved 15 lines, `dy=+10` moved ~8, `dy=+5` moved ~4. The client's pixel→line divisor is `SCROLL_POINTS_PER_LINE` (24 points per line, `--scroll-speed` scales it). |
 | Frame length | Must be **58 bytes** (length field `0x36`). Our earlier 50-byte frame desynchronised the server: it waited for 8 bytes that never came and the session hung. |
 | Unknown bytes | Two 4-byte words at `+0x1a` and `+0x2a`; zero is accepted. |
 | Where does it land? | HYPOTHESIS: the event only takes effect when the message's `x,y` fall inside the **frontmost** window. Earlier tests that appeared to confirm this had `x,y` at the wrong offsets, so re-test with the corrected layout. |
-
-Evidence: `artifacts/scroll-after-wheel.png` (001→032), `artifacts/dy-only.png`
-(032→047), `artifacts/dy-single-up.png` (047→039), `artifacts/gui-after.png`
-(GUI path, `+5` → 039→035).
 
 Reproduce:
 
@@ -366,11 +368,14 @@ cargo run -p ss-client -- gesture --host mm.local --kind wheel \
     --dy -10 --point-y 0 --x 1200 --y 800 --out artifacts/s.png
 ```
 
-`ss-gui` now maps `MouseWheel` and the evdev recogniser to subtype 11, converts
-pixel deltas to lines (`/12`), accumulates sub-line remainders, and clamps a
-single event to ±40 lines.
+`ss-gui` maps winit `MouseWheel` and the evdev recogniser onto subtype 11: pixel
+deltas are divided by `SCROLL_POINTS_PER_LINE` (24, tunable with
+`--scroll-speed`), the precise path puts the whole value in `fixedDelta` with
+zero lines and keeps **no** local remainder (the server accumulates), wheel input
+uses whole lines, and a single event is clamped to ±40 lines. The scroll axis
+filter decides vertical vs both-axis continuously from recent motion.
 
-### 5.2 Swipe — still uncalibrated
+### 8.2 Swipe — still uncalibrated
 
 - `mm.local` has **vertical** three/four-finger Mission Control swipes
   **disabled** (`TrackpadThreeFingerVertSwipeGesture = 0`,

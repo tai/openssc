@@ -82,8 +82,10 @@ contradicts this document, update this document in the same change.
   correct modifier forwarding), gesture backend, remote cursor, automatic duplex
   clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
   pull), JIS keyboard support with layout tables, keyboard grab so local
-  shortcuts reach the remote, and MVS with **server push as the default**
-  including the full push vocabulary. Visual latency is measurably on par with
+  shortcuts reach the remote, and MVS with server push, selected with `--mvs`
+  (push is the default inside MVS; `--poll` opts out), including the full push
+  vocabulary. Without `--mvs` the GUI advertises Zlib (6), which is the slow
+  path. Visual latency is measurably on par with
   `Screen Sharing.app` (envelope lag 157 ms against 237 ms) because the decoder
   now keeps up at full 2560x1600 resolution. Next: **Linux/Wayland packaging** — still the actual target
   platform and still unwalked — then swipe semantic calibration and frame pacing.
@@ -407,34 +409,38 @@ Create these as work progresses; keep the layout stable.
 
 ```
 AGENTS.md                 # this file — canonical operating guide
-README.md                 # human-facing overview (later)
+README.md                 # human-facing overview and quick start
 docs/
-  lab.md                  # machine/account/topology details, reset procedures
+  testing.md              # test layers, measurement methods, recorded results
   protocol/
-    overview.md           # layering, ports, session lifecycle
-    transport.md          # TCP framing, banner, version negotiation
-    authentication.md     # Apple security types, DH/AES, failure modes
-    handshake.md          # ClientInit/ServerInit, pixel formats, encodings
-    encodings.md          # Raw, ZRLE, Zlib, Cursor, MultiVariant, DisplayInfo
+    STATUS.md             # per-session handoff: verified / changed / next
+    authentication.md     # security type 33 (RSA1 + SRP-6a), DH/AES
+    record-layer.md       # 0x44f rekey, AES-128-CBC records, SHA-1
+    framebuffer.md        # ServerInit, pixel formats, 0x451/0x453, Zlib
+    codecs.md             # MultiVariant: streams, commands, ring, push modes
     input-and-gestures.md # key/pointer/scroll/gesture messages + event struct
     clipboard.md          # text/image pasteboard messages
-    audio.md              # later
-    display.md            # resolution/scale/display-info messages
-    glossary.md
+    filecopy.md           # 0x22 file-copy channel, both directions
   findings/               # dated experiment notes (no captures committed)
 tools/
-  capture/                # pcap helpers, RFB stream parser
-  probe/                  # minimal handshake/auth probes
-  instrument/             # dylib shims, lldb scripts, re-sign helpers
+  capture/                # trim an SS_DUMP_MVS capture to one burst
+  probe/                  # handshake / auth / framebuffer / MVS grammar probes
+  instrument/             # event injection (C) and dlopen/ndisasm introspection
+  filecopy/               # clipboard archive harness
+  measure/                # visual-latency harness: scroll injector, camera A/B,
+                          # parity analysis, decode-backlog report
+scripts/                  # reproducible lab commands
 crates/
   rfb-proto/              # pure protocol types, codecs, no I/O
   ss-client/              # transport + session state machine + CLI
-  ss-gui/                 # winit/wgpu (or softbuffer) frontend
-  gesture-input/          # macOS test backend + Linux evdev/libinput backend
-scripts/                  # reproducible lab commands
+  ss-gui/                 # winit + softbuffer frontend
+  gesture-input/          # portable recogniser + Linux evdev backend
 captures/                 # UNTRACKED: pcaps, logs, screenshots
-artifacts/                # UNTRACKED: builds, shims, extracted binaries
+artifacts/                # UNTRACKED test fixtures; pruned, see docs/testing.md
 ```
+
+Lab topology, accounts and permissions live in §2 of this file; that is the
+`docs/lab.md` this layout once reserved.
 
 ---
 
@@ -444,7 +450,10 @@ artifacts/                # UNTRACKED: builds, shims, extracted binaries
 
 - **Rust** (stable; 1.97.x is installed) for the client and protocol crates.
 - **Python 3.9** for one-off capture parsing and experiments.
-- Async I/O: `tokio`; errors: `thiserror`; logging: `tracing`.
+- Blocking I/O: `std::net::TcpStream` with one reader thread, one decoder
+  thread and one writer thread. There is no async runtime and no plan for one.
+  Errors: `anyhow`. Logging: `eprintln!`, gated behind `--debug-input`,
+  `SS_LATDBG` and `SS_DUMP_MVS`.
 - Crypto: start with well-reviewed crates (`aes`, `sha1`, `hmac`, `num-bigint`)
   or OpenSSL bindings; do not hand-roll primitives.
 - GUI: `winit` (native Wayland) + `softbuffer` for the first framebuffer
@@ -493,7 +502,7 @@ so unknown message types are logged and skipped without killing the session.
 | ID | Milestone | Definition of done |
 |----|-----------|--------------------|
 | M0 | Probe | CLI connects to `mm.local:5900`, performs auth, prints server name/version/desktop size, exits cleanly. |
-| M1 | Framebuffer | Decodes Raw + ZRLE, writes a correct PPM/PNG of the remote desktop; live window at ≥15 fps on LAN. (Python snapshot done; Rust/live pending.) |
+| M1 | Framebuffer | Decodes Raw, Zlib (6) and the `0x3e8`-`0x3ea` tiers, writes a correct PNG of the remote desktop; live window at ≥15 fps on LAN. (Done in Python and Rust; ZRLE is advertised by the native client but this server sends nothing for it, and our reader rejects it — see §13.) |
 | M2 | Input | Keyboard and absolute/relative pointer work end-to-end; modifier keys and drag are correct. |
 | M3 | Clipboard | Text clipboard syncs both directions. |
 | M4 | Gestures | Scroll, pinch, rotate, 3-/4-finger swipes, force click, and drag gestures are accepted by macOS and behave like the real client. |
@@ -523,10 +532,18 @@ cargo run -p ss-client -- gesture --host mm.local --kind swipe \
 cargo run -p ss-client -- gesture --host mm.local --kind magnify \
     --value 0.2 --mask 31 --series --out artifacts/magnify.png
 
-# Live GUI (0.5 server scale by default) and headless compositing check
-cargo run -p ss-gui -- --host mm.local
-cargo run -p ss-gui -- --host mm.local --scale 1.0   # full fidelity
-cargo run -p ss-gui -- --host mm.local --dump artifacts/gui.png --dump-after 1
+# Live GUI. --mvs is the fast path: MultiVariant plus server push. Without it the
+# client advertises Zlib (6), where this server takes ~700-880 ms to *produce* a
+# full frame against 44-49 ms for MVS — almost all of it server-side, not our
+# decode. --release matters for feel testing; the dev profile is already
+# optimised (opt-level 3 for these crates) but links without LTO.
+cargo run --release -p ss-gui -- --host mm.local --mvs
+cargo run --release -p ss-gui -- --host mm.local --mvs --dump artifacts/gui.png --dump-after 1
+
+# Latency measurement (see docs/testing.md)
+python3 tools/measure/decode_backlog.py /tmp/dbg.log      # from SS_LATDBG=1
+tools/measure/camera_ab.sh --client clone --label c1      # two-screen A/B
+python3 tools/measure/parity.py clone=c1.raw app=a1.raw
 
 # Linux raw multitouch (input group required)
 cargo run -p ss-gui --release -- --host <linux-host> --evdev
@@ -539,15 +556,17 @@ python3 tools/probe/apple_framebuffer.py --host mm.local --out artifacts/remote.
 open "vnc://tai@mm.local"
 ```
 
-Until the client exists, the "test" is a documented manual session with the real
-client plus a pcap and experiment note.
+`docs/testing.md` is the authority on how to measure rather than eyeball: unit
+tests, the decode replay benchmark, `SS_LATDBG`, wire captures and the two-screen
+camera A/B, with the recorded numbers and their caveats.
 
 ---
 
 ## 10. Working agreement for agents
 
-1. **Start every session** by reading `AGENTS.md`, `docs/protocol/STATUS.md`
-   (once it exists), and the latest file in `docs/findings/`.
+1. **Start every session** by reading `AGENTS.md`, `docs/protocol/STATUS.md`,
+   `docs/testing.md` (how to measure and what has already been measured), and
+   the latest file in `docs/findings/`.
 2. **State the experiment.** Before touching the lab, write down: hypothesis,
    commands, expected observable, and rollback.
 3. **Prefer read-only first.** `strings`, `otool`, `codesign -d`, `defaults
@@ -578,26 +597,29 @@ client plus a pcap and experiment note.
 
 ## 11. Open questions (prioritized)
 
-1. Which RFB security type(s) does the real client negotiate with this server
-   (`allowInsecureDH=1`, `VNCLegacyConnectionsEnabled=0`)? What exactly happens
-   when `encryptRFBDataStream`/`encryptKeystrokesOnly` are off?
-2. What are the exact Apple client→server message type numbers and layouts for
-   gestures? Which fields map to `swipemask`, `progress`, `flavor`, `flagbits`,
-   and the velocity components?
-3. Are gestures sent as one message per phase (begin/update/end), or as a
-   complete event after local recognition? What is the coordinate space?
-4. What is the exact auth key derivation and AES framing? Can the DH exchange be
-   MITM'd, or must we instrument an endpoint?
-5. Which encodings does the client actually advertise to this server, and in
-   what order? Which one does the server choose for a static vs moving desktop?
-6. Is MultiVariant required for the "Adaptive" quality mode, and how are its
-   tiles framed and decoded? Is there a fallback ZRLE path we can ship first?
-7. What does the server require for "control" vs "observe" permission, and how
+Still open:
+
+1. What does the server require for "control" vs "observe" permission, and how
    is that signalled in the handshake?
-8. How are Retina/HiDPI scale and display changes communicated (DisplayInfo vs
-   DisplayInfo2), and how should a Wayland client map them to fractional scale?
-9. Does this build support audio? If so, over which channel and codec?
-10. What is the minimum viable keepalive/ACK behaviour to avoid server timeouts?
+2. Does this build support audio? If so, over which channel and codec?
+3. What is the minimum viable keepalive/ACK behaviour for long sessions? No
+   keepalive was needed over a five-minute session (`STATUS.md`); unverified
+   beyond that, and rekey hardening is untested over hours.
+4. Swipe semantics: `motion`, `flags`, `flavor` and whether a physical HID
+   source is required. The message layout is known; the mapping to visible
+   Mission Control actions is not (see `input-and-gestures.md` §8.2).
+
+Answered — do not re-litigate without a measurement:
+
+| question | answer | where |
+|---|---|---|
+| Which security type does the native client negotiate? | 33 (`RSA1` + SRP-6a) | `authentication.md` |
+| Auth key derivation and AES framing, MITM-able? | SRP-6a + `SHA-256(K)[0:16]`; record layer `0x44f`, AES-128-CBC, SHA-1 | `authentication.md`, `record-layer.md` |
+| Gesture message numbers, layouts, field mapping | type `0x17`, subtypes 1-8/11, documented field by field | `input-and-gestures.md` §2 |
+| One message per phase or a whole event? | either; a lone `phase = 2` scroll frame is enough, and the native client sends one per trackpad event | `input-and-gestures.md` §8.1 |
+| Which encodings do we advertise, and what does the server pick? | Zlib (6) by default; MVS `0x3f3` + push with `--mvs`, which is what the native client uses | `main.rs` (SetEncodings), `framebuffer.md`, `codecs.md` |
+| How are MVS tiles framed and decoded? | two streams, 8x8 tiles, DCT/copy/fill commands, 99-byte coefficient ring; decoded to <=1 channel of the native oracle | `codecs.md` §2.19/2.20, `mvs.rs` |
+| How are Retina/HiDPI scale and layout changes communicated? | `0x451` carries point+pixel geometry; `0x453` vendor keysyms | `framebuffer.md`, `input-and-gestures.md` |
 
 ---
 
@@ -638,7 +660,8 @@ client plus a pcap and experiment note.
   `fb → tile → fb` for CopyPrevious/CopyAbove), run spans for fills,
   incremental raster position, and one publish per drained batch in the
   session decoder thread. Replay benchmark: 1000 → 272 ms for a captured
-  burst (94 → 347 Mpx/s). Live backlog p50 681 → 16 ms. Camera: envelope lag
+  burst (94 → 347 Mpx/s). Live backlog p50 681 → 16 ms (a repeat run on the
+  same build measured 2 ms p50, so 16 is the conservative number). Camera: envelope lag
   483 → 157 ms against SS.app's 237 ms, tail 533 → 133 ms against 267 ms, so
   the client is now on parity with `Screen Sharing.app` and marginally ahead
   on this link (SS.app spends ~1.6 MB per burst, we spend 0.05-1 MB).
@@ -647,6 +670,20 @@ client plus a pcap and experiment note.
   2 s "giving up on push" message is now an idle note, and the reader
   heartbeat advances on socket reads, so the keyboard grab no longer releases
   itself during a still screen.
+- **Cursor geometry in the fast path**: `0x451` (point vs pixel size) was only
+  advertised in the Zlib branch, so with `--mvs` the cursor bitmap fell back to
+  framebuffer scaling (half size on a 2x backing) and the push re-arm keyed on
+  `0x451` could never fire. It is now advertised with MVS and with `--encoding`.
+  The cursor is drawn from the point geometry: arrow 17x23 at 34x45 px.
+- **Docs made trustworthy**: `docs/testing.md` records every measurement layer
+  and its caveats, `tools/measure/` holds the harness (scroll injector, camera
+  A/B, parity analysis, decode-backlog report), and `README.md` was rewritten —
+  it still called MVS "in progress" and clipboard "opt-in". Every document was
+  then audited against the code, with the code taken as truth: the scroll
+  contract (`fixedDelta`, not line-granular), the file-copy frame (a pad byte at
+  +1, body at +6), Shift (`0xFFE1` is forwarded; the server ignores it for
+  printable keys), the file-copy test at `+0x64`, and §11's answered questions
+  are all corrected or marked superseded.
 - **Measured, not assumed**: the server's first-byte reaction is *not* worth
   chasing — the first visible change arrives at the same time in both clients.
 - **Scroll momentum default flipped**: the OS momentum tail is now forwarded by
@@ -700,7 +737,7 @@ Pulling a file or folder from the remote, and the input bug that blocked it.
   `Cmd+C` and the clipboard carried the item name. `0xFFE7` (Meta_L) is what
   works. Modifiers are now re-synced per key so a missed `ModifiersChanged`
   cannot silently drop one. This contradicts a static reading of the daemon's
-  KeyMap table - empirical wins (`input-and-gestures.md` §6).
+  KeyMap table - empirical wins (`input-and-gestures.md` §5).
 - **A plain Finder Cmd+C can never carry a path**: the remote pasteboard holds a
   file URL plus the name, and the server strips the URL from the archive. No
   client recovers it, Apple's included. *Copy as Pathname* is the gesture.
@@ -711,7 +748,8 @@ Pulling a file or folder from the remote, and the input bug that blocked it.
 
 File copy, both directions, verified by sha1 on the lab pair.
 
-- **Wire**: `0x22` + u32 length, then `{u16 version, u16 cmd, u32 sessionID}`,
+- **Wire**: `0x22`, a zero pad byte, `u32` body length (counted from +6), then
+  `{u16 version, u16 cmd, u32 sessionID}`,
   then cmd 2 `StartFileReceive` (the viewer names the destination folder on the
   remote), 100 `ItemInfo`, 101 `NewItem` per item, 102 `FileData` in 65536-byte
   chunks, 104 `EndSession`. Contract in `docs/protocol/filecopy.md`.
@@ -722,7 +760,9 @@ File copy, both directions, verified by sha1 on the lab pair.
   captured server-sent `NewItem`, not from the disassembly alone.
 - **Behaviour**: drop a file on the window to send it (winit `DroppedFile`) to
   `/Users/<remote user>/Downloads`; incoming files are written to `~/Downloads`
-  with `" 2"` on a name collision. Directory drops are refused. Transfers run on
+  with `" 2"` on a name collision. Directory drops are refused. *Since v1.3.0
+  folders are sent by DFS with `level` = depth; what stays refused is a symlink
+  drop.* Transfers run on
   a worker thread, so painting and input stay responsive. `--send-file` /
   `--recv-file` are test hooks, not user features.
 - **Not in v1.2.0**: drag-out of the window (declined; `StartFileSend` works but
@@ -818,8 +858,10 @@ keepalive/rekey hardening for long sessions.
   and pointer input, handles pinch/rotate/pan/smart-zoom, and has a headless
   `--dump` path that verifies compositing. Server-driven `0x09` updates with
   `0x451` re-arm, and full-resolution dirty-rect polling make it interactive.
-  `--scale <1.0` (`0x08`) is experimental because this server build stops
-  incremental updates in scaled mode. The window forces focus at startup and on
+  `--scale <1.0` (`0x08`) is honoured by this server build: a 1280x800 session
+  delivers incremental updates and a p50 15 ms decode backlog (2026-11-06). The
+  old "stops incremental updates" note was a 2026-11-03 observation that later
+  measurement overturned; the default stays 1.0. The window forces focus at startup and on
   first click; `--debug-input` traces winit events, `--ime` enables CJK input,
   and the title reports focus/disconnect state. `--scale` scales only the
   image; input coordinates stay in the server's original backing space.
@@ -844,17 +886,20 @@ keepalive/rekey hardening for long sessions.
   `codecs.md` §2.20; record: `docs/findings/2026-11-04-push-mode-mvs.md`.
 - **Latency reality:** polling MVS answers a keystroke in 85–98 ms p50, and the
   floor is one server capture interval — not the request loop (applied rects
-  arrive 6–9 ms apart during a repaint). Whether push beats that is still
-  unmeasured; `ss-gui` does not yet expose a correct push path.
+  arrive 6–9 ms apart during a repaint). Push was later measured at 92 ms p50,
+  inside that band, so the request leg was never the cost. *(`--mvs` has pushed
+  by default since v1.0.0; `--poll` is the request loop. The "push path not
+  exposed" note predates v1.0.0.)*
 - **Clipboard:** text sync is verified in both directions
-  (`docs/protocol/clipboard.md`). Reads need no AutoPasteboard; writes require
-  `0x15 AutoPasteboard(1)`, which puts the session in promise mode, so `ss-gui`
-  defaults to read and offers `--send-clipboard` for write.
-- **Next:** wire `ss-gui --push` to the now-working decoder and measure
-  keystroke latency against the 85–98 ms polling baseline; capture a real
-  swipe's CGEvent fields for swipe calibration (local Mission Control steals the
-  gesture, so this needs a suppressing tap or a parameter sweep); clipboard
-  duplex on one connection; keepalive/rekey; package on a Linux Wayland host.
+  (`docs/protocol/clipboard.md`). *Since v1.1.0 the clipboard is automatic and
+  duplex on one connection: `0x15 AutoPasteboard(1)` at connect, an 8-byte
+  `0x0b` fetch at connect and on `0x14 cmd=2`, `0x06` for text and a viewer
+  `0x1f` for images. `--clipboard` and `--send-clipboard` are accepted no-ops
+  kept for old command lines; `--no-clipboard` disables it. The session used to
+  close after a fetch because our fetch was 1 byte instead of 8.*
+- **Next:** capture a real swipe's CGEvent fields for swipe calibration (local
+  Mission Control steals the gesture, so this needs a suppressing tap or a
+  parameter sweep); keepalive/rekey; package on a Linux Wayland host.
 - **Blockers:** none. Debugging/DTrace restrictions force the
   re-signed-copy/shim route; the in-process `dlopen` + `ndisasm` method is
   already working and documented in `tools/instrument/`.

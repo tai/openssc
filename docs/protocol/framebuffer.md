@@ -105,7 +105,19 @@ byte zlib_payload[compressed_len]
 
 `compressed_len = 0` is a SELECT of a cached cursor; otherwise STORE.
 The decompressed payload is `w*h*4` BGRA followed by `w*h` alpha (separate
-plane). Cursor shape only; position comes from the client's pointer.
+plane).
+
+`0x450` carries the **shape** only. The server also drives the pointer:
+
+- `0x44c` (CursorPosition) reports warps and shape-driven moves;
+- `0x451` (DisplayInfo) carries the logical **point** size and the backing
+  **pixel** size, and that ratio is what sizes the cursor bitmap. Bitmaps are
+  measured in points (arrow 17x23, I-beam 9x18) while the framebuffer is 2x on a
+  Retina host, so a client that skips `0x451` draws the cursor at half size.
+
+The GUI therefore advertises `0x450`, `0x44c` and `0x451` together; `0x451` is
+also how a display-layout change arrives, and in push mode it drains the
+pushed stream, so re-arm `0x09` plus one non-incremental `0x03` after it.
 
 ## 3. Snapshot algorithm used by the Python probe
 
