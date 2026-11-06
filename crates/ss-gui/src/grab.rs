@@ -520,6 +520,11 @@ pub struct Grab {
 /// keyboard captured.
 static UI_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static READER_HEARTBEAT_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+/// Set by the session reader while its socket read is blocking. Waiting for a
+/// server that has nothing to send is normal (push mode on a still screen) and
+/// must not be reported as a stalled reader.
+static READER_BLOCKED_FLAG: std::sync::OnceLock<std::sync::Arc<std::sync::atomic::AtomicBool>> =
+    std::sync::OnceLock::new();
 
 /// Whether the keyboard is currently captured. Mirrors `Shared::enabled` so
 /// the event loop can ask without holding the handle.
@@ -537,6 +542,19 @@ pub fn beat_ui() {
 /// Called from the session reader loop.
 pub fn beat_reader() {
     READER_HEARTBEAT_MS.store(now_ms(), Ordering::Relaxed);
+}
+
+/// Share the reader's "blocked in recv" flag with the watchdog. The reader
+/// flips it around its blocking socket read.
+pub fn set_reader_blocked(flag: std::sync::Arc<std::sync::atomic::AtomicBool>) {
+    let _ = READER_BLOCKED_FLAG.set(flag);
+}
+
+fn reader_blocked() -> bool {
+    READER_BLOCKED_FLAG
+        .get()
+        .map(|f| f.load(Ordering::Relaxed))
+        .unwrap_or(false)
 }
 
 /// Most recent events, so a stall report can say what the app was doing.
@@ -669,7 +687,12 @@ where
                 }
                 let now = now_ms();
                 let ui_stalled = now.saturating_sub(UI_HEARTBEAT_MS.load(Ordering::Relaxed));
-                let rd_stalled = now.saturating_sub(READER_HEARTBEAT_MS.load(Ordering::Relaxed));
+                let rd_stalled = if reader_blocked() {
+                    // Blocked waiting for the server: alive, not wedged.
+                    0
+                } else {
+                    now.saturating_sub(READER_HEARTBEAT_MS.load(Ordering::Relaxed))
+                };
                 let limit = WATCHDOG_STALL.as_millis() as u64;
                 if ui_stalled > limit || rd_stalled > limit {
                     let what = if ui_stalled > limit { "event loop" } else { "session reader" };

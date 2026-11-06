@@ -17,6 +17,8 @@ use sha2::{Digest, Sha256, Sha512};
 use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::TcpStream;
+use std::sync::atomic::{AtomicBool, Ordering as AtomicOrdering};
+use std::sync::Arc;
 
 pub const VIEWER_PRELUDE: &[u8] = &[
     0x21, 0x00, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x02, 0x00, 0x00, 0x00, 0x03, 0x00,
@@ -1115,6 +1117,13 @@ pub struct SessionReader {
     /// The encoder never recycles ids, so entries live for the connection and
     /// a fresh `SessionReader` (reconnect) starts with an empty cache.
     cursor_cache: HashMap<u32, CursorUpdate>,
+    /// Called after every record read from the socket. A caller that guards
+    /// against a wedged reader needs socket activity, not completed updates:
+    /// in push mode a still screen legitimately produces no updates at all.
+    activity: Option<Arc<dyn Fn() + Send + Sync>>,
+    /// True only while the reader is blocked waiting for the next record.
+    /// Waiting for a server that has nothing to say is not a stall.
+    idle: Option<Arc<AtomicBool>>,
 }
 
 pub struct SessionWriter {
@@ -1145,6 +1154,8 @@ impl AppleSession {
                 pending: Vec::new(),
                 tier_zlib: None,
                 cursor_cache: HashMap::new(),
+                activity: None,
+                idle: None,
             },
             SessionWriter {
                 stream: writer_stream,
@@ -1161,6 +1172,23 @@ impl SessionReader {
     pub fn set_read_timeout(&mut self, timeout: std::time::Duration) -> Result<()> {
         self.stream.set_read_timeout(Some(timeout))?;
         Ok(())
+    }
+
+    /// Install a callback invoked after every successful socket record read.
+    ///
+    /// Used as a liveness witness: a complete `Update` only proves progress
+    /// when the server has something to send, while a still screen in push
+    /// mode is normal and must not look like a stalled reader.
+    pub fn set_activity_hook(&mut self, hook: Arc<dyn Fn() + Send + Sync>) {
+        self.activity = Some(hook);
+    }
+
+    /// Install a flag that is set while the socket read is blocking.
+    ///
+    /// Liveness watchdogs need this to tell "the server has nothing to send"
+    /// (normal for push on a still screen) from "this thread is wedged".
+    pub fn set_idle_flag(&mut self, flag: Arc<AtomicBool>) {
+        self.idle = Some(flag);
     }
 }
 
@@ -1187,9 +1215,21 @@ impl SessionWriter {
 
 impl SessionReader {
     fn recv_message(&mut self) -> Result<Vec<u8>> {
-        let n = read_u16(&mut self.stream)? as usize;
+        // Mark the wait before it starts: this call blocks until the server
+        // sends the next record header.
+        if let Some(idle) = &self.idle {
+            idle.store(true, AtomicOrdering::Relaxed);
+        }
+        let n = read_u16(&mut self.stream);
+        if let Some(idle) = &self.idle {
+            idle.store(false, AtomicOrdering::Relaxed);
+        }
+        let n = n? as usize;
         let mut ct = vec![0u8; n];
         self.stream.read_exact(&mut ct)?;
+        if let Some(hook) = &self.activity {
+            hook();
+        }
         self.recv.decrypt(&ct)
     }
 

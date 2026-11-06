@@ -20,7 +20,7 @@ use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -580,6 +580,10 @@ static READER_ALIVE_MS: AtomicU64 = AtomicU64::new(0);
 static LAST_APPLIED_MS: AtomicU64 = AtomicU64::new(0);
 /// Set once the first pushed frame has been painted.
 static PUSH_PAINTED: AtomicBool = AtomicBool::new(false);
+/// EXPERIMENT: SS_LATDBG=1 traces arrival -> decode -> paint so the visible
+/// backlog can be attributed to a stage instead of guessed at.
+static LATDBG: OnceLock<bool> = OnceLock::new();
+fn latdbg() -> bool { *LATDBG.get_or_init(|| std::env::var("SS_LATDBG").is_ok()) }
 /// Timestamp of the oldest local input event that has not been answered by a
 /// painted rectangle yet; `u64::MAX` means "nothing pending".
 static INPUT_PENDING_MS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -963,6 +967,42 @@ impl Decoder {
         }
         self.mark(r.x, r.y, r.w, r.h);
     }
+}
+
+/// EXPERIMENT (`SS_DUMP_MVS=<path>`): record every MVS body with the rect and
+/// encoding it arrived with, so a captured scroll burst can be replayed by the
+/// decode benchmark in `crates/rfb-proto/tests/mvs_replay.rs`.
+///
+/// Format (little-endian, analysis only): `SSMVS1\0\0`, `u16` width, `u16`
+/// height, then repeated `u32 len`, `u32 ms since start`, `u16 x, y, w, h`,
+/// `u32 encoding`, `len` body bytes. Flushed per body so a killed client still
+/// leaves a usable file.
+fn dump_mvs(width: u16, height: u16, rect: &rfb_proto::RectUpdate) {
+    use std::io::Write;
+    static DUMP: OnceLock<Option<std::sync::Mutex<BufWriter<File>>>> = OnceLock::new();
+    let Some(slot) = DUMP.get_or_init(|| {
+        let path = PathBuf::from(std::env::var_os("SS_DUMP_MVS")?);
+        let mut file = BufWriter::new(File::create(&path).ok()?);
+        file.write_all(b"SSMVS1\0\0").ok()?;
+        file.write_all(&width.to_le_bytes()).ok()?;
+        file.write_all(&height.to_le_bytes()).ok()?;
+        eprintln!("mvs dump: {path:?}");
+        Some(std::sync::Mutex::new(file))
+    }) else {
+        return;
+    };
+    if rect.encoding != 0x3f3 || rect.pixels.is_empty() {
+        return;
+    }
+    let Ok(mut file) = slot.lock() else { return };
+    let _ = file.write_all(&(rect.pixels.len() as u32).to_le_bytes());
+    let _ = file.write_all(&(now_ms() as u32).to_le_bytes());
+    for v in [rect.x, rect.y, rect.w, rect.h] {
+        let _ = file.write_all(&v.to_le_bytes());
+    }
+    let _ = file.write_all(&rect.encoding.to_le_bytes());
+    let _ = file.write_all(&rect.pixels);
+    let _ = file.flush();
 }
 
 /// Hand the changed region to the UI. The region is the union of everything
@@ -1742,8 +1782,8 @@ impl App {
                 eprintln!(
                     "scroll t={} ms raw=({dx:.1},{dy:.1}) point=({},{}) lines=({},{}) fixed=({},{}) phase={} precise={} momentum={from_momentum} speed={:.2}",
                     START.get_or_init(Instant::now).elapsed().as_millis(),
-                    dx.round() as i32,
-                    dy.round() as i32,
+                    x,
+                    y,
                     lines.0,
                     lines.1,
                     fixed.0,
@@ -2839,6 +2879,9 @@ impl ApplicationHandler<UserEvent> for App {
             }
             self.frames += 1;
             self.full_frame |= full;
+            if latdbg() {
+                eprintln!("[{} ms] PAINT frames={}", now_ms(), self.frames);
+            }
             LAST_APPLIED_MS.store(now_ms(), Ordering::Relaxed);
             PUSH_PAINTED.store(true, Ordering::Relaxed);
             self.record_input_latency();
@@ -3279,7 +3322,22 @@ fn main() -> Result<()> {
             session.send_message(&framebuffer_update_request(fb_w, fb_h, true))?;
         }
     }
-    let (reader, writer) = session.split()?;
+    let (mut reader, writer) = session.split()?;
+    // Liveness witness for the grab watchdog: socket activity, not completed
+    // updates. A still screen in push mode sends nothing to decode, which used
+    // to look like a stalled reader and dropped the keyboard grab.
+    reader.set_activity_hook(Arc::new(|| {
+        let now = START
+            .get_or_init(Instant::now)
+            .elapsed()
+            .as_millis() as u64;
+        READER_ALIVE_MS.store(now, Ordering::Relaxed);
+        grab::beat_reader();
+    }));
+    // A blocking read means "the server has nothing to send", not "wedged".
+    let reader_idle = Arc::new(AtomicBool::new(false));
+    reader.set_idle_flag(reader_idle.clone());
+    grab::set_reader_blocked(reader_idle);
 
     let (tx_out, rx_out) = mpsc::channel::<Vec<u8>>();
     // Bounded: if the GUI cannot keep up, apply backpressure instead of
@@ -3294,7 +3352,9 @@ fn main() -> Result<()> {
     // it is not draining the socket, the TCP window closes and the server
     // stalls, which is what made the picture lag the remote by hundreds of ms.
     // MVS bodies are stateful, so nothing may be dropped here - order matters.
-    let (tx_decode, rx_decode) = mpsc::channel::<Update>();
+    // Arrival time travels with the update so the decoder can report how long
+    // the oldest body in a batch waited before it was painted.
+    let (tx_decode, rx_decode) = mpsc::channel::<(Update, u64)>();
 
     // File copy: received items always land in ~/Downloads; dropped files are
     // sent to /Users/<remote user>/Downloads (the native client's shape).
@@ -3374,10 +3434,9 @@ fn main() -> Result<()> {
     }
 
     if push {
-        // Narrow watchdog: once the first pushed frame has been painted, if the
-        // stream goes quiet for more than 2 s, say so once and stop waiting.
-        // Deliberately does NOT fall back to polling, so a broken push stream
-        // is visible instead of silently costing a request per keystroke.
+        // Idle note, not a failure report: push only sends changes, so a still
+        // screen legitimately produces nothing. Say it once so a long quiet
+        // spell is explained, and keep the session armed.
         thread::spawn(move || loop {
             thread::sleep(Duration::from_millis(200));
             if !PUSH_PAINTED.load(Ordering::Relaxed) {
@@ -3386,7 +3445,7 @@ fn main() -> Result<()> {
             let quiet = now_ms().saturating_sub(LAST_APPLIED_MS.load(Ordering::Relaxed));
             if quiet > 2000 {
                 eprintln!(
-                    "[{:6} ms] push: nothing applied for {quiet} ms after the initial paint; giving up on push — re-run with --poll to use the request loop",
+                    "[{:6} ms] push: screen unchanged for {quiet} ms (normal: push only sends changes)",
                     now_ms()
                 );
                 break;
@@ -3485,7 +3544,6 @@ fn main() -> Result<()> {
     let remote_path_reader = remote_path.clone();
     let recv_dir_reader = recv_dir.clone();
     let reader_proxy = proxy.clone();
-    let frame_slot_reader = frame_slot.clone();
     let debug_reader = debug_input;
     // Decoder thread: owns the session decoder, applies bodies in arrival
     // order and publishes whole frames for the UI. It never touches the
@@ -3495,17 +3553,43 @@ fn main() -> Result<()> {
         let debug_dec = debug_input;
         thread::spawn(move || {
             let mut decoder = Decoder::new(fb_w, fb_h, mvs, debug_dec);
-            for update in rx_decode {
-                for r in &update.rects {
+            // One publish per batch, not per update. During a scroll the
+            // reader hands over ~130 updates and the UI can only show the
+            // latest; applying them all in order (MVS deltas are stateful,
+            // nothing may be dropped or reordered) and copying the dirty
+            // union once removes ~130 full-region copies from the critical
+            // path. What the UI sees is unchanged: the dirty rect is the
+            // union of everything applied since it last took a frame.
+            loop {
+                let Ok((first, first_arr)) = rx_decode.recv() else { break };
+                let t0 = Instant::now();
+                let mut batch = 1;
+                let mut rects = first.rects.len();
+                let mut last_arr = first_arr;
+                for r in &first.rects {
                     decoder.apply(r);
                 }
+                while let Ok((more, arr)) = rx_decode.try_recv() {
+                    batch += 1;
+                    last_arr = arr;
+                    rects += more.rects.len();
+                    for r in &more.rects {
+                        decoder.apply(r);
+                    }
+                }
                 publish_frame(&mut decoder, &frame_slot_dec);
+                if latdbg() {
+                    eprintln!(
+                        "[{} ms] DEC updates={batch} rects={rects} first_arr={first_arr} last_arr={last_arr} took={:.1} ms",
+                        now_ms(),
+                        t0.elapsed().as_secs_f64() * 1000.0,
+                    );
+                }
             }
         });
     }
     thread::spawn(move || {
         let mut reader = reader;
-        let mut decoder = Decoder::new(fb_w, fb_h, mvs, debug_reader);
         if debug_reader {
             thread::spawn(|| loop {
                 thread::sleep(Duration::from_secs(2));
@@ -3687,11 +3771,21 @@ fn main() -> Result<()> {
                         .rects
                         .iter()
                         .any(|r| r.encoding == 0x3f3 && r.w == fb_w && r.h == fb_h);
+                    // EXPERIMENT (SS_LATDBG=1): arrival timestamp per update,
+                    // so the backlog can be measured against decode and paint.
+                    if latdbg() {
+                        let bytes: usize = update.rects.iter().map(|r| r.pixels.len()).sum();
+                        eprintln!("[{} ms] ARR rects={} bytes={}", now_ms(), update.rects.len(), bytes);
+                    }
+                    // EXPERIMENT (SS_DUMP_MVS): analysis hook, no-op unless set.
+                    for r in &update.rects {
+                        dump_mvs(fb_w, fb_h, r);
+                    }
                     // The UI only needs the metadata, not the encoded rects.
                     let meta = update_for_meta(&update);
                     // Hand off instead of decoding here: the decoder runs on
                     // its own thread so this thread keeps draining the socket.
-                    if tx_decode.send(update).is_err() {
+                    if tx_decode.send((update, now_ms())).is_err() {
                         break;
                     }
                     if tx_upd.send(meta).is_err() {
