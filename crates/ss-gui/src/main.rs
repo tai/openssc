@@ -1140,7 +1140,10 @@ enum UserEvent {
 }
 
 struct App {
-    context: softbuffer::Context<DisplayHandle<'static>>,
+    /// `Option` only so `exiting` can drop it while winit's Wayland display is
+    /// still alive. `EventLoop::run_app` takes the loop by value, so the
+    /// context would otherwise outlive the foreign `wl_display` it borrows.
+    context: Option<softbuffer::Context<DisplayHandle<'static>>>,
     window: Option<Arc<Window>>,
     surface: Option<softbuffer::Surface<DisplayHandle<'static>, Arc<Window>>>,
     /// The presented framebuffer. The reader sends dirty regions; the UI only
@@ -1280,14 +1283,17 @@ impl App {
         coast: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
-        // SAFETY: the context is dropped before the event loop (see `exiting`).
+        // SAFETY: `exiting` drops the context before `run_app` returns, i.e.
+        // while this display handle is still valid. `run_app` takes the
+        // EventLoop by value, so dropping the context as a field of `App`
+        // after it returns would call into a disconnected `wl_display`.
         let display = unsafe {
             std::mem::transmute::<DisplayHandle<'_>, DisplayHandle<'static>>(display)
         };
         let context = softbuffer::Context::new(display)
             .map_err(|e| anyhow::anyhow!("softbuffer context: {e:?}"))?;
         Ok(Self {
-            context,
+            context: Some(context),
             window: None,
             surface: None,
             fb: vec![0u32; fb_w as usize * fb_h as usize],
@@ -2241,7 +2247,10 @@ impl ApplicationHandler<UserEvent> for App {
             .with_title("ss-clone — Apple Screen Sharing")
             .with_inner_size(LogicalSize::new(1280.0, 800.0));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
-        let surface = softbuffer::Surface::new(&self.context, window.clone())
+        let Some(context) = self.context.as_ref() else {
+            return;
+        };
+        let surface = softbuffer::Surface::new(context, window.clone())
             .unwrap_or_else(|e| panic!("softbuffer surface: {e:?}"));
         self.surface = Some(surface);
         self.window = Some(window);
@@ -2921,8 +2930,12 @@ impl ApplicationHandler<UserEvent> for App {
         }
         self.modifiers = ModifiersState::empty();
         self.sync_modifiers(ModifiersState::empty());
+        // softbuffer's Wayland context borrows winit's `wl_display`. tear it
+        // down here, while `run_app` still owns that display; it is consumed
+        // by value when `run_app` returns, before `App` is dropped.
         self.surface = None;
         self.window = None;
+        self.context = None;
     }
 }
 
