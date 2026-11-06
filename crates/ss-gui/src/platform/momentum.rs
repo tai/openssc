@@ -1,4 +1,4 @@
-//! macOS momentum-phase classification for scroll events.
+//! Momentum-phase classification for scroll events.
 //!
 //! winit maps `NSEvent.momentumPhase` onto the same `TouchPhase` sequence as a
 //! real touch (momentum Began -> Started), and gives it priority over the
@@ -7,20 +7,25 @@
 //! monitor runs before the event is dispatched, so it can read the real
 //! `momentumPhase` and record one classification per event; the GUI pops it in
 //! its `MouseWheel` handler.
+//!
+//! The queue is portable and the only part that needs testing. On platforms
+//! without the monitor `start()` returns false and nothing is ever queued, so
+//! `take()` returns `None` — the same as an unclassified event.
 
 use std::collections::VecDeque;
-use std::ptr::NonNull;
 use std::sync::Mutex;
-
-use block2::RcBlock;
-use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase};
 
 /// One entry per scroll event, in dispatch order: `true` = momentum.
 static QUEUE: Mutex<VecDeque<bool>> = Mutex::new(VecDeque::new());
 
 /// Install the local monitor. Returns false when the API returns nil (the
 /// caller then falls back to forwarding every event).
+#[cfg(target_os = "macos")]
 pub fn start() -> bool {
+    use block2::RcBlock;
+    use objc2_app_kit::{NSEvent, NSEventMask, NSEventPhase};
+    use std::ptr::NonNull;
+
     let handler = RcBlock::new(|event: NonNull<NSEvent>| -> *mut NSEvent {
         let momentum = unsafe { event.as_ref().momentumPhase() } != NSEventPhase::None;
         if let Ok(mut queue) = QUEUE.lock() {
@@ -47,6 +52,13 @@ pub fn start() -> bool {
         }
         None => false,
     }
+}
+
+/// No momentum monitor on this platform: every scroll event is unclassified
+/// and the GUI forwards it.
+#[cfg(not(target_os = "macos"))]
+pub fn start() -> bool {
+    false
 }
 
 /// Pop the classification for the event winit is about to deliver.
