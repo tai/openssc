@@ -1036,6 +1036,23 @@ pub fn image_item(uti: &str, data: &[u8]) -> PasteboardItem {
     }
 }
 
+/// A pasteboard item for plain UTF-8 text.
+///
+/// Used for the viewer→server `0x1f` archive. `0x06 ClientCutText` alone
+/// installs a *promise* on this server: readable through `osascript`, but
+/// `pbpaste` and app-level paste see nothing. Sending the same text as a
+/// viewer archive carries real data, so remote Cmd+V works.
+pub fn text_item(text: &str) -> PasteboardItem {
+    PasteboardItem {
+        uti: "public.utf8-plain-text".to_string(),
+        aliases: vec![
+            ("public.mime-type".to_string(), "text/plain".to_string()),
+            ("com.apple.ostype".to_string(), "TEXT".to_string()),
+        ],
+        data: text.as_bytes().to_vec(),
+    }
+}
+
 /// Viewer→server `0x1f` ClipboardSend (the native client's local→remote image
 /// path). Layout verified from the daemon: 16-byte header, then the archive
 /// zlib-compressed with Z_SYNC_FLUSH, exactly like the server→client message:
@@ -2011,6 +2028,15 @@ mod tests {
         dec.decompress(&msg[16..], &mut out, flate2::FlushDecompress::Sync)
             .unwrap();
         assert_eq!(&out[..dec.total_out() as usize], &archive[..]);
+    }
+
+    #[test]
+    fn text_item_roundtrips_as_pasteboard_text() {
+        let text = "line one\n日本語 line two";
+        let item = text_item(text);
+        assert_eq!(item.uti, "public.utf8-plain-text");
+        let archive = pasteboard_archive(&[item]);
+        assert_eq!(pasteboard_text(&archive).unwrap().as_deref(), Some(text));
     }
 
     #[test]
