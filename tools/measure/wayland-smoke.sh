@@ -174,7 +174,7 @@ fi
 
 # ------------------------------------------------------------- client
 ARGS=(--host "$HOST" --port "$PORT" --user "$REMOTE_USER" \
-      --password "$PASSWORD" --mvs \
+      --password "$PASSWORD" --mvs --no-clipboard \
       --dump "$DUMP" --dump-after "$DUMP_AFTER")
 if [ "$do_grim" -eq 1 ]; then
   # Keep the window alive for grim; close it through the compositor afterwards,
