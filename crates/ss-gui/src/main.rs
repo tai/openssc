@@ -5,7 +5,7 @@
 //! events into RFB/Apple messages and presents BGRX frames.
 
 use anyhow::Result;
-use gesture_input::{AxisFilter, Gesture, Momentum, Phase, SCROLL_POINTS_PER_LINE};
+use gesture_input::{AxisFilter, Gesture, Phase, SCROLL_POINTS_PER_LINE};
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
     client_cut_text, clipboard_fetch, framebuffer_update_request, gesture_begin_end,
@@ -37,6 +37,8 @@ mod filecopy;
 
 #[cfg(target_os = "macos")]
 mod grab;
+#[cfg(target_os = "macos")]
+mod momentum;
 
 /// The keyboard grab handle. A no-op stub off macOS so the rest of the app
 /// does not need cfg branches.
@@ -86,6 +88,20 @@ static SCROLL_SPEED: std::sync::atomic::AtomicU32 =
 
 fn scroll_speed() -> f32 {
     f32::from_bits(SCROLL_SPEED.load(std::sync::atomic::Ordering::Relaxed))
+}
+
+/// Should a scroll event be forwarded to the remote?
+///
+/// Touchdown events always go through (that is the continuous scrolling the
+/// owner wants smooth). OS momentum events are dropped by default - they are
+/// what made micro-scroll and flick-and-stop drift - and forwarded only with
+/// `--coast`. An event with no classification (monitor unavailable or a
+/// desync) is forwarded rather than swallowed.
+fn scroll_forward(is_momentum: Option<bool>, coast: bool) -> bool {
+    match is_momentum {
+        Some(true) => coast,
+        Some(false) | None => true,
+    }
 }
 
 /// Map winit's touch phase onto the portable gesture phase.
@@ -481,9 +497,8 @@ Display and codec:
 Input and keyboard:
   --keymap us|jis          layout the REMOTE runs (default us)
   --scroll-speed <f>       scroll distance multiplier, feel calibration (default 1.0)
-  --momentum               synthesise a post-release glide (default off; the OS
-                           already provides momentum, which we forward)
-  --no-coast               drop the OS momentum tail (default: forward it)
+  --coast                  forward the OS momentum tail (default: drop it)
+  --no-coast               accepted no-op; dropping momentum is the default
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
@@ -1161,31 +1176,14 @@ struct App {
     scroll_pending: Option<PendingScroll>,
     /// When the last scroll message went out (coalescing to ~120 Hz).
     scroll_last: Instant,
-    /// Post-release glide, driven by the last scroll velocity.
-    scroll_momentum: Momentum,
-    /// True while the OS is coasting after a touch ended.
-    scroll_coasting: bool,
-    /// `--no-coast`: drop the OS momentum tail instead of forwarding it.
-    /// Default is to forward it, because a capture of genuine Screen
-    /// Sharing.app shows it forwarding momentum at a steady ~60 Hz.
-    drop_coast: bool,
-    /// When the last touch phase ended, for the momentum-start heuristic.
-    scroll_ended_at: Option<Instant>,
-    /// `--momentum`: allow the post-release glide. Off by default - the owner
-    /// wants the scroll to stop when the fingers stop, and an overshooting
-    /// glide is worse than no glide at all.
-    momentum_enabled: bool,
+    /// `--coast`: forward the OS momentum tail. Default is to drop it, which
+    /// is what makes micro-scroll and flick-and-stop stop dead.
+    coast: bool,
+    /// Scroll events with no momentum classification (monitor missing or a
+    /// desync); forwarded and counted so the log shows it.
+    scroll_unclassified: u64,
     /// Continuous axis weighting from recent motion (no mode, no latch).
     scroll_axis: AxisFilter,
-    /// Whether the glide was running on the previous frame (to reset history
-    /// when it ends).
-    scroll_gliding: bool,
-    /// Last scroll velocity in points per second (for the glide).
-    scroll_velocity: (f32, f32),
-    /// When the previous scroll sample arrived.
-    scroll_sample_at: Instant,
-    /// When the current scroll gesture began (Began phase), for the flick test.
-    scroll_gesture_start: Option<Instant>,
     /// `--scroll-test stop`: when to send the touch that stops the glide.
     scroll_stop_at: Option<Instant>,
     /// `--scroll-test stress`: remaining scripted flicks and when the next
@@ -1230,8 +1228,7 @@ impl App {
         grab: Option<GrabHandle>,
         scroll_test: String,
         frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
-        momentum_enabled: bool,
-        drop_coast: bool,
+        coast: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -1291,16 +1288,9 @@ impl App {
             scroll_rem: (0.0, 0.0),
             scroll_pending: None,
             scroll_last: Instant::now(),
-            scroll_momentum: Momentum::new(),
-            momentum_enabled,
-            scroll_coasting: false,
-            drop_coast,
-            scroll_ended_at: None,
+            coast,
+            scroll_unclassified: 0,
             scroll_axis: AxisFilter::new(),
-            scroll_gliding: false,
-            scroll_velocity: (0.0, 0.0),
-            scroll_sample_at: Instant::now(),
-            scroll_gesture_start: None,
             scroll_stop_at: None,
             scroll_stress: 0,
             scroll_stress_next: None,
@@ -1653,31 +1643,7 @@ impl App {
         else {
             return;
         };
-        // Track the release velocity for the glide, and stop any glide the
-        // moment the fingers are back on the pad.
         let now = Instant::now();
-        let dt = now
-            .duration_since(self.scroll_sample_at)
-            .as_secs_f32()
-            .max(0.001);
-        // The release event itself carries no motion; keep the last real
-        // velocity so the glide has something to work with.
-        if !matches!(phase, Phase::Ended | Phase::Cancelled) && (dx != 0.0 || dy != 0.0) {
-            self.scroll_velocity = (dx / dt, dy / dt);
-        }
-        self.scroll_sample_at = now;
-        match phase {
-            Phase::Began => {
-                self.scroll_momentum.stop();
-                self.scroll_gesture_start = Some(now);
-            }
-            Phase::Changed => self.scroll_momentum.stop(),
-            Phase::Ended => {}
-            Phase::Cancelled => {
-                self.scroll_momentum.stop();
-                self.scroll_gesture_start = None;
-            }
-        }
         if phase == Phase::Began {
             self.scroll_axis.begin();
         }
@@ -1717,23 +1683,6 @@ impl App {
         let urgent = !matches!(phase, Phase::Changed);
         if urgent || self.scroll_last.elapsed() >= SCROLL_INTERVAL {
             self.flush_scroll();
-        }
-        if phase == Phase::Ended {
-            let (vx, vy) = self.scroll_velocity;
-            let gesture = self
-                .scroll_gesture_start
-                .take()
-                .map(|start| now.duration_since(start))
-                .unwrap_or_default();
-            let speed = (vx * vx + vy * vy).sqrt();
-            let started = self.momentum_enabled
-                && self.scroll_momentum.start(vx, vy, gesture, now);
-            if self.debug_input {
-                eprintln!(
-                    "scroll release v=({vx:.0},{vy:.0}) speed={speed:.0} pt/s gesture={} ms -> momentum={started}",
-                    gesture.as_millis()
-                );
-            }
         }
     }
 
@@ -2424,37 +2373,40 @@ impl ApplicationHandler<UserEvent> for App {
                     // speed (and, with the old 120 pt/line constant, at 1/24th).
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
-                // After the fingers lift, macOS keeps delivering momentum
-                // scroll events (NSEvent.momentumPhase). winit maps that phase
-                // onto the SAME Started/Moved/Ended sequence as a real touch
-                // (momentum Began -> Started, momentum Ended -> Ended), so it
-                // cannot be told apart by phase alone. What it does have is
-                // timing: momentum starts within a frame or two of the touch
-                // ending, whereas a new touch comes after the hand has moved.
-                // So: a Started inside COAST_WINDOW after an Ended begins the
-                // coasting phase, and its Moved events are dropped.
-                const COAST_WINDOW: Duration = Duration::from_millis(150);
-                let now = Instant::now();
-                match phase {
-                    TouchPhase::Started => {
-                        let soon = self.scroll_ended_at.map_or(false, |t| now - t < COAST_WINDOW);
-                        self.scroll_coasting = soon;
-                        if soon && self.debug_input {
-                            eprintln!("scroll: OS momentum begins (coasting until Ended)");
+                // winit cannot tell the OS momentum tail from a new touch (it
+                // maps momentumPhase onto the same TouchPhase and gives it
+                // priority), so the macOS NSEvent monitor classifies each
+                // event before dispatch. Touchdown events always go through;
+                // momentum events are dropped unless `--coast` asked for them.
+                #[cfg(target_os = "macos")]
+                let is_momentum = momentum::take();
+                #[cfg(target_os = "macos")]
+                if self.debug_input {
+                    let queued = momentum::pending();
+                    if queued > 4 {
+                        eprintln!("scroll: classification queue {queued} deep (monitor/winit desync)");
+                    }
+                }
+                #[cfg(not(target_os = "macos"))]
+                let is_momentum: Option<bool> = None;
+                if self.debug_input {
+                    match is_momentum {
+                        Some(true) => eprintln!(
+                            "scroll: momentum event ({})",
+                            if self.coast { "forwarded" } else { "dropped" }
+                        ),
+                        Some(false) => eprintln!("scroll: touch event"),
+                        None => {
+                            self.scroll_unclassified += 1;
+                            eprintln!(
+                                "scroll: unclassified event (#{}), forwarding",
+                                self.scroll_unclassified
+                            );
                         }
                     }
-                    TouchPhase::Ended | TouchPhase::Cancelled => {
-                        self.scroll_coasting = false;
-                        self.scroll_ended_at = Some(now);
-                    }
-                    TouchPhase::Moved => {
-                        if self.scroll_coasting && self.drop_coast {
-                            if self.debug_input {
-                                eprintln!("scroll: dropped OS momentum event ({dx:.0},{dy:.0})");
-                            }
-                            return;
-                        }
-                    }
+                }
+                if !scroll_forward(is_momentum, self.coast) {
+                    return;
                 }
                 self.queue_scroll(Gesture::Scroll {
                     dx,
@@ -2740,17 +2692,56 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
             }
         }
-        let gliding = self.scroll_momentum.active();
-        if self.scroll_gliding && !gliding {
-            // A glide just ended: the next gesture starts with fresh history.
-            self.scroll_axis.begin();
+        if let Some(at) = self.scroll_stop_at {
+            if Instant::now() >= at {
+                self.scroll_stop_at = None;
+                eprintln!("scroll test: touch to stop the glide");
+                self.queue_scroll(Gesture::Scroll {
+                    dx: 0.0,
+                    dy: 0.0,
+                    phase: Phase::Began,
+                    precise: true,
+                    momentum: None,
+                });
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
         }
-        self.scroll_gliding = gliding;
-        while let Some(gesture) = self.scroll_momentum.tick(Instant::now()) {
-            self.emit_scroll(&gesture, true);
-        }
-        if let Some(at) = self.scroll_momentum.next_at() {
-            event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+        if let Some(at) = self.scroll_stress_next {
+            if Instant::now() >= at {
+                if self.scroll_stress > 0 {
+                    self.scroll_stress -= 1;
+                    self.scroll_stress_next = Some(Instant::now() + Duration::from_millis(700));
+                    self.queue_scroll(Gesture::Scroll {
+                        dx: 0.0,
+                        dy: 0.0,
+                        phase: Phase::Began,
+                        precise: true,
+                        momentum: None,
+                    });
+                    for _ in 0..10 {
+                        self.queue_scroll(Gesture::Scroll {
+                            dx: 0.0,
+                            dy: -40.0,
+                            phase: Phase::Changed,
+                            precise: true,
+                            momentum: None,
+                        });
+                        thread::sleep(Duration::from_millis(16));
+                    }
+                    self.queue_scroll(Gesture::Scroll {
+                        dx: 0.0,
+                        dy: 0.0,
+                        phase: Phase::Ended,
+                        precise: true,
+                        momentum: None,
+                    });
+                } else {
+                    self.scroll_stress_next = None;
+                }
+            } else {
+                event_loop.set_control_flow(ControlFlow::WaitUntil(at));
+            }
         }
         // A coalesced scroll batch must not sit until the next wheel event:
         // flush it when the interval expires, or wake up to do so. Without
@@ -2762,7 +2753,7 @@ impl ApplicationHandler<UserEvent> for App {
             } else {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
-        } else if !self.demo_cursor && !self.scroll_momentum.active() {
+        } else if !self.demo_cursor {
             // While the keyboard is captured, keep waking so the tap watchdog
             // can tell "idle" from "wedged". An idle app that never ticks is
             // indistinguishable from a hung one, and the watchdog would then
@@ -2922,8 +2913,7 @@ fn main() -> Result<()> {
     let mut pull_paths: Vec<String> = Vec::new();
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
-    let mut momentum_enabled = false;
-    let mut drop_coast = false;
+    let mut coast = false;
     let mut keymap_name: Option<String> = None;
     // Lab hook: scripted gesture for measuring the scroll model
     // (`flick`, `drag`, `medium`, `stop`, `jitter`, `diagonal`, `turn`).
@@ -3034,12 +3024,13 @@ fn main() -> Result<()> {
                 SCROLL_SPEED.store(speed.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 i += 2;
             }
-            "--momentum" => {
-                momentum_enabled = true;
+            "--coast" => {
+                coast = true;
                 i += 1;
             }
             "--no-coast" => {
-                drop_coast = true;
+                // Kept as an accepted no-op: dropping momentum is the default.
+                coast = false;
                 i += 1;
             }
             "--keymap" if i + 1 < args.len() => {
@@ -3120,6 +3111,14 @@ fn main() -> Result<()> {
         },
     };
     eprintln!("keymap: {} (remote layout)", keymap.name);
+    #[cfg(target_os = "macos")]
+    {
+        if momentum::start() {
+            eprintln!("scroll: momentum-phase monitor installed");
+        } else {
+            eprintln!("scroll: momentum-phase monitor unavailable; forwarding every scroll event");
+        }
+    }
     if let Ok(v) = std::env::var("SS_SCROLL_SUBTYPE") {
         match v.trim().parse::<u8>() {
             Ok(8) => {
@@ -3764,8 +3763,7 @@ fn main() -> Result<()> {
         grab,
         scroll_test,
         frame_slot.clone(),
-        momentum_enabled,
-        drop_coast,
+        coast,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
@@ -3877,6 +3875,18 @@ mod tests {
         let msg = msg.unwrap();
         let phase = u32::from_be_bytes([msg[46], msg[47], msg[48], msg[49]]);
         assert_eq!(phase, 4);
+    }
+
+    #[test]
+    fn momentum_is_dropped_unless_coasting() {
+        // Touchdown events always pass.
+        assert!(scroll_forward(Some(false), false));
+        assert!(scroll_forward(Some(false), true));
+        // OS momentum is dropped by default and forwarded with --coast.
+        assert!(!scroll_forward(Some(true), false));
+        assert!(scroll_forward(Some(true), true));
+        // Unclassified events are forwarded, never swallowed.
+        assert!(scroll_forward(None, false));
     }
 
     #[test]

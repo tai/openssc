@@ -1627,9 +1627,12 @@ name = "ss-gui"
 version = "1.4.1"
 dependencies = [
  "anyhow",
+ "block2",
  "core-foundation",
  "core-graphics",
  "gesture-input",
+ "objc2 0.5.3",
+ "objc2-app-kit",
  "png",
  "raw-window-handle",
  "rfb-proto",
