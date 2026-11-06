@@ -36,24 +36,7 @@ use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 mod filecopy;
 mod platform;
 
-#[cfg(target_os = "macos")]
-mod grab;
-#[cfg(target_os = "macos")]
-mod momentum;
-
-/// The keyboard grab handle. A no-op stub off macOS so the rest of the app
-/// does not need cfg branches.
-#[cfg(target_os = "macos")]
-type GrabHandle = grab::Grab;
-#[cfg(not(target_os = "macos"))]
-struct GrabHandle;
-#[cfg(not(target_os = "macos"))]
-impl GrabHandle {
-    fn set_enabled(&self, _on: bool) {}
-    fn is_enabled(&self) -> bool {
-        false
-    }
-}
+use platform::{grab, momentum};
 
 /// Scroll deltas accumulated between subtype-11 messages, in the portable
 /// model's units (pixels).
@@ -1149,8 +1132,7 @@ enum UserEvent {
     Disconnected(String),
     /// Status text for the window title after a pull attempt.
     PullStatus(String),
-    /// A keyboard event captured by the macOS event tap.
-    #[cfg(target_os = "macos")]
+    /// A keyboard event captured by the platform event tap.
     Grab(grab::GrabEvent),
 }
 
@@ -1199,8 +1181,8 @@ struct App {
     remote_path: Arc<std::sync::Mutex<Option<String>>>,
     /// The remote's layout table: which key sits where on the far end.
     keymap: &'static Keymap,
-    /// macOS keyboard grab, when it could be created.
-    grab: Option<GrabHandle>,
+    /// Platform keyboard grab, when it could be created.
+    grab: Option<grab::Grab>,
     /// The release chord fired: stay ungrabbed until focus is lost and
     /// regained (the user pressed it because something was wrong).
     grab_suspended: bool,
@@ -1289,7 +1271,7 @@ impl App {
         pull_pending: Arc<std::sync::Mutex<Option<PullState>>>,
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
         keymap: &'static Keymap,
-        grab: Option<GrabHandle>,
+        grab: Option<grab::Grab>,
         scroll_test: String,
         frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
         coast: bool,
@@ -2195,7 +2177,6 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_title(&status);
                 }
             }
-            #[cfg(target_os = "macos")]
             UserEvent::Grab(event) => match event {
                 grab::GrabEvent::Key {
                     keycode,
@@ -2457,17 +2438,13 @@ impl ApplicationHandler<UserEvent> for App {
                 // event before dispatch. Touchdown events always go through;
                 // momentum events are forwarded unless `--no-coast` dropped
                 // them.
-                #[cfg(target_os = "macos")]
                 let is_momentum = momentum::take();
-                #[cfg(target_os = "macos")]
                 if self.debug_input {
                     let queued = momentum::pending();
                     if queued > 4 {
                         eprintln!("scroll: classification queue {queued} deep (monitor/winit desync)");
                     }
                 }
-                #[cfg(not(target_os = "macos"))]
-                let is_momentum: Option<bool> = None;
                 if self.debug_input {
                     match is_momentum {
                         Some(true) => eprintln!(
@@ -3196,13 +3173,10 @@ fn main() -> Result<()> {
         },
     };
     eprintln!("keymap: {} (remote layout)", keymap.name);
-    #[cfg(target_os = "macos")]
-    {
-        if momentum::start() {
-            eprintln!("scroll: momentum-phase monitor installed");
-        } else {
-            eprintln!("scroll: momentum-phase monitor unavailable; forwarding every scroll event");
-        }
+    if momentum::start() {
+        eprintln!("scroll: momentum-phase monitor installed");
+    } else {
+        eprintln!("scroll: momentum-phase monitor unavailable; forwarding every scroll event");
     }
     if let Ok(v) = std::env::var("SS_SCROLL_SUBTYPE") {
         match v.trim().parse::<u8>() {
@@ -3218,9 +3192,11 @@ fn main() -> Result<()> {
     let event_loop = EventLoop::<UserEvent>::with_user_event().build()?;
     event_loop.set_control_flow(ControlFlow::Wait);
     let proxy = event_loop.create_proxy();
-    #[cfg(target_os = "macos")]
     let grab = if no_grab {
         eprintln!("grab: disabled (--no-grab); local shortcuts stay local");
+        None
+    } else if !grab::supported() {
+        eprintln!("grab: not available on this platform");
         None
     } else {
         grab::request_permission();
@@ -3265,13 +3241,6 @@ fn main() -> Result<()> {
                 None
             }
         }
-    };
-    #[cfg(not(target_os = "macos"))]
-    let grab: Option<GrabHandle> = {
-        if !no_grab {
-            eprintln!("grab: not available on this platform");
-        }
-        None
     };
 
 

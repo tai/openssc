@@ -11,7 +11,6 @@
 //! it (default: Left Command + Shift held for 350 ms) so nobody gets locked
 //! out; the chord itself is passed through, never consumed, never forwarded.
 
-
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -21,12 +20,12 @@ use core_foundation::base::TCFType;
 use core_foundation::mach_port::CFMachPort;
 use core_foundation::runloop::{kCFRunLoopCommonModes, CFRunLoop};
 
-pub use crate::platform::chord::{parse_chord, Chord};
+use super::GrabEvent;
+use crate::platform::chord::Chord;
 use crate::platform::keymap::{
     DEV_LEFT_CMD, DEV_LEFT_SHIFT, FLAG_CAPS, FLAG_COMMAND, FLAG_CONTROL, FLAG_FN, FLAG_OPTION,
     FLAG_SHIFT,
 };
-pub use crate::platform::keymap::{keycode_to_winit, logical_for, modifiers_from_flags};
 
 // CGEventTapCreate arguments.
 const K_CG_SESSION_EVENT_TAP: u32 = 1;
@@ -69,28 +68,6 @@ extern "C" {
         actual_len: *mut usize,
         buf: *mut u16,
     ) -> bool;
-}
-
-/// What the tap sends back to the app.
-#[derive(Debug, Clone)]
-pub enum GrabEvent {
-    /// A keyboard event that was consumed locally and must go to the remote.
-    Key {
-        keycode: u16,
-        chars: Option<String>,
-        flags: u64,
-        pressed: bool,
-        repeat: bool,
-        /// flagsChanged: no character, only modifier state changed.
-        modifier_only: bool,
-    },
-    /// The hold/key chord fired: the grab is off until the window loses and
-    /// regains focus.
-    Released { held: Duration },
-    /// The chord was seen but cancelled (another key or modifier went down).
-    HoldCancelled { held: Duration },
-    /// macOS disabled the tap (timeout / user input); we re-enabled it.
-    Reenabled { reason: &'static str },
 }
 /// The tap handle the app keeps.
 pub struct Grab {
