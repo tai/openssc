@@ -1179,6 +1179,10 @@ struct App {
     /// `--coast`: forward the OS momentum tail. Default is to drop it, which
     /// is what makes micro-scroll and flick-and-stop stop dead.
     coast: bool,
+    /// EXPERIMENT (SS_SCROLL_PROD=1): force a capture with an incremental
+    /// request after each scroll, instead of waiting for the server's tick.
+    scroll_prod: bool,
+    last_prod: Instant,
     /// Scroll events with no momentum classification (monitor missing or a
     /// desync); forwarded and counted so the log shows it.
     scroll_unclassified: u64,
@@ -1289,6 +1293,8 @@ impl App {
             scroll_pending: None,
             scroll_last: Instant::now(),
             coast,
+            scroll_prod: std::env::var("SS_SCROLL_PROD").is_ok(),
+            last_prod: Instant::now() - Duration::from_secs(1),
             scroll_unclassified: 0,
             scroll_axis: AxisFilter::new(),
             scroll_stop_at: None,
@@ -1737,6 +1743,16 @@ impl App {
         }
         if let Some(msg) = msg {
             self.send(msg);
+            // EXPERIMENT (SS_SCROLL_PROD=1): a request straight after a scroll
+            // forces the server to capture now instead of waiting for its own
+            // tick. Rate-limited so it cannot become a busy loop.
+            if self.scroll_prod {
+                let now = Instant::now();
+                if now.duration_since(self.last_prod) >= Duration::from_millis(30) {
+                    self.last_prod = now;
+                    self.send(framebuffer_update_request(self.fb_w, self.fb_h, true));
+                }
+            }
         }
     }
 

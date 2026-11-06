@@ -1373,6 +1373,7 @@ dependencies = [
  "anyhow",
  "flate2",
  "hmac",
+ "libc",
  "num-bigint",
  "num-traits",
  "rand",

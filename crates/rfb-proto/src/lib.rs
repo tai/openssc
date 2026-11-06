@@ -476,6 +476,31 @@ impl AppleSession {
         let mut stream = TcpStream::connect((host, port))
             .with_context(|| format!("connect to {host}:{port}"))?;
         stream.set_nodelay(true)?;
+        // Larger socket buffers: the default 128 KiB window on macOS caps the
+        // receive rate well below what the link can do, and a full-screen MVS
+        // update is ~1.3 MB - the window, not the medium, becomes the limit.
+        #[cfg(unix)]
+        {
+            use std::os::unix::io::AsRawFd;
+            let fd = stream.as_raw_fd();
+            let size: libc::c_int = 4 * 1024 * 1024;
+            unsafe {
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_RCVBUF,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+                libc::setsockopt(
+                    fd,
+                    libc::SOL_SOCKET,
+                    libc::SO_SNDBUF,
+                    &size as *const _ as *const libc::c_void,
+                    std::mem::size_of::<libc::c_int>() as libc::socklen_t,
+                );
+            }
+        }
         stream.set_read_timeout(Some(std::time::Duration::from_secs(20)))?;
 
         let mut banner = [0u8; 12];

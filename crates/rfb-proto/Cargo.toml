@@ -5,6 +5,7 @@ edition.workspace = true
 license.workspace = true
 
 [dependencies]
+libc = "0.2"
 aes = "0.8"
 anyhow = "1"
 flate2 = "1"
