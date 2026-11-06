@@ -93,10 +93,15 @@ fn scroll_speed() -> f32 {
 /// Should a scroll event be forwarded to the remote?
 ///
 /// Touchdown events always go through (that is the continuous scrolling the
-/// owner wants smooth). OS momentum events are dropped by default - they are
-/// what made micro-scroll and flick-and-stop drift - and forwarded only with
-/// `--coast`. An event with no classification (monitor unavailable or a
+/// owner wants smooth). OS momentum events are forwarded by default, matching
+/// Screen Sharing.app; `--no-coast` drops them so a flick stops dead when the
+/// fingers lift. An event with no classification (monitor unavailable or a
 /// desync) is forwarded rather than swallowed.
+/// Forwarding the OS momentum tail is the default, as Screen Sharing.app does;
+/// `--no-coast` turns it off. Kept as a named constant so the default is
+/// asserted by a test rather than only readable in `main`.
+const COAST_BY_DEFAULT: bool = true;
+
 fn scroll_forward(is_momentum: Option<bool>, coast: bool) -> bool {
     match is_momentum {
         Some(true) => coast,
@@ -497,8 +502,8 @@ Display and codec:
 Input and keyboard:
   --keymap us|jis          layout the REMOTE runs (default us)
   --scroll-speed <f>       scroll distance multiplier, feel calibration (default 1.0)
-  --coast                  forward the OS momentum tail (default: drop it)
-  --no-coast               accepted no-op; dropping momentum is the default
+  --coast                  forward the OS momentum tail (default)
+  --no-coast               drop it, so a flick stops when the fingers lift
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
@@ -1229,8 +1234,9 @@ struct App {
     scroll_pending: Option<PendingScroll>,
     /// When the last scroll message went out (coalescing to ~120 Hz).
     scroll_last: Instant,
-    /// `--coast`: forward the OS momentum tail. Default is to drop it, which
-    /// is what makes micro-scroll and flick-and-stop stop dead.
+    /// Forward the OS momentum tail (the default, like Screen Sharing.app).
+    /// `--no-coast` drops it, which makes a flick stop dead when the fingers
+    /// lift.
     coast: bool,
     /// EXPERIMENT (SS_SCROLL_PROD=1): force a capture with an incremental
     /// request after each scroll, instead of waiting for the server's tick.
@@ -2446,7 +2452,8 @@ impl ApplicationHandler<UserEvent> for App {
                 // maps momentumPhase onto the same TouchPhase and gives it
                 // priority), so the macOS NSEvent monitor classifies each
                 // event before dispatch. Touchdown events always go through;
-                // momentum events are dropped unless `--coast` asked for them.
+                // momentum events are forwarded unless `--no-coast` dropped
+                // them.
                 #[cfg(target_os = "macos")]
                 let is_momentum = momentum::take();
                 #[cfg(target_os = "macos")]
@@ -2985,7 +2992,7 @@ fn main() -> Result<()> {
     let mut pull_paths: Vec<String> = Vec::new();
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
-    let mut coast = false;
+    let mut coast = COAST_BY_DEFAULT;
     let mut keymap_name: Option<String> = None;
     // Lab hook: scripted gesture for measuring the scroll model
     // (`flick`, `drag`, `medium`, `stop`, `jitter`, `diagonal`, `turn`).
@@ -3097,11 +3104,14 @@ fn main() -> Result<()> {
                 i += 2;
             }
             "--coast" => {
+                // Accepted no-op: forwarding the OS momentum tail is the
+                // default now.
                 coast = true;
                 i += 1;
             }
             "--no-coast" => {
-                // Kept as an accepted no-op: dropping momentum is the default.
+                // Drop the OS momentum tail, so a flick stops dead when the
+                // fingers lift.
                 coast = false;
                 i += 1;
             }
@@ -4019,15 +4029,25 @@ mod tests {
     }
 
     #[test]
-    fn momentum_is_dropped_unless_coasting() {
+    fn coast_is_the_default() {
+        assert!(
+            COAST_BY_DEFAULT,
+            "Screen Sharing.app forwards the momentum tail; --no-coast opts out"
+        );
+    }
+
+    #[test]
+    fn momentum_is_forwarded_unless_coast_is_off() {
         // Touchdown events always pass.
         assert!(scroll_forward(Some(false), false));
         assert!(scroll_forward(Some(false), true));
-        // OS momentum is dropped by default and forwarded with --coast.
-        assert!(!scroll_forward(Some(true), false));
+        // OS momentum is forwarded by default (coast = true) and dropped with
+        // --no-coast (coast = false).
         assert!(scroll_forward(Some(true), true));
+        assert!(!scroll_forward(Some(true), false));
         // Unclassified events are forwarded, never swallowed.
         assert!(scroll_forward(None, false));
+        assert!(scroll_forward(None, true));
     }
 
     #[test]

@@ -632,6 +632,11 @@ client plus a pcap and experiment note.
   itself during a still screen.
 - **Measured, not assumed**: the server's first-byte reaction is *not* worth
   chasing — the first visible change arrives at the same time in both clients.
+- **Scroll momentum default flipped**: the OS momentum tail is now forwarded by
+  default (`--no-coast` opts out), matching `Screen Sharing.app`, whose motion
+  envelopes this was measured against. Synthetic wheel events do not make macOS
+  synthesise momentum, so this is covered by a unit test on the default rather
+  than by a scripted run; feel-testing needs a real trackpad flick.
 - Still open: the 150 ms replay target (272 ms), and the live client decoding
   a heavy body ~2.7x slower than the replay benchmark decodes the same bytes.
 
