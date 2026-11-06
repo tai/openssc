@@ -165,7 +165,10 @@ is required: `AutoPasteboard(1)` is what lets the pushed text land.
 
 Limitation: without a keyboard grab the compositor's SUPER+V cannot be
 reclaimed. Ctrl+V is the chord that is guaranteed to reach the window; this is
-documented in `ss-gui --help`.
+documented in `ss-gui --help`. The path needs the automatic clipboard:
+`--no-clipboard` means no `0x15 AutoPasteboard`, so pushed text would be
+ignored; Ctrl+V then logs that the clipboard is off instead of pretending to
+paste.
 
 ## 5. Images (VERIFIED, byte-identical)
 

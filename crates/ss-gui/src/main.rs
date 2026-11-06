@@ -1246,6 +1246,10 @@ struct App {
     exit_after_dump: bool,
     debug_input: bool,
     ime: bool,
+    /// Whether the automatic clipboard (and so `0x15 AutoPasteboard`) is on.
+    /// Without it the server will not install pushed text, so Ctrl+V must not
+    /// pretend to have pasted.
+    clipboard_enabled: bool,
     /// A Ctrl+V we translated into the explicit paste is still down locally;
     /// its repeats and release are swallowed so the remote never sees a bare
     /// Ctrl+V or a V key-up without a V key-down.
@@ -1316,6 +1320,7 @@ impl App {
         exit_after_dump: bool,
         debug_input: bool,
         ime: bool,
+        clipboard: bool,
         deadline: Option<Instant>,
         demo_cursor: bool,
         file_dest: String,
@@ -1383,6 +1388,7 @@ impl App {
             exit_after_dump,
             debug_input,
             ime,
+            clipboard_enabled: clipboard,
             paste_key_held: false,
             focused_once: false,
             deadline,
@@ -1758,6 +1764,15 @@ impl App {
     /// `wl-paste` and the settle delay would otherwise stall the UI (and the
     /// framebuffer pump). Repeats and the key-up are swallowed by the caller.
     fn paste_local_clipboard(&mut self) {
+        if !self.clipboard_enabled {
+            eprintln!(
+                "paste: the automatic clipboard is off (--no-clipboard); Ctrl+V cannot reach the remote pasteboard"
+            );
+            if let Some(window) = &self.window {
+                window.set_title("ss-clone — clipboard is off (--no-clipboard)");
+            }
+            return;
+        }
         // Ctrl is already down on the remote (winit reports the modifier
         // before the key). Lift it so the remote sees Cmd+V, not Ctrl+Cmd+V;
         // the next real key re-synthesises whatever is still held.
@@ -4052,6 +4067,7 @@ fn main() -> Result<()> {
         exit_after_dump,
         debug_input,
         ime,
+        clipboard,
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
         demo_cursor,
         file_dest.clone(),
