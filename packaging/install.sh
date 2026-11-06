@@ -52,8 +52,9 @@ install -m 0644 "$HERE/ss-clone.svg" "$ICONDIR/ss-clone.svg"
 
 # The committed .desktop is valid for /usr/bin packaging; a user prefix needs an
 # absolute launcher path because ~/.local/bin is not always on a GUI session's
-# PATH.
-sed "s|^Exec=ss-clone-launch$|Exec=$BINDIR/ss-clone-launch|" \
+# PATH. TryExec must point at the same absolute path or the menu entry is hidden.
+sed -e "s|^Exec=ss-clone-launch$|Exec=$BINDIR/ss-clone-launch|" \
+    -e "s|^TryExec=ss-clone-launch$|TryExec=$BINDIR/ss-clone-launch|" \
     "$HERE/ss-clone.desktop" >"$APPDIR/ss-clone.desktop"
 chmod 0644 "$APPDIR/ss-clone.desktop"
 
