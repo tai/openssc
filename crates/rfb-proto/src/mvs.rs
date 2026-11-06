@@ -135,23 +135,83 @@ impl<'a> BitReader<'a> {
         self.data.len() * 8 - self.pos
     }
 
+    #[inline]
     pub fn read_bit(&mut self) -> Result<u32> {
-        if self.pos >= self.data.len() * 8 {
+        let byte = self.pos >> 3;
+        let Some(&b) = self.data.get(byte) else {
             bail!("MVS stream exhausted at bit {}", self.pos);
-        }
-        let byte = self.data[self.pos >> 3];
-        let bit = (byte >> (7 - (self.pos & 7))) & 1;
+        };
         self.pos += 1;
-        Ok(bit as u32)
+        Ok(((b >> (7 - ((self.pos - 1) & 7))) & 1) as u32)
     }
 
+    /// Read up to 32 MSB-first bits in one go.
+    ///
+    /// The common case loads eight bytes and shifts, instead of walking bit by
+    /// bit: this stream is read millions of times per scroll burst, and the
+    /// per-bit bounds checks showed up at 26% of the decode profile.
+    #[inline]
     pub fn read(&mut self, bits: u32) -> Result<u32> {
         debug_assert!(bits <= 32);
-        let mut v = 0u32;
-        for _ in 0..bits {
-            v = (v << 1) | self.read_bit()?;
+        if bits == 0 {
+            return Ok(0);
         }
-        Ok(v)
+        let end = self.pos + bits as usize;
+        if end > self.data.len() * 8 {
+            bail!("MVS stream exhausted at bit {}", self.pos);
+        }
+        let byte = self.pos >> 3;
+        let value = if byte + 8 <= self.data.len() {
+            let word = u64::from_be_bytes(self.data[byte..byte + 8].try_into().unwrap());
+            let shift = (self.pos & 7) as u32;
+            ((word << shift) >> (64 - bits)) as u32
+        } else {
+            // Tail of the stream: no eight bytes left to load.
+            let mut v = 0u32;
+            let mut at = self.pos;
+            for _ in 0..bits {
+                let bit = (self.data[at >> 3] >> (7 - (at & 7))) & 1;
+                v = (v << 1) | bit as u32;
+                at += 1;
+            }
+            v
+        };
+        self.pos = end;
+        Ok(value)
+    }
+
+    /// Read up to 32 bits without consuming them. Pair with [`Self::skip`]
+    /// when a field's width depends on its own leading bits.
+    #[inline]
+    pub fn peek(&self, bits: u32) -> Result<u32> {
+        debug_assert!(bits <= 32);
+        if bits == 0 {
+            return Ok(0);
+        }
+        if self.pos + bits as usize > self.data.len() * 8 {
+            bail!("MVS stream exhausted at bit {}", self.pos);
+        }
+        let byte = self.pos >> 3;
+        if byte + 8 <= self.data.len() {
+            let word = u64::from_be_bytes(self.data[byte..byte + 8].try_into().unwrap());
+            let shift = (self.pos & 7) as u32;
+            Ok(((word << shift) >> (64 - bits)) as u32)
+        } else {
+            let mut v = 0u32;
+            let mut at = self.pos;
+            for _ in 0..bits {
+                let bit = (self.data[at >> 3] >> (7 - (at & 7))) & 1;
+                v = (v << 1) | bit as u32;
+                at += 1;
+            }
+            Ok(v)
+        }
+    }
+
+    /// Advance past `bits` already peeked bits.
+    #[inline]
+    pub fn skip(&mut self, bits: u32) {
+        self.pos += bits as usize;
     }
 
     /// Consume the bit-aligned `0x6d` marker and verify zero padding.
@@ -526,10 +586,16 @@ impl BlockDecoder for PortableBlocks {
             let mut index = 1usize;
             while index < 64 {
                 let scale = coefficient_scale(index, param);
-                let value = if r.read_bit()? == 1 {
+                // One 3-bit lookahead covers both the "non-unit magnitude"
+                // flag and the 2-bit symbolic code: the old shape was two
+                // separate bit-reader calls per coefficient.
+                let head = r.peek(3)?;
+                let value = if head & 4 != 0 {
+                    r.skip(1);
                     Self::magnitude(r, index)?
                 } else {
-                    let code = r.read(2)?;
+                    r.skip(3);
+                    let code = head & 3;
                     if code == 1 {
                         if r.read_bit()? == 0 {
                             break; // end of block
@@ -601,15 +667,30 @@ impl QuantTables {
     }
 }
 
-/// Separable 8x8 IDCT basis with the native fixed-point scale folded in.
+/// Separable 8x8 IDCT, fixed point, with the native scale folded in.
 ///
 /// The native transform (`0x7ff9223bc67d`) is a fixed-point SSE IDCT; this is
 /// the mathematical equivalent at scale 64. It matches the framework wrapper
 /// (`0x3ff9223bc594`) on every block of the reference capture (3,388/3,388
 /// with a maximum channel difference of 1).
+///
+/// This implementation uses the classic JPEG "islow" butterfly structure
+/// (Loeffler-Ligtenberg-Moschytz, as in libjpeg's `jidctint.c`): ~11 multiplies
+/// per 8-point pass instead of 64, i64 accumulation so the larger dequantised
+/// range this codec produces cannot overflow, and 18-bit cosine constants
+/// rather than libjpeg's 13 (see [`IDCT_CONST_BITS`]). Unlike `jidctint` the
+/// intermediate pass is *not* descaled, so the single rounding happens at the
+/// end (`descale(sum, 2*CONST_BITS - 3)`), which keeps it closer to the f64
+/// reference than the original integer transform.
+///
+/// A plane whose AC coefficients are all zero takes the DC shortcut
+/// (`out = 8 * dequantised DC`). That is the common case: this codec codes
+/// only chroma DC in type-0 bodies, so two of the three planes per DCT tile
+/// usually take it.
 pub struct Idct {
-    /// `cos[x][u] = cos((2x+1) u pi / 16)`
-    cos: [[f64; 8]; 8],
+    /// Unit tests flip this to compare against [`Idct::plane_reference`].
+    #[cfg(test)]
+    reference: bool,
 }
 
 impl Default for Idct {
@@ -618,15 +699,99 @@ impl Default for Idct {
     }
 }
 
+/// `CONST_BITS` of the fixed-point cosine constants below. libjpeg's
+/// `jidctint` uses 13 bits, which is enough for 12-bit dequantised values but
+/// not for this codec's 16-bit `pmullw` product; 18 bits keeps the sample
+/// error below half a scale-64 step for the whole range this server emits
+/// (see `idct_precision_sweep`), while the i64 accumulators still cannot
+/// overflow even at the maximum i16 input.
+const IDCT_CONST_BITS: i32 = 18;
+const FIX_0_298631336: i64 = 78284;
+const FIX_0_390180644: i64 = 102284;
+const FIX_0_541196100: i64 = 141871;
+const FIX_0_765366865: i64 = 200636;
+const FIX_0_899976223: i64 = 235923;
+const FIX_1_175875602: i64 = 308249;
+const FIX_1_501321110: i64 = 393562;
+const FIX_1_847759065: i64 = 484379;
+const FIX_1_961570560: i64 = 514214;
+const FIX_2_053119869: i64 = 538213;
+const FIX_2_562915447: i64 = 671853;
+const FIX_3_072711026: i64 = 805493;
+/// Final rounding: the two fixed-point passes are followed by the scale-64 fold.
+const IDCT_DESCALE: i32 = 2 * IDCT_CONST_BITS - 3;
+
+/// One 8-point inverse DCT butterfly (libjpeg's `islow` structure).
+///
+/// Returns the pass output scaled by `2^CONST_BITS`. A DC-only vector takes
+/// the shortcut `in[0] << CONST_BITS`, which is what the full butterfly
+/// reduces to.
+#[inline(always)]
+fn idct_8(x: &[i64; 8]) -> [i64; 8] {
+    if x[1] == 0 && x[2] == 0 && x[3] == 0 && x[4] == 0 && x[5] == 0 && x[6] == 0 && x[7] == 0 {
+        return [x[0] << IDCT_CONST_BITS; 8];
+    }
+    // Even part.
+    let z2 = x[2];
+    let z3 = x[6];
+    let z1 = z2.wrapping_add(z3).wrapping_mul(FIX_0_541196100);
+    let tmp2 = z1.wrapping_sub(z3.wrapping_mul(FIX_1_847759065));
+    let tmp3 = z1.wrapping_add(z2.wrapping_mul(FIX_0_765366865));
+    let z2 = x[0];
+    let z3 = x[4];
+    let tmp0 = z2.wrapping_add(z3) << IDCT_CONST_BITS;
+    let tmp1 = z2.wrapping_sub(z3) << IDCT_CONST_BITS;
+    let tmp10 = tmp0.wrapping_add(tmp3);
+    let tmp13 = tmp0.wrapping_sub(tmp3);
+    let tmp11 = tmp1.wrapping_add(tmp2);
+    let tmp12 = tmp1.wrapping_sub(tmp2);
+    // Odd part.
+    let mut tmp0 = x[7];
+    let mut tmp1 = x[5];
+    let mut tmp2 = x[3];
+    let mut tmp3 = x[1];
+    let z1 = tmp0.wrapping_add(tmp3);
+    let z2 = tmp1.wrapping_add(tmp2);
+    let z3 = tmp0.wrapping_add(tmp2);
+    let z4 = tmp1.wrapping_add(tmp3);
+    let z5 = z3.wrapping_add(z4).wrapping_mul(FIX_1_175875602);
+    tmp0 = tmp0.wrapping_mul(FIX_0_298631336);
+    tmp1 = tmp1.wrapping_mul(FIX_2_053119869);
+    tmp2 = tmp2.wrapping_mul(FIX_3_072711026);
+    tmp3 = tmp3.wrapping_mul(FIX_1_501321110);
+    let z1 = z1.wrapping_mul(-FIX_0_899976223);
+    let z2 = z2.wrapping_mul(-FIX_2_562915447);
+    let z3 = z3.wrapping_mul(-FIX_1_961570560).wrapping_add(z5);
+    let z4 = z4.wrapping_mul(-FIX_0_390180644).wrapping_add(z5);
+    let tmp0 = tmp0.wrapping_add(z1).wrapping_add(z3);
+    let tmp1 = tmp1.wrapping_add(z2).wrapping_add(z4);
+    let tmp2 = tmp2.wrapping_add(z2).wrapping_add(z3);
+    let tmp3 = tmp3.wrapping_add(z1).wrapping_add(z4);
+    [
+        tmp10 + tmp3,
+        tmp11 + tmp2,
+        tmp12 + tmp1,
+        tmp13 + tmp0,
+        tmp13 - tmp0,
+        tmp12 - tmp1,
+        tmp11 - tmp2,
+        tmp10 - tmp3,
+    ]
+}
+
+#[inline(always)]
+fn descale(x: i64, n: i32) -> i32 {
+    // Wrapping is intentional: hot numeric paths must not pay for overflow
+    // checks, and this mirrors the native fixed-point arithmetic.
+    (x.wrapping_add(1 << (n - 1)) >> n) as i32
+}
+
 impl Idct {
     pub fn new() -> Self {
-        let mut cos = [[0f64; 8]; 8];
-        for (x, row) in cos.iter_mut().enumerate() {
-            for (u, c) in row.iter_mut().enumerate() {
-                *c = (((2 * x + 1) as f64) * u as f64 * std::f64::consts::PI / 16.0).cos();
-            }
+        Self {
+            #[cfg(test)]
+            reference: false,
         }
-        Self { cos }
     }
 
     /// Dequantise `coeff` (native plane order) with `quant` and transform.
@@ -635,6 +800,57 @@ impl Idct {
     /// colour helper). Quant entries are raw values, not the native `<< 4`
     /// expansion.
     pub fn plane(&self, coeff: &[i16], quant: &[u8; 64]) -> [i32; 64] {
+        #[cfg(test)]
+        if self.reference {
+            return self.plane_reference(coeff, quant);
+        }
+        // f[v][u] = coeff[8u+v] * quant[8v+u], wrapped to i16 like `pmullw`.
+        let f00 = i16w((coeff[0] as i32).wrapping_mul(quant[0] as i32)) as i32;
+        if coeff[1..].iter().all(|&c| c == 0) {
+            return [8i32.wrapping_mul(f00); 64];
+        }
+        // Dequantise in coded order (no zeroed scratch to fill first) and run
+        // the vertical pass per column. `columns[u][y]` is the transposed
+        // first-pass output, so the horizontal pass gathers one row from it.
+        let dequant = |u: usize, v: usize| {
+            i16w((coeff[8 * u + v] as i32).wrapping_mul(quant[8 * v + u] as i32)) as i64
+        };
+        // Both passes are written as eight independent expressions: the
+        // butterfly's dependency chain is ~7 multiplies deep, not throughput
+        // limited, so unrolling lets the out-of-order engine overlap them.
+        let columns: [[i64; 8]; 8] = [
+            idct_8(&std::array::from_fn(|v| dequant(0, v))),
+            idct_8(&std::array::from_fn(|v| dequant(1, v))),
+            idct_8(&std::array::from_fn(|v| dequant(2, v))),
+            idct_8(&std::array::from_fn(|v| dequant(3, v))),
+            idct_8(&std::array::from_fn(|v| dequant(4, v))),
+            idct_8(&std::array::from_fn(|v| dequant(5, v))),
+            idct_8(&std::array::from_fn(|v| dequant(6, v))),
+            idct_8(&std::array::from_fn(|v| dequant(7, v))),
+        ];
+        let rows: [[i64; 8]; 8] = [
+            idct_8(&std::array::from_fn(|u| columns[u][0])),
+            idct_8(&std::array::from_fn(|u| columns[u][1])),
+            idct_8(&std::array::from_fn(|u| columns[u][2])),
+            idct_8(&std::array::from_fn(|u| columns[u][3])),
+            idct_8(&std::array::from_fn(|u| columns[u][4])),
+            idct_8(&std::array::from_fn(|u| columns[u][5])),
+            idct_8(&std::array::from_fn(|u| columns[u][6])),
+            idct_8(&std::array::from_fn(|u| columns[u][7])),
+        ];
+        let mut res = [0i32; 64];
+        for (y, row) in rows.iter().enumerate() {
+            for (x, &value) in row.iter().enumerate() {
+                res[8 * y + x] = descale(value, IDCT_DESCALE);
+            }
+        }
+        res
+    }
+
+    /// The f64 separable transform this used to be. Unit tests only: the
+    /// integer path must agree with it to within one scale-64 sample.
+    #[cfg(test)]
+    pub fn plane_reference(&self, coeff: &[i16], quant: &[u8; 64]) -> [i32; 64] {
         const C: [f64; 8] = [
             std::f64::consts::FRAC_1_SQRT_2,
             1.0,
@@ -645,37 +861,46 @@ impl Idct {
             1.0,
             1.0,
         ];
+        let mut cos = [[0f64; 8]; 8];
+        for (x, row) in cos.iter_mut().enumerate() {
+            for (u, c) in row.iter_mut().enumerate() {
+                *c = (((2 * x + 1) as f64) * u as f64 * std::f64::consts::PI / 16.0).cos();
+            }
+        }
         // f[v][u] = coeff[8u+v] * quant[v][u], wrapped to i16 like `pmullw`.
         let mut f = [[0f64; 8]; 8];
         for v in 0..8 {
             for u in 0..8 {
-                let c = coeff[8 * u + v] as i32 * quant[8 * v + u] as i32;
+                let c = (coeff[8 * u + v] as i32).wrapping_mul(quant[8 * v + u] as i32);
                 f[v][u] = i16w(c) as f64;
             }
         }
-        // Vertical pass: tmp[y][u] = sum_v C(v) f[v][u] cos((2y+1)v pi/16)
         let mut tmp = [[0f64; 8]; 8];
         for (y, row) in tmp.iter_mut().enumerate() {
             for (u, slot) in row.iter_mut().enumerate() {
                 let mut s = 0.0;
                 for v in 0..8 {
-                    s += C[v] * f[v][u] * self.cos[y][v];
+                    s += C[v] * f[v][u] * cos[y][v];
                 }
                 *slot = s;
             }
         }
-        // Horizontal pass, then scale: 64 * (1/4) = 16.
         let mut out = [0i32; 64];
         for y in 0..8 {
             for x in 0..8 {
                 let mut s = 0.0;
                 for u in 0..8 {
-                    s += C[u] * tmp[y][u] * self.cos[x][u];
+                    s += C[u] * tmp[y][u] * cos[x][u];
                 }
                 out[8 * y + x] = (16.0 * s).round() as i32;
             }
         }
         out
+    }
+
+    #[cfg(test)]
+    pub fn set_reference(&mut self, on: bool) {
+        self.reference = on;
     }
 }
 
@@ -687,23 +912,65 @@ fn clip8(x: i32) -> u8 {
     x.clamp(0, 255) as u8
 }
 
+/// The three constants of one chroma pair, hoisted out of the pixel loop.
+///
+/// A type-0 DCT tile codes chroma DC only, so both chroma planes are flat and
+/// every term that depends on them is the same for all 64 pixels. Precomputing
+/// them keeps the loop down to six saturating adds per pixel while producing
+/// exactly the bytes of [`rgb_from_idct`].
+#[derive(Clone, Copy)]
+struct Chroma {
+    green1: i32,
+    green2: i32,
+    blue1: i32,
+    blue2: i32,
+    red1: i32,
+    red2: i32,
+}
+
+impl Chroma {
+    #[inline(always)]
+    fn new(cb: i32, cr: i32) -> Self {
+        // `pmulhw` semantics: wrap the 32-bit product, then take the high word.
+        // Refined/cached tiles can drive the spatial samples far beyond the
+        // range a plain type-0 frame produces, so these must not panic.
+        Self {
+            green1: (cb.wrapping_mul(-22554)) >> 16,
+            green2: sat16(((cr.wrapping_mul(18734)) >> 16).wrapping_sub(cr)),
+            blue1: cb,
+            blue2: sat16(cb.wrapping_add((cb.wrapping_mul(-14942)) >> 16)),
+            red1: cr,
+            red2: (cr.wrapping_mul(26345)) >> 16,
+        }
+    }
+
+    #[inline(always)]
+    fn rgb(self, y: i32) -> [u8; 3] {
+        let word = self.bgrx(y);
+        [word as u8, (word >> 8) as u8, (word >> 16) as u8]
+    }
+
+    /// One BGRX pixel packed as a little-endian u32 (`B | G<<8 | R<<16`), which
+    /// is exactly the framebuffer byte order. Packing here lets the tile loop
+    /// do one 4-byte store per pixel instead of building a byte array.
+    #[inline(always)]
+    fn bgrx(self, y: i32) -> u32 {
+        let y = i16w(y.wrapping_add(8192)) as i32;
+        let green = sat16(sat16(y.wrapping_add(self.green1)).wrapping_add(self.green2));
+        let blue = sat16(sat16(y.wrapping_add(self.blue1)).wrapping_add(self.blue2));
+        let red = sat16(sat16(y.wrapping_add(self.red1)).wrapping_add(self.red2));
+        let scale = |v: i32| clip8(sat16(v.wrapping_add(32)) >> 6) as u32;
+        scale(blue) | (scale(green) << 8) | (scale(red) << 16)
+    }
+}
+
 /// Colour conversion helper `0x7ff9223bcb21`, transcribed exactly.
 ///
 /// Inputs are scale-64 spatial samples: `y` is centred, `cb`/`cr` are
 /// zero-centred. Returns BGR, the framebuffer byte order.
+#[inline]
 pub fn rgb_from_idct(y: i32, cb: i32, cr: i32) -> [u8; 3] {
-    let y = i16w(y + 8192) as i32;
-    // `pmulhw` semantics: wrap the 32-bit product, then take the high word.
-    // Refined/cached tiles can drive the spatial samples far beyond the range a
-    // plain type-0 frame produces, so these must not panic on overflow.
-    let green = sat16(
-        sat16(y + ((cb.wrapping_mul(-22554)) >> 16))
-            + sat16(((cr.wrapping_mul(18734)) >> 16) - cr),
-    );
-    let blue = sat16(sat16(y + cb) + sat16(cb + ((cb.wrapping_mul(-14942)) >> 16)));
-    let red = sat16(sat16(y + cr) + ((cr.wrapping_mul(26345)) >> 16));
-    let scale = |v: i32| clip8(sat16(v + 32) >> 6);
-    [scale(blue), scale(green), scale(red)]
+    Chroma::new(cb, cr).rgb(y)
 }
 
 fn round_div(num: i32, den: i32) -> i32 {
@@ -939,6 +1206,7 @@ pub fn expand_cache_entry(entry: &[u8; CACHE_STRIDE]) -> [i16; 192] {
     coeff
 }
 
+#[inline]
 fn read_unary(r: &mut BitReader<'_>, limit: u32) -> Result<u32> {
     let mut ones = 0;
     while r.read_bit()? == 1 {
@@ -1126,28 +1394,57 @@ impl MvsDecoder {
         Ok(())
     }
 
-    /// Render three coefficient planes into a BGRX tile.
-    fn render_coeff(&self, coeff: &[i16; 192], tile: &mut [u8; TILE * TILE * 4]) {
-        let y = self.idct.plane(&coeff[..64], &self.quant.luma);
-        let cb = self.idct.plane(&coeff[64..128], &self.quant.chroma);
-        let cr = self.idct.plane(&coeff[128..192], &self.quant.chroma);
-        for j in 0..64 {
-            let [b, g, r] = rgb_from_idct(y[j], cb[j], cr[j]);
-            tile[j * 4..j * 4 + 4].copy_from_slice(&[b, g, r, 0]);
+    /// Render three coefficient planes straight into the framebuffer tile at
+    /// `(x, y)`. The chroma planes are usually constant (type-0 DCT codes
+    /// chroma DC only), so that case hoists the whole chroma conversion.
+    fn render_coeff_to(
+        &self,
+        coeff: &[i16; 192],
+        fb: &mut [u8],
+        stride: usize,
+        x: usize,
+        y: usize,
+    ) {
+        let luma = self.idct.plane(&coeff[..64], &self.quant.luma);
+        let mut words = [0u32; TILE * TILE];
+        // Chroma is flat when both planes carry DC only (index 64 and 128 are
+        // the DCs; everything else is AC).
+        if coeff[65..128].iter().all(|&c| c == 0) && coeff[129..192].iter().all(|&c| c == 0) {
+            // Flat chroma: plane() would return 8 * dequantised DC for all 64
+            // samples, so build the conversion constants once.
+            let cb = 8 * i16w((coeff[64] as i32).wrapping_mul(self.quant.chroma[0] as i32)) as i32;
+            let cr = 8 * i16w((coeff[128] as i32).wrapping_mul(self.quant.chroma[0] as i32)) as i32;
+            let chroma = Chroma::new(cb, cr);
+            for (word, &sample) in words.iter_mut().zip(luma.iter()) {
+                *word = chroma.bgrx(sample);
+            }
+        } else {
+            let cb = self.idct.plane(&coeff[64..128], &self.quant.chroma);
+            let cr = self.idct.plane(&coeff[128..192], &self.quant.chroma);
+            for ((word, &sample), (&cb, &cr)) in
+                words.iter_mut().zip(luma.iter()).zip(cb.iter().zip(cr.iter()))
+            {
+                *word = Chroma::new(cb, cr).bgrx(sample);
+            }
+        }
+        let mut line = [0u8; TILE * 4];
+        for (row, words) in words.chunks_exact(TILE).enumerate() {
+            for (chunk, &word) in line.chunks_exact_mut(4).zip(words.iter()) {
+                let bytes = word.to_le_bytes();
+                chunk.copy_from_slice(&bytes);
+            }
+            let dst = (y + row) * stride + x * 4;
+            fb[dst..dst + TILE * 4].copy_from_slice(&line);
         }
     }
 
-    /// Resolve a cache index (type-0 code 6/7, type-1 code 3) into `tile`.
+    /// Resolve a cache index (type-0 code 6/7, type-1 code 3) into `coeff`.
     ///
     /// Returns false when the index is invalid; the caller then leaves the
     /// tile untouched, which is the closest behaviour to the native error path.
-    fn render_cache(&mut self, index: u16, tile: &mut [u8; TILE * TILE * 4]) -> bool {
-        let Some(entry) = self.cache.read(index) else {
-            return false;
-        };
-        let coeff = expand_cache_entry(&entry);
-        self.render_coeff(&coeff, tile);
-        true
+    fn cache_coeff(&mut self, index: u16) -> Option<[i16; 192]> {
+        let entry = self.cache.read(index)?;
+        Some(expand_cache_entry(&entry))
     }
 
     /// Decode a type-0 body into `fb` (BGRX, `self.width * 4` bytes per row).
@@ -1171,39 +1468,73 @@ impl MvsDecoder {
         let mut blocks = PortableBlocks::default();
         let mut solid = BACKGROUND;
         let mut bitmap = [BACKGROUND; 2];
-        let mut tile = [0u8; TILE * TILE * 4];
         let mut stats = FrameStats::default();
 
+        // Raster position is advanced incrementally: `index % tiles_x` and
+        // `index / tiles_x` per tile were measurable in the decode profile.
+        let x0 = rect.x as usize;
+        let y0 = rect.y as usize;
+        let mut col = 0usize;
+        let mut x = x0;
+        let mut y = y0;
+        let mut gi = (y0 / TILE) * grid_width + x0 / TILE;
         let mut index = 0usize;
         for run in &mut commands {
             let run = run?;
             stats.commands += 1;
+            if run.command == Command::Fill {
+                // Fill runs are long (a white desktop is tens of thousands of
+                // tiles), so fill whole row spans instead of tile by tile.
+                let mut left = run.tiles as usize;
+                while left > 0 {
+                    let span = (tiles_x - col).min(left);
+                    fill_span(fb, stride, x, y, span, BACKGROUND);
+                    for _ in 0..span {
+                        if let Some(record) = self.records.get_mut(gi) {
+                            record.generation = generation;
+                            record.source_record = -1;
+                        }
+                        index += 1;
+                        stats.tiles += 1;
+                        col += 1;
+                        x += TILE;
+                        gi += 1;
+                        if col == tiles_x {
+                            col = 0;
+                            x = x0;
+                            y += TILE;
+                            gi += grid_width - tiles_x;
+                        }
+                    }
+                    left -= span;
+                }
+                continue;
+            }
             for _ in 0..run.tiles {
-                let tx = index % tiles_x;
-                let ty = index / tiles_x;
-                let gi = (rect.y as usize / TILE + ty) * grid_width
-                    + rect.x as usize / TILE
-                    + tx;
                 if let Some(record) = self.records.get_mut(gi) {
                     record.generation = generation;
                     record.source_record = -1;
                 }
                 match run.command {
-                    Command::Fill => fill_tile(&mut tile, BACKGROUND),
+                    Command::Fill => unreachable!("handled above"),
                     Command::CopyPrevious => {
                         let source = if index > 0 {
-                            Some(tile_offset(rect, tiles_x, index - 1))
-                        } else if rect.x as usize >= TILE {
-                            Some((rect.x as usize - TILE, rect.y as usize))
+                            if col > 0 {
+                                Some((x - TILE, y))
+                            } else {
+                                Some((x0 + (tiles_x - 1) * TILE, y - TILE))
+                            }
+                        } else if x0 >= TILE {
+                            Some((x0 - TILE, y0))
                         } else {
                             None
                         };
                         let copied = match source {
-                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, &mut tile),
+                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, x, y),
                             None => false,
                         };
                         if !copied {
-                            fill_tile(&mut tile, BACKGROUND);
+                            fill_tile_at(fb, stride, x, y, BACKGROUND);
                         }
                         if let Some(record) = self.records.get_mut(gi) {
                             record.source_record = gi as i32 - 1;
@@ -1214,23 +1545,19 @@ impl MvsDecoder {
                         }
                     }
                     Command::CopyAbove => {
-                        let above_in_rect = index >= tiles_x;
-                        let source = if above_in_rect {
-                            Some(tile_offset(rect, tiles_x, index - tiles_x))
-                        } else if rect.y as usize >= TILE {
-                            Some((
-                                rect.x as usize + (index % tiles_x) * TILE,
-                                rect.y as usize - TILE,
-                            ))
+                        let source = if index >= tiles_x {
+                            Some((x, y - TILE))
+                        } else if y0 >= TILE {
+                            Some((x, y0 - TILE))
                         } else {
                             None
                         };
                         let copied = match source {
-                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, &mut tile),
+                            Some((sx, sy)) => copy_tile_at(fb, stride, sx, sy, x, y),
                             None => false,
                         };
                         if !copied {
-                            fill_tile(&mut tile, BACKGROUND);
+                            fill_tile_at(fb, stride, x, y, BACKGROUND);
                         }
                         if let Some(record) = self.records.get_mut(gi) {
                             record.source_record = gi as i32 - grid_width as i32;
@@ -1251,7 +1578,7 @@ impl MvsDecoder {
                                 let [b, g, r] = solid_rgb(y, cb, cr);
                                 solid = [b, g, r, 0];
                             }
-                            fill_tile(&mut tile, solid);
+                            fill_tile_at(fb, stride, x, y, solid);
                         } else {
                             if !reuse {
                                 for slot in bitmap.iter_mut() {
@@ -1262,13 +1589,13 @@ impl MvsDecoder {
                                     *slot = [b, g, r, 0];
                                 }
                             }
-                            decode_bitmap(&mut payload, &bitmap, &mut tile)?;
+                            decode_bitmap(&mut payload, &bitmap, fb, stride, x, y)?;
                         }
                     }
-                    Command::Bitmap => decode_bitmap(&mut payload, &bitmap, &mut tile)?,
+                    Command::Bitmap => decode_bitmap(&mut payload, &bitmap, fb, stride, x, y)?,
                     Command::Dct => {
                         blocks.decode_block(&mut payload, header.p1, header.p2)?;
-                        self.render_coeff(&blocks.coeff, &mut tile);
+                        self.render_coeff_to(&blocks.coeff, fb, stride, x, y);
                         // Spatial record: base coefficients for type-1
                         // refinement. A reused block copies the previous record.
                         let record = if blocks.last_reuse {
@@ -1297,16 +1624,28 @@ impl MvsDecoder {
                     }
                     Command::Cache16 => {
                         let cache_index = payload.read(16)? as u16;
-                        self.render_cache(cache_index, &mut tile);
+                        if let Some(coeff) = self.cache_coeff(cache_index) {
+                            self.render_coeff_to(&coeff, fb, stride, x, y);
+                        }
                     }
                     Command::Cache17 => {
                         let cache_index = self.cache.last_read.wrapping_add(1);
-                        self.render_cache(cache_index, &mut tile);
+                        if let Some(coeff) = self.cache_coeff(cache_index) {
+                            self.render_coeff_to(&coeff, fb, stride, x, y);
+                        }
                     }
                 }
-                write_tile(fb, stride, rect, tx, ty, &tile);
                 index += 1;
                 stats.tiles += 1;
+                col += 1;
+                x += TILE;
+                gi += 1;
+                if col == tiles_x {
+                    col = 0;
+                    x = x0;
+                    y += TILE;
+                    gi += grid_width - tiles_x;
+                }
             }
         }
         if index != total {
@@ -1341,7 +1680,6 @@ impl MvsDecoder {
         let grid_width = self.grid_width;
         let tiles_x = (rect.w as usize).div_ceil(8);
         let tiles_y = (rect.h as usize).div_ceil(8);
-        let mut tile = [0u8; TILE * TILE * 4];
         let mut stats = FrameStats::default();
 
         for ly in 0..tiles_y {
@@ -1360,8 +1698,8 @@ impl MvsDecoder {
                         } else {
                             bits.read(16)? as u16
                         };
-                        if self.render_cache(cache_index, &mut tile) {
-                            write_tile_at(fb, stride, x, y, &tile);
+                        if let Some(coeff) = self.cache_coeff(cache_index) {
+                            self.render_coeff_to(&coeff, fb, stride, x, y);
                         }
                     }
                     2 => {
@@ -1387,8 +1725,7 @@ impl MvsDecoder {
                         let record = self.records.get(gi).copied().unwrap_or_default();
                         let (coeff, ring) =
                             refine(&record, &mut bits, cr_count, cb_count, &huff)?;
-                        self.render_coeff(&coeff, &mut tile);
-                        write_tile_at(fb, stride, x, y, &tile);
+                        self.render_coeff_to(&coeff, fb, stride, x, y);
                         self.cache.insert(ring);
                         stats.dct_blocks += 1;
                     }
@@ -1455,13 +1792,75 @@ fn refine(
     Ok((out, ring))
 }
 
-/// Write a tile at absolute pixel coordinates.
-fn write_tile_at(fb: &mut [u8], stride: usize, x: usize, y: usize, tile: &[u8; TILE * TILE * 4]) {
-    for row in 0..TILE {
-        let src = row * TILE * 4;
-        let dst = (y + row) * stride + x * 4;
-        fb[dst..dst + TILE * 4].copy_from_slice(&tile[src..src + TILE * 4]);
+/// Byte offset of one tile row.
+#[inline(always)]
+fn tile_row(stride: usize, x: usize, y: usize, row: usize) -> usize {
+    (y + row) * stride + x * 4
+}
+
+/// Fill the 8x8 tile at `(x, y)` with one pixel.
+fn fill_tile_at(fb: &mut [u8], stride: usize, x: usize, y: usize, pixel: [u8; 4]) {
+    let mut row = [0u8; TILE * 4];
+    for chunk in row.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&pixel);
     }
+    for r in 0..TILE {
+        let dst = tile_row(stride, x, y, r);
+        fb[dst..dst + TILE * 4].copy_from_slice(&row);
+    }
+}
+
+/// Fill `tiles` consecutive tiles on one tile row with one pixel.
+fn fill_span(fb: &mut [u8], stride: usize, x: usize, y: usize, tiles: usize, pixel: [u8; 4]) {
+    let mut narrow = [0u8; TILE * 4];
+    for chunk in narrow.chunks_exact_mut(4) {
+        chunk.copy_from_slice(&pixel);
+    }
+    let mut wide = [0u8; 256];
+    for chunk in wide.chunks_exact_mut(TILE * 4) {
+        chunk.copy_from_slice(&narrow);
+    }
+    // A rect whose width is not a multiple of the tile edge would otherwise
+    // run the span into the next row; clamp to what the row can hold.
+    let bytes = (tiles * TILE * 4).min(stride.saturating_sub(x * 4));
+    for row in 0..TILE {
+        let dst = tile_row(stride, x, y, row);
+        let out = &mut fb[dst..dst + bytes];
+        let mut chunks = out.chunks_exact_mut(wide.len());
+        for chunk in &mut chunks {
+            chunk.copy_from_slice(&wide);
+        }
+        for chunk in chunks.into_remainder().chunks_exact_mut(TILE * 4) {
+            chunk.copy_from_slice(&narrow);
+        }
+    }
+}
+
+/// Copy the tile at `(sx, sy)` to `(x, y)` inside the same framebuffer.
+///
+/// Returns false when the source tile is not fully inside the framebuffer.
+/// `copy_within` is a memmove, so a destination overlapping its source is
+/// fine; the tile bookkeeping the caller does is unaffected either way.
+fn copy_tile_at(
+    fb: &mut [u8],
+    stride: usize,
+    sx: usize,
+    sy: usize,
+    x: usize,
+    y: usize,
+) -> bool {
+    let fb_h = fb.len() / stride;
+    if sx + TILE > stride / 4 || sy + TILE > fb_h {
+        return false;
+    }
+    for r in 0..TILE {
+        let src = tile_row(stride, sx, sy, r);
+        let dst = tile_row(stride, x, y, r);
+        if src != dst {
+            fb.copy_within(src..src + TILE * 4, dst);
+        }
+    }
+    true
 }
 
 /// Copy an 8x8 tile from a byte offset inside the framebuffer to `(x, y)`.
@@ -1471,28 +1870,27 @@ fn copy_tile_from_offset(fb: &mut [u8], stride: usize, offset: usize, x: usize, 
     }
     for row in 0..TILE {
         let src = offset + row * stride;
-        let dst = (y + row) * stride + x * 4;
+        let dst = tile_row(stride, x, y, row);
         fb.copy_within(src..src + TILE * 4, dst);
     }
 }
 
-fn fill_tile(tile: &mut [u8; TILE * TILE * 4], pixel: [u8; 4]) {
-    for chunk in tile.chunks_exact_mut(4) {
-        chunk.copy_from_slice(&pixel);
-    }
-}
-
+/// Decode an 8x8 two-colour bitmap straight into the framebuffer tile.
 fn decode_bitmap(
     payload: &mut BitReader<'_>,
     colours: &[[u8; 4]; 2],
-    tile: &mut [u8; TILE * TILE * 4],
+    fb: &mut [u8],
+    stride: usize,
+    x: usize,
+    y: usize,
 ) -> Result<()> {
     let mask = payload.read(8)? as u8;
     for row in 0..TILE {
-        let base = row * TILE * 4;
+        let dst = tile_row(stride, x, y, row);
+        let line = &mut fb[dst..dst + TILE * 4];
         if mask & (0x80 >> row) != 0 {
             for col in 0..TILE {
-                tile[base + col * 4..base + col * 4 + 4].copy_from_slice(&colours[0]);
+                line[col * 4..col * 4 + 4].copy_from_slice(&colours[0]);
             }
         } else {
             let bits = payload.read(8)? as u8;
@@ -1502,42 +1900,11 @@ fn decode_bitmap(
                 } else {
                     colours[1]
                 };
-                tile[base + col * 4..base + col * 4 + 4].copy_from_slice(&pixel);
+                line[col * 4..col * 4 + 4].copy_from_slice(&pixel);
             }
         }
     }
     Ok(())
-}
-
-fn tile_offset(rect: Rect, tiles_x: usize, index: usize) -> (usize, usize) {
-    let tx = index % tiles_x;
-    let ty = index / tiles_x;
-    (rect.x as usize + tx * TILE, rect.y as usize + ty * TILE)
-}
-
-fn write_tile(fb: &mut [u8], stride: usize, rect: Rect, tx: usize, ty: usize, tile: &[u8]) {
-    let x = rect.x as usize + tx * TILE;
-    let y = rect.y as usize + ty * TILE;
-    for row in 0..TILE {
-        let src = row * TILE * 4;
-        let dst = (y + row) * stride + x * 4;
-        fb[dst..dst + TILE * 4].copy_from_slice(&tile[src..src + TILE * 4]);
-    }
-}
-
-/// Copy the tile whose top-left pixel is `(x, y)`. Returns false when that
-/// tile is not fully inside the framebuffer.
-fn copy_tile_at(fb: &[u8], stride: usize, x: usize, y: usize, tile: &mut [u8; TILE * TILE * 4]) -> bool {
-    let fb_h = fb.len() / stride;
-    if x + TILE > stride / 4 || y + TILE > fb_h {
-        return false;
-    }
-    for row in 0..TILE {
-        let src = (y + row) * stride + x * 4;
-        tile[row * TILE * 4..row * TILE * 4 + TILE * 4]
-            .copy_from_slice(&fb[src..src + TILE * 4]);
-    }
-    true
 }
 
 #[cfg(test)]
@@ -1723,38 +2090,54 @@ mod tests {
     /// Replay a captured push sequence in manifest order.
     ///
     /// Returns `(bodies, insertions, last_read, write_cursor, fnv)`.
-    fn replay_manifest(manifest: &str) -> Option<(usize, u32, u16, u16, u32)> {
+    /// Returns `(bodies, insertions, last_read, write_cursor, fnv, max_diff)`
+    /// where `max_diff` is the largest channel difference against the f64
+    /// reference transform over the same bodies.
+    fn replay_manifest(manifest: &str) -> Option<(usize, u32, u16, u16, u32, i32)> {
         let text = artifact(manifest)?;
-        let mut dec = MvsDecoder::new(2560, 1600);
-        let mut fb = vec![0u8; 2560 * 1600 * 4];
-        let mut bodies = 0usize;
-        for line in String::from_utf8_lossy(&text).lines() {
-            let f: Vec<&str> = line.split_whitespace().collect();
-            if f.len() < 8 {
-                continue;
+        let replay = |reference: bool| {
+            let mut dec = MvsDecoder::new(2560, 1600);
+            dec.idct.set_reference(reference);
+            let mut fb = vec![0u8; 2560 * 1600 * 4];
+            let mut bodies = 0usize;
+            for line in String::from_utf8_lossy(&text).lines() {
+                let f: Vec<&str> = line.split_whitespace().collect();
+                if f.len() < 8 {
+                    continue;
+                }
+                let path = format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), f[7]);
+                let body = std::fs::read(&path).ok()?;
+                let rect = Rect::new(
+                    f[2].parse().unwrap(),
+                    f[3].parse().unwrap(),
+                    f[4].parse().unwrap(),
+                    f[5].parse().unwrap(),
+                );
+                dec.apply(&body, rect, &mut fb)
+                    .unwrap_or_else(|e| panic!("body {} ({}): {e:#}", f[0], f[1]));
+                bodies += 1;
             }
-            let path = format!("{}/../../{}", env!("CARGO_MANIFEST_DIR"), f[7]);
-            let body = std::fs::read(&path).ok()?;
-            let rect = Rect::new(
-                f[2].parse().unwrap(),
-                f[3].parse().unwrap(),
-                f[4].parse().unwrap(),
-                f[5].parse().unwrap(),
-            );
-            dec.apply(&body, rect, &mut fb)
-                .unwrap_or_else(|e| panic!("body {} ({}): {e:#}", f[0], f[1]));
-            bodies += 1;
-        }
+            Some((dec, fb, bodies))
+        };
+        let (dec, fb, bodies) = replay(false)?;
+        let (_, reference, _) = replay(true)?;
         let mut fnv: u32 = 0x811c9dc5;
         for b in &fb {
             fnv = (fnv ^ *b as u32).wrapping_mul(16_777_619);
         }
+        let max_diff = fb
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap_or(0);
         Some((
             bodies,
             dec.cache.total_insertions,
             dec.cache.last_read,
             dec.cache.write_cursor(),
             fnv,
+            max_diff,
         ))
     }
 
@@ -1763,7 +2146,7 @@ mod tests {
     /// independent Python parser in `artifacts/push-codex-parse.py`.
     #[test]
     fn push_sequence_applies_with_cache_and_type1() {
-        let Some((bodies, inserts, last_read, cursor, fnv)) =
+        let Some((bodies, inserts, last_read, cursor, fnv, diff)) =
             replay_manifest("push-pC/manifest.txt")
         else {
             return;
@@ -1772,13 +2155,16 @@ mod tests {
         assert_eq!(inserts, 20_082, "ring insertions");
         assert_eq!(last_read, 20_073);
         assert_eq!(cursor, 20_082);
-        assert_eq!(fnv, 0xe065_e9ab, "final framebuffer FNV");
+        assert!(diff <= 1, "integer IDCT drifted {diff} channels");
+        // Hashes are for the fixed-point transform; the check above pins it to
+        // within one channel of the f64 reference that produced 0xe065_e9ab.
+        assert_eq!(fnv, 0x2f9f_ac98, "final framebuffer FNV");
     }
 
     /// codex's own 12-second capture (131 type-0, 90 type-1, 1 quant).
     #[test]
     fn codex_capture_sequence_applies() {
-        let Some((bodies, inserts, last_read, cursor, fnv)) =
+        let Some((bodies, inserts, last_read, cursor, fnv, diff)) =
             replay_manifest("push-codex-manifest.txt")
         else {
             return;
@@ -1787,7 +2173,8 @@ mod tests {
         assert_eq!(inserts, 34_608, "ring insertions");
         assert_eq!(last_read, 526);
         assert_eq!(cursor, 34_608);
-        assert_eq!(fnv, 0xfc24_7744, "final framebuffer FNV");
+        assert!(diff <= 1, "integer IDCT drifted {diff} channels");
+        assert_eq!(fnv, 0xbd37_0b99, "final framebuffer FNV");
     }
 
     #[test]
@@ -2238,4 +2625,97 @@ mod tests {
         assert_eq!(last[0], ((CACHE_ENTRIES - 1) & 0xff) as u8);
     }
 
+    /// Render one coefficient block as BGRX through the same helpers the
+    /// decoder uses, so the comparison is at the level the project cares
+    /// about: channel bytes.
+    fn render_block(idct: &Idct, coeff: &[i16; 64], quant: &[u8; 64]) -> [u8; 192] {
+        let y = idct.plane(&coeff[..64], quant);
+        let c = idct.plane(&coeff[..64], &DEFAULT_QUANT_CHROMA);
+        let mut out = [0u8; 192];
+        for j in 0..64 {
+            let [b, g, r] = rgb_from_idct(y[j], c[j], c[j]);
+            out[j * 3..j * 3 + 3].copy_from_slice(&[b, g, r]);
+        }
+        out
+    }
+
+    /// The fixed-point IDCT must agree with the f64 basis. Rendered channels
+    /// are the contract (|diff| <= 1, the existing tolerance against the
+    /// framework); samples are checked against the documented fixed-point
+    /// envelope, which is a fraction of one channel step for the range this
+    /// server emits and stays under 8 even at the i16 wrap extreme.
+    #[test]
+    fn integer_idct_matches_reference_on_random_blocks() {
+        let fast = Idct::new();
+        let mut slow = Idct::new();
+        slow.set_reference(true);
+        let mut state = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            state = state.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            (state >> 33) as u32
+        };
+        let quants = [DEFAULT_QUANT_LUMA, DEFAULT_QUANT_CHROMA];
+        let mut max_channel = 0i32;
+        let mut max_sample = 0i32;
+        let mut blocks = 0;
+        // Magnitudes cover a realistic capture (~1e3 after dequantisation)
+        // through the whole i16 wrap range.
+        for cap in [16i32, 64, 256, 1024, 4096, 16384, 32767] {
+            for block in 0..500 {
+                let mut coeff = [0i16; 64];
+                coeff[0] = ((next() as i32 % (cap + 1)) - cap / 2) as i16;
+                // 0 AC terms (the chroma / flat-tile case), then sparse/dense.
+                let ac = [0usize, 1, 2, 4, 8, 16, 63][block % 7];
+                for _ in 0..ac {
+                    let j = 1 + (next() as usize) % 63;
+                    let m = (next() as i32) % (cap + 1);
+                    coeff[j] = (if next() & 1 == 0 { m } else { -m }) as i16;
+                }
+                let quant = &quants[(block / 7) % 2];
+                let got = fast.plane(&coeff, quant);
+                let want = slow.plane(&coeff, quant);
+                for (g, w) in got.iter().zip(want.iter()) {
+                    max_sample = max_sample.max((g - w).abs());
+                }
+                for (x, y) in render_block(&fast, &coeff, quant)
+                    .iter()
+                    .zip(render_block(&slow, &coeff, quant).iter())
+                {
+                    max_channel = max_channel.max((*x as i32 - *y as i32).abs());
+                }
+                blocks += 1;
+            }
+        }
+        assert!(max_channel <= 1, "{blocks} blocks: channel diff {max_channel}");
+        assert!(max_sample <= 8, "{blocks} blocks: sample diff {max_sample}");
+    }
+
+    /// Same equivalence over the blocks of the real capture: decode the full
+    /// type-0 body twice, once with each transform, and compare the pixels.
+    #[test]
+    fn integer_idct_matches_reference_on_capture() {
+        let Some(body) = capture() else { return };
+        let (w, h) = (2560u16, 1600u16);
+        let rect = Rect::new(0, 0, w, h);
+        let mut integer = vec![0u8; w as usize * h as usize * 4];
+        let mut reference = integer.clone();
+        let mut fast = MvsDecoder::new(w, h);
+        let mut slow = MvsDecoder::new(w, h);
+        if let Some(q) = quant() {
+            fast.quant = q.clone();
+            slow.quant = q;
+        }
+        slow.idct.set_reference(true);
+        let stats_fast = fast.decode_partial(&body, rect, &mut integer).unwrap();
+        let stats_slow = slow.decode_partial(&body, rect, &mut reference).unwrap();
+        assert_eq!(stats_fast, stats_slow, "same blocks, same statistics");
+        assert!(stats_fast.dct_blocks > 0);
+        let max_diff = integer
+            .iter()
+            .zip(reference.iter())
+            .map(|(a, b)| (*a as i32 - *b as i32).abs())
+            .max()
+            .unwrap();
+        assert!(max_diff <= 1, "max channel diff {max_diff} over the capture");
+    }
 }
