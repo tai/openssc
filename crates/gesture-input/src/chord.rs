@@ -37,6 +37,62 @@ pub struct ReleaseChord {
     completed: bool,
 }
 
+/// The focused-window chord that re-enables a paused grab. This one is a tap,
+/// not a hold: Ctrl+Alt+Esc key-down re-enables, and the matching key-up is
+/// consumed even if Ctrl/Alt were released first.
+#[derive(Debug, Default)]
+pub struct ResumeChord {
+    pending: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TapAction {
+    /// Not the resume chord; handle normally.
+    Forward,
+    /// Part of the resume chord; do not send it.
+    Consume,
+    /// The key-down consumed to resume the grab; do not send it.
+    Resume,
+}
+
+impl ResumeChord {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn pending(&self) -> bool {
+        self.pending
+    }
+
+    pub fn reset(&mut self) {
+        self.pending = false;
+    }
+
+    pub fn on_escape(
+        &mut self,
+        down: bool,
+        ctrl: bool,
+        alt: bool,
+        repeat: bool,
+    ) -> TapAction {
+        if down {
+            if self.pending {
+                return TapAction::Consume;
+            }
+            if ctrl && alt && !repeat {
+                self.pending = true;
+                return TapAction::Resume;
+            }
+            TapAction::Forward
+        } else if self.pending {
+            self.pending = false;
+            TapAction::Consume
+        } else {
+            TapAction::Forward
+        }
+    }
+}
+
 impl ReleaseChord {
     pub fn new() -> Self {
         Self::default()
@@ -246,5 +302,30 @@ mod tests {
         chord.on_key(LINUX_KEY_LEFTCTRL, true, t);
         chord.on_key(LINUX_KEY_LEFTALT, true, t);
         assert!(!chord.tick(t + Duration::from_secs(1)));
+    }
+
+    #[test]
+    fn resume_tap_consumes_down_and_up() {
+        let mut tap = ResumeChord::new();
+        assert_eq!(tap.on_escape(true, true, true, false), TapAction::Resume);
+        assert!(tap.pending());
+        // Ctrl/Alt may be released before Escape; the up is still ours.
+        assert_eq!(tap.on_escape(false, false, false, false), TapAction::Consume);
+        assert!(!tap.pending());
+    }
+
+    #[test]
+    fn escape_without_ctrl_alt_is_forwarded() {
+        let mut tap = ResumeChord::new();
+        assert_eq!(tap.on_escape(true, false, false, false), TapAction::Forward);
+        assert_eq!(tap.on_escape(false, false, false, false), TapAction::Forward);
+    }
+
+    #[test]
+    fn a_held_escape_repeat_is_consumed_after_resume() {
+        let mut tap = ResumeChord::new();
+        assert_eq!(tap.on_escape(true, true, true, false), TapAction::Resume);
+        assert_eq!(tap.on_escape(true, true, true, true), TapAction::Consume);
+        assert_eq!(tap.on_escape(false, true, true, false), TapAction::Consume);
     }
 }

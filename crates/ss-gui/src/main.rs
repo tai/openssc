@@ -5,6 +5,7 @@
 //! events into RFB/Apple messages and presents BGRX frames.
 
 use anyhow::Result;
+use gesture_input::chord::{ResumeChord, TapAction};
 use gesture_input::{AxisFilter, Gesture, Phase, SCROLL_POINTS_PER_LINE};
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
@@ -492,7 +493,8 @@ Input and keyboard:
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --grab-trackpad          Linux: grab the trackpad while focused (needs --evdev)
   --grab-keyboard          Linux: grab the keyboard 500 ms after focus
-                           (release: hold LeftCtrl+LeftAlt+Esc for 350 ms)
+                           (hold LeftCtrl+LeftAlt+Esc 350 ms to pause;
+                            tap it while focused to grab again)
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
   --release-grab <chord>   macOS release chord, e.g. cmd+shift or ctrl+alt+cmd+esc
                            (default: hold Left-Cmd+Shift for 350 ms)
@@ -1312,6 +1314,84 @@ fn evdev_logical(code: u16, win: Option<KeyCode>, shift: bool) -> Option<Key> {
     Some(Key::Character(c.to_string().into()))
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum KeyboardGrabMode {
+    /// No `--grab-keyboard`: the keyboard is never captured.
+    Plain,
+    /// Requested but paused: local shortcuts work; Ctrl+Alt+Esc re-arms.
+    Paused,
+    /// The evdev keyboard is currently captured.
+    Grabbed,
+}
+
+/// Persistent on/off state for the keyboard grab. The release chord pauses it;
+/// the winit tap chord resumes it. Focus/blur only grabs or releases while
+/// this remains enabled.
+#[derive(Debug, Clone, Copy)]
+struct KeyboardGrabToggle {
+    requested: bool,
+    enabled: bool,
+    grabbed: bool,
+}
+
+impl KeyboardGrabToggle {
+    fn new(requested: bool) -> Self {
+        Self {
+            requested,
+            enabled: requested,
+            grabbed: false,
+        }
+    }
+
+    fn requested(&self) -> bool {
+        self.requested
+    }
+
+    fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    fn grabbed(&self) -> bool {
+        self.grabbed
+    }
+
+    fn can_resume(&self) -> bool {
+        self.requested && !self.enabled && !self.grabbed
+    }
+
+    fn mode(&self) -> KeyboardGrabMode {
+        if self.grabbed {
+            KeyboardGrabMode::Grabbed
+        } else if self.requested && !self.enabled {
+            KeyboardGrabMode::Paused
+        } else {
+            KeyboardGrabMode::Plain
+        }
+    }
+
+    fn arm(&mut self) {
+        self.grabbed = true;
+    }
+
+    fn release(&mut self) {
+        self.grabbed = false;
+    }
+
+    /// The release chord fired: stop re-grabbing on focus until resumed.
+    fn pause(&mut self) -> bool {
+        let was = self.mode();
+        self.enabled = false;
+        self.grabbed = false;
+        was != KeyboardGrabMode::Paused
+    }
+
+    fn resume(&mut self) -> bool {
+        let was = self.mode();
+        self.enabled = true;
+        was != KeyboardGrabMode::Plain
+    }
+}
+
 #[derive(Debug, Clone)]
 enum UserEvent {
     Refresh,
@@ -1389,10 +1469,11 @@ struct App {
     evdev_keyboard: Option<platform::evdev::GrabHandle>,
     /// Wire keysyms currently down on the grabbed keyboard.
     evdev_keys_down: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
-    /// `--grab-keyboard`: request the grab on focus.
-    grab_keyboard: bool,
-    /// The evdev keyboard is currently captured.
-    keyboard_grabbed: bool,
+    /// `--grab-keyboard` state: requested/enabled/grabbed, with persistent
+    /// pause/resume across focus changes.
+    keyboard_toggle: KeyboardGrabToggle,
+    /// Consumes the winit tap chord that re-enables a paused grab.
+    resume_chord: ResumeChord,
     /// `--grab-keyboard` arms 500 ms after focus, so the window is visible
     /// before keys stop reaching the desktop.
     keyboard_grab_at: Option<Instant>,
@@ -1534,8 +1615,8 @@ impl App {
             grab_trackpad,
             evdev_keyboard,
             evdev_keys_down,
-            grab_keyboard,
-            keyboard_grabbed: false,
+            keyboard_toggle: KeyboardGrabToggle::new(grab_keyboard),
+            resume_chord: ResumeChord::new(),
             keyboard_grab_at: None,
             grab_suspended: false,
             scroll_test,
@@ -1603,6 +1684,39 @@ impl App {
         // flag and this server does not synthesise repeats from a held key,
         // so dropping these events made a held key type exactly one character.
         // Local shortcuts below are guarded against repeats separately.
+        //
+        // While the grab is paused, a plain Ctrl+Alt+Esc tap through winit
+        // re-enables it. The tap and its key-up are consumed, not forwarded.
+        if self.keyboard_toggle.can_resume() || self.resume_chord.pending() {
+            let is_escape = code == Some(KeyCode::Escape)
+                || matches!(logical, Key::Named(NamedKey::Escape));
+            if is_escape {
+                match self.resume_chord.on_escape(
+                    pressed,
+                    self.modifiers.control_key(),
+                    self.modifiers.alt_key(),
+                    repeat,
+                ) {
+                    TapAction::Forward => {}
+                    TapAction::Consume => return,
+                    TapAction::Resume => {
+                        if self.keyboard_toggle.resume() {
+                            eprintln!(
+                                "evdev keyboard: enabled; Ctrl+Alt+Esc re-arms the grab"
+                            );
+                        }
+                        self.keyboard_grab_at =
+                            if self.window_focused && self.evdev_keyboard.is_some() {
+                                Some(Instant::now() + Duration::from_millis(500))
+                            } else {
+                                None
+                            };
+                        self.update_title();
+                        return;
+                    }
+                }
+            }
+        }
         // Cmd+Shift+V is local: pull the file/folder named on the
         // remote clipboard. Do not forward the V key (Cmd+V alone is
         // still a normal remote paste). Match the physical key so a
@@ -1804,7 +1918,7 @@ impl App {
     }
 
     fn send_key(&mut self, keysym: u32, pressed: bool) {
-        if self.grab_keyboard || self.keyboard_grabbed {
+        if self.keyboard_toggle.requested() {
             if let Some(down) = &self.evdev_keys_down {
                 let mut down = down.lock().unwrap_or_else(|e| e.into_inner());
                 if pressed {
@@ -1830,19 +1944,25 @@ impl App {
         }
         self.sync_modifiers(ModifiersState::empty());
         self.modifiers = ModifiersState::empty();
-        self.keyboard_grabbed = false;
+        self.keyboard_toggle.release();
+        self.resume_chord.reset();
         self.keyboard_grab_at = None;
         self.update_title();
     }
 
     fn update_title(&self) {
         let Some(window) = &self.window else { return };
-        if self.keyboard_grabbed {
-            window.set_title("ss-clone — keyboard grabbed: Ctrl+Alt+Esc to release");
-        } else if self.window_focused {
-            window.set_title("ss-clone — Apple Screen Sharing");
-        } else {
-            window.set_title("ss-clone — click to focus");
+        match self.keyboard_toggle.mode() {
+            KeyboardGrabMode::Grabbed => {
+                window.set_title("ss-clone — keyboard grabbed: Ctrl+Alt+Esc to release")
+            }
+            KeyboardGrabMode::Paused => window.set_title(
+                "ss-clone — keyboard paused: local shortcuts active, Ctrl+Alt+Esc grabs",
+            ),
+            KeyboardGrabMode::Plain if self.window_focused => {
+                window.set_title("ss-clone — Apple Screen Sharing")
+            }
+            KeyboardGrabMode::Plain => window.set_title("ss-clone — click to focus"),
         }
     }
 
@@ -2570,6 +2690,13 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 self.release_evdev_keyboard("release chord");
+                if self.keyboard_toggle.pause() {
+                    eprintln!(
+                        "evdev keyboard: paused; local shortcuts active, Ctrl+Alt+Esc re-arms"
+                    );
+                }
+                self.resume_chord.reset();
+                self.update_title();
             }
         }
     }
@@ -2641,14 +2768,19 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
-                if focused && self.grab_keyboard && self.evdev_keyboard.is_some() {
+                if focused
+                    && self.keyboard_toggle.requested()
+                    && self.keyboard_toggle.enabled()
+                    && self.evdev_keyboard.is_some()
+                {
                     // Do not steal the keyboard the instant focus lands: give
                     // the human half a second to see the window first.
                     self.keyboard_grab_at =
                         Some(Instant::now() + Duration::from_millis(500));
                 } else if !focused {
                     self.keyboard_grab_at = None;
-                    if self.keyboard_grabbed {
+                    self.resume_chord.reset();
+                    if self.keyboard_toggle.grabbed() {
                         if let Some(keyboard) = &self.evdev_keyboard {
                             if let Err(e) = keyboard.set_grabbed(false) {
                                 eprintln!("evdev keyboard: release on blur failed: {e}");
@@ -2923,26 +3055,30 @@ impl ApplicationHandler<UserEvent> for App {
             if let Some(at) = self.keyboard_grab_at {
                 if Instant::now() >= at {
                     self.keyboard_grab_at = None;
-                    if self.window_focused {
-                        let was_grabbed = self.keyboard_grabbed;
-                        self.keyboard_grabbed = true;
+                    if self.window_focused && self.keyboard_toggle.enabled() {
+                        let was_grabbed = self.keyboard_toggle.grabbed();
+                        self.keyboard_toggle.arm();
                         match keyboard.set_grabbed(true) {
                             Ok(()) => {
+                                self.resume_chord.reset();
                                 self.update_title();
                             }
                             Err(e) => {
-                                self.keyboard_grabbed = was_grabbed;
+                                if !was_grabbed {
+                                    self.keyboard_toggle.release();
+                                }
                                 eprintln!("evdev keyboard: cannot grab: {e}");
                             }
                         }
                     }
                 }
             }
-            if self.keyboard_grabbed && !keyboard.is_grabbed() {
+            if self.keyboard_toggle.grabbed() && !keyboard.is_grabbed() {
                 // The watchdog released it (or the device went away). The
                 // release callback already sent key-ups; just clear local state.
                 eprintln!("evdev keyboard: grab is no longer active");
-                self.keyboard_grabbed = false;
+                self.keyboard_toggle.release();
+                self.resume_chord.reset();
                 self.modifiers = ModifiersState::empty();
                 self.forwarded_mods = ModifiersState::empty();
                 self.update_title();
@@ -3223,7 +3359,7 @@ impl ApplicationHandler<UserEvent> for App {
                 .unwrap_or(false);
             let mut wake_at = if grab::is_active()
                 || trackpad_grabbed
-                || self.keyboard_grabbed
+                || self.keyboard_toggle.grabbed()
             {
                 Some(Instant::now() + Duration::from_millis(400))
             } else {
@@ -3336,7 +3472,7 @@ impl ApplicationHandler<UserEvent> for App {
                 eprintln!("evdev: release on exit failed: {e}");
             }
         }
-        if self.keyboard_grabbed {
+        if self.keyboard_toggle.grabbed() {
             if let Some(keyboard) = &self.evdev_keyboard {
                 if let Err(e) = keyboard.set_grabbed(false) {
                     eprintln!("evdev keyboard: release on exit failed: {e}");
@@ -3936,6 +4072,9 @@ fn main() -> Result<()> {
                     eprintln!(
                         "evdev keyboard: using {} (local layout assumed US)",
                         keyboard.info
+                    );
+                    eprintln!(
+                        "evdev keyboard: LeftCtrl+LeftAlt+Esc — hold 350 ms to pause, tap to grab"
                     );
                     evdev_keyboard = Some(keyboard.handle);
                     evdev_keys_down = Some(down);
@@ -4665,8 +4804,37 @@ mod tests {
     }
 
     #[test]
-    fn evdev_keycodes_map_to_the_same_characters_as_winit() {
-        assert_eq!(linux_keycode_to_winit(28), Some(KeyCode::Enter));
+    fn keyboard_grab_pauses_and_resumes_persistently() {
+        let off = KeyboardGrabToggle::new(false);
+        assert_eq!(off.mode(), KeyboardGrabMode::Plain);
+        assert!(!off.can_resume());
+
+        let mut toggle = KeyboardGrabToggle::new(true);
+        assert_eq!(toggle.mode(), KeyboardGrabMode::Plain);
+        assert!(toggle.enabled());
+        assert!(!toggle.can_resume());
+
+        toggle.arm();
+        assert_eq!(toggle.mode(), KeyboardGrabMode::Grabbed);
+        assert!(!toggle.can_resume());
+
+        assert!(toggle.pause(), "grabbed -> paused is a transition");
+        assert_eq!(toggle.mode(), KeyboardGrabMode::Paused);
+        assert!(!toggle.enabled());
+        assert!(toggle.can_resume());
+        assert!(!toggle.pause(), "already paused is not a transition");
+        // Focus/blur only release the device; they do not re-enable it.
+        toggle.release();
+        assert_eq!(toggle.mode(), KeyboardGrabMode::Paused);
+
+        assert!(toggle.resume(), "paused -> enabled is a transition");
+        assert_eq!(toggle.mode(), KeyboardGrabMode::Plain);
+        assert!(toggle.enabled());
+        assert!(!toggle.can_resume());
+    }
+
+    #[test]
+    fn evdev_keycodes_map_to_the_same_characters_as_winit() {        assert_eq!(linux_keycode_to_winit(28), Some(KeyCode::Enter));
         assert!(matches!(
             evdev_logical(30, Some(KeyCode::KeyA), false),
             Some(Key::Character(ref s)) if s.as_str() == "a"
