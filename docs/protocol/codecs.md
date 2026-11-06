@@ -787,3 +787,43 @@ Polling MVS already delivers keystrokes in ~85–98 ms p50 on the lab LAN, and t
 floor is one server capture interval, not the request loop (during a repaint,
 applied rects arrive 6–9 ms apart). Push removes the request leg; whether it
 beats that floor is **not yet measured** — see STATUS.md.
+
+## 2.21 Decoder throughput (2026-11-06)
+
+No wire change: bodies, commands, spatial records and the coefficient ring are
+decoded exactly as §2.20 describes. What changed is how fast, because at
+full 2560x1600 resolution the decoder could not keep up with a scroll. Numbers
+and profiling live in `docs/findings/2026-11-06-mvs-decode-throughput.md`.
+
+Sixty-odd percent of the decode was the IDCT and the per-pixel colour
+conversion. Observable rules that follow from the work:
+
+- **The transform is fixed point, not f64.** libjpeg's `islow` butterfly with
+  18-bit cosine constants and i64 accumulators, descaled once at the end
+  (`2*CONST_BITS - 3`, giving the native scale-64 samples). 13-bit constants
+  (what libjpeg uses) are not enough here: this codec's dequantised range is a
+  full i16 product, not the 12-bit range `jidctint` assumes, and 13-bit
+  constants drifted sample values by up to 385 at the extremes. The rendered
+  channel output still matches the f64 basis within 1, which is the project's
+  existing tolerance against the framework; the sample-level envelope at the
+  i16 extreme is 8 and is asserted by the unit tests.
+- **A plane with no AC coefficients is `8 * dequantised DC` everywhere.** That is
+  the DC shortcut; it is exact, not an approximation. Chroma in type-0 bodies is
+  DC-only, so most tiles transform one plane, not three.
+- **Flat chroma is detected on the AC ranges**, `65..128` and `129..192`.
+  `64..` includes the two DC words, which are normally non-zero, so checking it
+  made the shortcut dead code for a while.
+- **Pixel conversion is hoisted, then vectorised by the compiler.** With flat
+  chroma the six chroma terms are constants for the whole tile, and the loop is
+  plain SSE2 `paddsw`/`packssdw` arithmetic at four pixels per instruction. The
+  arithmetic is `pmulhw`-shaped (`i16` truncation after every add), so the
+  scalar and vector paths must agree byte for byte; the differential test in
+  `mvs.rs` checks that against the f64 reference.
+- **Tiles are written straight into the framebuffer.** CopyPrevious/CopyAbove
+  are `fb -> fb` row copies via `copy_within`, which is a memmove and therefore
+  safe when source and destination overlap; no staging tile is involved. This is
+  presentation only: the spatial record writes (`generation`,
+  `source_record`, `source_framebuffer_offset`) are unchanged.
+- **Fill runs fill row spans.** A white desktop is tens of thousands of
+  consecutive fill tiles, so a run is filled as one span per tile row instead of
+  one tile at a time.

@@ -1,5 +1,34 @@
 # Protocol status / agent handoff
 
+## 2026-11-06 — full-resolution MVS decode throughput (VERIFIED on the replay fixture)
+
+- Phase / milestone: M1/M6 — the client must keep up with the server during a
+  scroll at 2560x1600 without shrinking the image.
+- Verified: a captured scroll burst (132 bodies, 1,471,236 tiles, 233,522 DCT
+  blocks, 94.2 Mpx) now decodes in **271.6 ms / 346.7 Mpx/s**, from
+  **1000.2 ms / 94.1 Mpx/s** before. Live backlog over the same 300 px scroll:
+  p50 **681 -> 16-17 ms**, p90 1081 -> 56-58 ms, max **1373 -> 88-106 ms**. Rendering
+  stays within 1 channel of the f64 reference, asserted over the captured
+  fixture, two push manifests and randomised blocks (full i16 range).
+- Changed: `MvsDecoder` — fixed-point `islow` IDCT (18-bit constants, i64,
+  single final descale, DC shortcut), direct-to-framebuffer tile writes, run
+  spans for fills, chroma constants hoisted for DC-only chroma, incremental
+  raster position, `peek`/`skip` on the bit reader. `ss-gui` — decoder thread
+  publishes once per drained batch; `SS_DUMP_MVS` analysis hook; the reader
+  heartbeat now advances on socket reads and treats a blocking read as alive;
+  the 2 s push watchdog is an idle note, not "giving up".
+- Measured with: `cargo test -p rfb-proto --test mvs_replay -- --nocapture`
+  (skips when `artifacts/mvs-scroll-burst.bin` is absent) and `SS_LATDBG=1`
+  (`tools`-free: pair `DEC ... first_arr=` with the batch end).
+- Open: the 150 ms target on that fixture is **not reached** (271.6 ms). The
+  remaining profile is render 20%, IDCT 17%, block decoder + bit reader 30%,
+  command loop 12%, tile copies 10%; another 2x across all of them is needed.
+  Also: the live client decodes a heavy body ~2.7x slower than the replay
+  benchmark for the same bytes (UI blit and memory traffic on the same
+  machine) — that gap is unmeasured and is the next thing to look at.
+- Lab state: `mm.local` healthy; `Screen Sharing` re-shown on `md.local`;
+  no ss-gui running.
+
 ## 2026-11-05 — **v1.4.1**: keyboard grab, `--help` (VERIFIED)
 
 - Phase / milestone: local shortcuts now reach the remote.
