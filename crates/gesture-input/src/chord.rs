@@ -1,8 +1,10 @@
 //! Portable release-chord state machine for the Linux evdev keyboard grab.
 //!
-//! The chord is LeftCtrl + LeftAlt + Esc held for 350 ms. It has to be
-//! recognised from the raw evdev stream because a grabbed keyboard is invisible
-//! to the compositor, so no compositor shortcut can release it.
+//! The chord is Ctrl + Alt + Esc held for 350 ms (left or right modifiers).
+//! It has to be recognised from the raw evdev stream because a grabbed keyboard
+//! is invisible to the compositor, so no compositor shortcut can release it.
+//! The three keys may arrive in any order; if Esc arrives first it is forwarded
+//! and the release path sends its key-up after the hold fires.
 //!
 //! Only Esc is withheld from the remote while the chord is pending. Ctrl and
 //! Alt were already forwarded (they are ordinary modifiers); the release path
@@ -13,7 +15,9 @@ use std::time::{Duration, Instant};
 
 pub const LINUX_KEY_ESC: u16 = 1;
 pub const LINUX_KEY_LEFTCTRL: u16 = 29;
+pub const LINUX_KEY_RIGHTCTRL: u16 = 97;
 pub const LINUX_KEY_LEFTALT: u16 = 56;
+pub const LINUX_KEY_RIGHTALT: u16 = 100;
 pub const HOLD: Duration = Duration::from_millis(350);
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -108,9 +112,10 @@ impl ReleaseChord {
         }
 
         match code {
-            LINUX_KEY_LEFTCTRL => {
+            LINUX_KEY_LEFTCTRL | LINUX_KEY_RIGHTCTRL => {
                 if down {
                     self.ctrl = true;
+                    self.maybe_start(now);
                 } else {
                     self.ctrl = false;
                     if self.started.is_some() {
@@ -119,9 +124,10 @@ impl ReleaseChord {
                 }
                 self.forward()
             }
-            LINUX_KEY_LEFTALT => {
+            LINUX_KEY_LEFTALT | LINUX_KEY_RIGHTALT => {
                 if down {
                     self.alt = true;
+                    self.maybe_start(now);
                 } else {
                     self.alt = false;
                     if self.started.is_some() {
@@ -148,6 +154,10 @@ impl ReleaseChord {
                             ..ChordStep::default()
                         };
                     }
+                    // Esc arrived before both modifiers: forward it for now.
+                    // If they join while Esc is held, the hold starts late and
+                    // the release path still balances Esc with a key-up.
+                    self.esc_forwarded = true;
                     self.forward()
                 } else {
                     if !self.esc {
@@ -155,8 +165,14 @@ impl ReleaseChord {
                     }
                     self.esc = false;
                     if self.started.is_some() {
-                        // Released too early: give the remote a normal press.
                         self.started = None;
+                        if self.esc_forwarded {
+                            // The down already reached the remote; just send
+                            // the matching up, not a duplicate press.
+                            self.esc_forwarded = false;
+                            return self.forward();
+                        }
+                        // Released too early: give the remote a normal press.
                         self.esc_forwarded = true;
                         return ChordStep {
                             consume: true,
@@ -184,6 +200,19 @@ impl ReleaseChord {
                 self.forward()
             }
         }
+    }
+
+    /// Start the hold when the last of the three keys arrives, regardless of
+    /// whether Esc or the modifiers came first.
+    fn maybe_start(&mut self, now: Instant) {
+        if self.esc && self.ctrl && self.alt && self.started.is_none() && !self.completed {
+            self.started = Some(now);
+        }
+    }
+
+    /// True while a potential hold is timing but has not completed.
+    pub fn pending_hold(&self) -> bool {
+        self.started.is_some() && !self.completed
     }
 
     /// Check the hold timer. Returns true exactly once when the chord fires.
@@ -305,8 +334,22 @@ mod tests {
     }
 
     #[test]
-    fn resume_tap_consumes_down_and_up() {
-        let mut tap = ResumeChord::new();
+    fn chord_works_with_esc_first_and_right_side_modifiers() {
+        let mut chord = ReleaseChord::new();
+        let t = at(0);
+        // Esc first: it is forwarded, then the modifiers complete the chord.
+        let esc = chord.on_key(LINUX_KEY_ESC, true, t);
+        assert!(!esc.consume);
+        assert!(!chord.pending_hold());
+        chord.on_key(LINUX_KEY_RIGHTCTRL, true, t);
+        chord.on_key(LINUX_KEY_RIGHTALT, true, t);
+        assert!(chord.pending_hold());
+        assert!(chord.tick(t + HOLD));
+        assert!(chord.completed());
+    }
+
+    #[test]
+    fn resume_tap_consumes_down_and_up() {        let mut tap = ResumeChord::new();
         assert_eq!(tap.on_escape(true, true, true, false), TapAction::Resume);
         assert!(tap.pending());
         // Ctrl/Alt may be released before Escape; the up is still ours.

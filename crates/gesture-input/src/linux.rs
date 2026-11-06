@@ -93,7 +93,7 @@ pub enum DeviceEvent {
     /// A raw keyboard key from the grabbed keyboard (`value` 0=up, 1=down,
     /// 2=repeat). The GUI owns keycode translation; this crate never logs it.
     Key { code: u16, down: bool, repeat: bool },
-    /// The LeftCtrl+LeftAlt+Esc release chord completed.
+    /// The Ctrl+Alt+Esc release chord completed.
     ReleaseChord,
 }
 

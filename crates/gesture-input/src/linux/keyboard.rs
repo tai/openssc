@@ -2,7 +2,7 @@
 //!
 //! A keyboard grab is only safe with a release path that does not depend on the
 //! compositor. The release chord is recognised here from the raw evdev stream
-//! (LeftCtrl+LeftAlt+Esc held 350 ms), so the compositor never has to see it.
+//! (Ctrl+Alt+Esc held 350 ms), so the compositor never has to see it.
 //! All key-up/modifier-release wire messages are sent by the GUI through the
 //! `on_release` callback before this module drops the grab, including when the
 //! watchdog, not the UI, is the one releasing.
@@ -212,7 +212,13 @@ where
                 }
                 let down = ev.value != 0;
                 let repeat = ev.value == 2;
+                let was_pending = chord.pending_hold();
                 let step = chord.on_key(ev.code, down, Instant::now());
+                if chord.pending_hold() && !was_pending {
+                    eprintln!("evdev keyboard: chord armed (ctrl+alt+esc held)");
+                } else if was_pending && !chord.pending_hold() && !chord.completed() {
+                    eprintln!("evdev keyboard: chord cancelled (early release or another key)");
+                }
                 if step.replay_esc_down {
                     on_event(DeviceEvent::Key {
                         code: LINUX_KEY_ESC,
@@ -238,6 +244,7 @@ where
         }
 
         if !released && grabbed.load(Ordering::Relaxed) && chord.tick(Instant::now()) {
+            eprintln!("evdev keyboard: chord completed");
             on_event(DeviceEvent::ReleaseChord);
             released = true;
         }

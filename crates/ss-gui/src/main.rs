@@ -493,7 +493,7 @@ Input and keyboard:
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --grab-trackpad          Linux: grab the trackpad while focused (needs --evdev)
   --grab-keyboard          Linux: grab the keyboard 500 ms after focus
-                           (hold LeftCtrl+LeftAlt+Esc 350 ms to pause;
+                           (hold Ctrl+Alt+Esc 350 ms to pause;
                             tap it while focused to grab again)
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
   --release-grab <chord>   macOS release chord, e.g. cmd+shift or ctrl+alt+cmd+esc
@@ -1406,7 +1406,7 @@ enum UserEvent {
     /// A raw key from the grabbed evdev keyboard.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EvdevKey { code: u16, down: bool, repeat: bool },
-    /// LeftCtrl+LeftAlt+Esc completed on the grabbed evdev keyboard.
+    /// Ctrl+Alt+Esc completed on the grabbed evdev keyboard.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EvdevReleaseChord,
 }
@@ -4074,7 +4074,7 @@ fn main() -> Result<()> {
                         keyboard.info
                     );
                     eprintln!(
-                        "evdev keyboard: LeftCtrl+LeftAlt+Esc — hold 350 ms to pause, tap to grab"
+                        "evdev keyboard: Ctrl+Alt+Esc — hold 350 ms to pause, tap to grab"
                     );
                     evdev_keyboard = Some(keyboard.handle);
                     evdev_keys_down = Some(down);
