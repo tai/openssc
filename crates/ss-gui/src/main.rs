@@ -481,6 +481,7 @@ Display and codec:
 Input and keyboard:
   --keymap us|jis          layout the REMOTE runs (default us)
   --scroll-speed <f>       scroll distance multiplier, feel calibration (default 1.0)
+  --momentum               allow the post-release scroll glide (default off)
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
@@ -1160,6 +1161,10 @@ struct App {
     scroll_last: Instant,
     /// Post-release glide, driven by the last scroll velocity.
     scroll_momentum: Momentum,
+    /// `--momentum`: allow the post-release glide. Off by default - the owner
+    /// wants the scroll to stop when the fingers stop, and an overshooting
+    /// glide is worse than no glide at all.
+    momentum_enabled: bool,
     /// Continuous axis weighting from recent motion (no mode, no latch).
     scroll_axis: AxisFilter,
     /// Whether the glide was running on the previous frame (to reset history
@@ -1215,6 +1220,7 @@ impl App {
         grab: Option<GrabHandle>,
         scroll_test: String,
         frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
+        momentum_enabled: bool,
     ) -> Result<Self> {
         let display = event_loop.display_handle()?;
         // SAFETY: the context is dropped before the event loop (see `exiting`).
@@ -1275,6 +1281,7 @@ impl App {
             scroll_pending: None,
             scroll_last: Instant::now(),
             scroll_momentum: Momentum::new(),
+            momentum_enabled,
             scroll_axis: AxisFilter::new(),
             scroll_gliding: false,
             scroll_velocity: (0.0, 0.0),
@@ -1705,7 +1712,8 @@ impl App {
                 .map(|start| now.duration_since(start))
                 .unwrap_or_default();
             let speed = (vx * vx + vy * vy).sqrt();
-            let started = self.scroll_momentum.start(vx, vy, gesture, now);
+            let started = self.momentum_enabled
+                && self.scroll_momentum.start(vx, vy, gesture, now);
             if self.debug_input {
                 eprintln!(
                     "scroll release v=({vx:.0},{vy:.0}) speed={speed:.0} pt/s gesture={} ms -> momentum={started}",
@@ -2868,6 +2876,7 @@ fn main() -> Result<()> {
     let mut pull_paths: Vec<String> = Vec::new();
     // The remote's layout table (`us`, `jis`); the local layout is whatever
     // the OS composes, so it never needs naming.
+    let mut momentum_enabled = false;
     let mut keymap_name: Option<String> = None;
     // Lab hook: scripted gesture for measuring the scroll model
     // (`flick`, `drag`, `medium`, `stop`, `jitter`, `diagonal`, `turn`).
@@ -2977,6 +2986,10 @@ fn main() -> Result<()> {
                 }
                 SCROLL_SPEED.store(speed.to_bits(), std::sync::atomic::Ordering::Relaxed);
                 i += 2;
+            }
+            "--momentum" => {
+                momentum_enabled = true;
+                i += 1;
             }
             "--keymap" if i + 1 < args.len() => {
                 keymap_name = Some(args[i + 1].to_ascii_lowercase());
@@ -3700,6 +3713,7 @@ fn main() -> Result<()> {
         grab,
         scroll_test,
         frame_slot.clone(),
+        momentum_enabled,
     )?;
     event_loop.run_app(&mut app)?;
     Ok(())
