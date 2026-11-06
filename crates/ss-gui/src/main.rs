@@ -1377,9 +1377,10 @@ impl App {
         pressed: bool,
         repeat: bool,
     ) {
-        if repeat {
-            return;
-        }
+        // Auto-repeat is forwarded as another key-down: RFB has no repeat
+        // flag and this server does not synthesise repeats from a held key,
+        // so dropping these events made a held key type exactly one character.
+        // Local shortcuts below are guarded against repeats separately.
         // Cmd+Shift+V is local: pull the file/folder named on the
         // remote clipboard. Do not forward the V key (Cmd+V alone is
         // still a normal remote paste). Match the physical key so a
@@ -1395,14 +1396,20 @@ impl App {
             && self.modifiers.shift_key()
             && (self.modifiers.super_key() || self.modifiers.control_key())
         {
-            if pressed {
+            // The key is owned locally either way; only the first press
+            // pulls, so holding the chord does not fetch repeatedly.
+            if pressed && !repeat {
                 self.pull_from_remote();
             }
             return;
         }
         // Test shortcuts for gesture calibration on macOS: Ctrl+Alt+arrows
-        // emit a swipe; Ctrl+Alt+=/- emit a magnify.
+        // emit a swipe; Ctrl+Alt+=/- emit a magnify. A held key is still a
+        // shortcut, not input for the remote, so skip repeats entirely.
         if self.modifiers.control_key() && self.modifiers.alt_key() && pressed {
+            if repeat {
+                return;
+            }
             match logical {
                 Key::Named(NamedKey::ArrowLeft) => {
                     self.send_swipe(1, 4);
