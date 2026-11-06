@@ -1048,8 +1048,23 @@ fn publish_frame(dec: &mut Decoder, slot: &std::sync::Mutex<Option<Frame>>) {
     }
 }
 
+/// Begin/end state for an evdev pinch or rotate. The recogniser emits a
+/// `Changed` delta and one `Ended` at lift; Apple's verified shape is
+/// begin(phase 1, mask 31), change(phase 2, mask 31), end(phase 4, mask 31).
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
+#[derive(Default)]
+struct EvdevGestureState {
+    pinch_active: bool,
+    rotate_active: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn gesture_bodies(
+    g: Gesture,
+    fb_w: u16,
+    fb_h: u16,
+    state: &mut EvdevGestureState,
+) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
     match g {
         Gesture::Swipe {
@@ -1096,24 +1111,46 @@ fn gesture_bodies(g: Gesture, fb_w: u16, fb_h: u16) -> Vec<Vec<u8>> {
         Gesture::Magnify { factor, phase, x, y } => {
             let px = (x * fb_w as f32).clamp(0.0, fb_w as f32 - 1.0) as u16;
             let py = (y * fb_h as f32).clamp(0.0, fb_h as f32 - 1.0) as u16;
-            out.push(gesture_magnify(
-                (factor - 1.0) as f64,
-                phase.code() as u64,
-                0,
-                px,
-                py,
-            ));
+            match phase {
+                Phase::Began => {
+                    out.push(gesture_magnify(0.0, 1, 31, px, py));
+                    state.pinch_active = true;
+                }
+                Phase::Changed => {
+                    if !state.pinch_active {
+                        out.push(gesture_magnify(0.0, 1, 31, px, py));
+                        state.pinch_active = true;
+                    }
+                    out.push(gesture_magnify((factor - 1.0) as f64, 2, 31, px, py));
+                }
+                Phase::Ended | Phase::Cancelled => {
+                    let code = phase.code() as u64;
+                    out.push(gesture_magnify(0.0, code, 31, px, py));
+                    state.pinch_active = false;
+                }
+            }
         }
         Gesture::Rotate { radians, phase, x, y } => {
             let px = (x * fb_w as f32).clamp(0.0, fb_w as f32 - 1.0) as u16;
             let py = (y * fb_h as f32).clamp(0.0, fb_h as f32 - 1.0) as u16;
-            out.push(gesture_rotate(
-                radians as f64,
-                phase.code() as u64,
-                0,
-                px,
-                py,
-            ));
+            match phase {
+                Phase::Began => {
+                    out.push(gesture_rotate(0.0, 1, 31, px, py));
+                    state.rotate_active = true;
+                }
+                Phase::Changed => {
+                    if !state.rotate_active {
+                        out.push(gesture_rotate(0.0, 1, 31, px, py));
+                        state.rotate_active = true;
+                    }
+                    out.push(gesture_rotate(radians as f64, 2, 31, px, py));
+                }
+                Phase::Ended | Phase::Cancelled => {
+                    let code = phase.code() as u64;
+                    out.push(gesture_rotate(0.0, code, 31, px, py));
+                    state.rotate_active = false;
+                }
+            }
         }
     }
     out
@@ -3427,12 +3464,24 @@ fn main() -> Result<()> {
         #[cfg(target_os = "linux")]
         {
             let tx = tx_out.clone();
-            match gesture_input::linux::spawn_default(move |g| {
-                for body in gesture_bodies(g, input_w, input_h) {
-                    let _ = tx.send(body);
+            let debug = debug_input;
+            let mut gesture_state = EvdevGestureState::default();
+            match gesture_input::linux::spawn_default(
+                move |g| {
+                    if debug {
+                        eprintln!("evdev gesture {g:?}");
+                    }
+                    for body in gesture_bodies(g, input_w, input_h, &mut gesture_state) {
+                        let _ = tx.send(body);
+                    }
+                },
+                debug,
+            ) {
+                Ok(devices) => {
+                    for device in devices {
+                        eprintln!("evdev: using {device}");
+                    }
                 }
-            }) {
-                Ok(names) => eprintln!("evdev gesture devices: {names:?}"),
                 Err(e) => eprintln!("evdev: {e}"),
             }
         }
@@ -4090,5 +4139,65 @@ mod tests {
         assert_eq!(named_keysym(&NamedKey::ArrowLeft), Some(0xff51));
         assert_eq!(text_keysym('@'), 0x40);
         assert_eq!(text_keysym('あ'), 0x0100_3042);
+    }
+
+    #[test]
+    fn evdev_pinch_and_rotate_use_begin_change_end_with_mask_31() {
+        let mut state = EvdevGestureState::default();
+        let pinch = gesture_bodies(
+            Gesture::Magnify {
+                factor: 1.25,
+                phase: Phase::Changed,
+                x: 0.5,
+                y: 0.5,
+            },
+            1000,
+            800,
+            &mut state,
+        );
+        assert_eq!(pinch.len(), 2, "begin + change");
+        assert_eq!(pinch[0], gesture_magnify(0.0, 1, 31, 500, 400));
+        assert_eq!(pinch[1], gesture_magnify((1.25f32 - 1.0) as f64, 2, 31, 500, 400));
+
+        let end = gesture_bodies(
+            Gesture::Magnify {
+                factor: 1.0,
+                phase: Phase::Ended,
+                x: 0.5,
+                y: 0.5,
+            },
+            1000,
+            800,
+            &mut state,
+        );
+        assert_eq!(end, vec![gesture_magnify(0.0, 4, 31, 500, 400)]);
+
+        let rotate = gesture_bodies(
+            Gesture::Rotate {
+                radians: 0.2,
+                phase: Phase::Changed,
+                x: 0.25,
+                y: 0.75,
+            },
+            1000,
+            800,
+            &mut state,
+        );
+        assert_eq!(rotate.len(), 2, "begin + change");
+        assert_eq!(rotate[0], gesture_rotate(0.0, 1, 31, 250, 600));
+        assert_eq!(rotate[1], gesture_rotate(0.2f32 as f64, 2, 31, 250, 600));
+
+        let end = gesture_bodies(
+            Gesture::Rotate {
+                radians: 0.0,
+                phase: Phase::Ended,
+                x: 0.25,
+                y: 0.75,
+            },
+            1000,
+            800,
+            &mut state,
+        );
+        assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 250, 600)]);
     }
 }

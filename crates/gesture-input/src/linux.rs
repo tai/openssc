@@ -1,8 +1,14 @@
 //! Linux evdev multitouch backend (MT protocol B).
 //!
-//! Requires read access to `/dev/input/event*`. Add the user to the `input`
-//! group (or run with sufficient privileges) and pass `--evdev` to the GUI.
-//! We do not grab the device by default so the compositor keeps working.
+//! Requires read access to the trackpad's `/dev/input/event*` node. The
+//! preferred permission is a scoped udev `uaccess` rule for
+//! `ID_INPUT_TOUCHPAD=1`; the coarse alternative is the `input` group, which
+//! grants every input device including the keyboard. Access is checked when a
+//! device is opened, so a permission failure is reported as such, not as
+//! "no device".
+//!
+//! Devices are discovered through udev (`ID_INPUT_TOUCHPAD=1`), never by node
+//! number. We do not grab the device unless the caller explicitly asks.
 
 use crate::{Gesture, GestureRecognizer, TouchPoint};
 use std::ffi::CStr;
@@ -10,6 +16,7 @@ use std::fs::{self, File};
 use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::thread;
 
 const EV_SYN: u16 = 0;
@@ -69,6 +76,19 @@ pub struct Touchpad {
     pub x_max: i32,
     pub y_min: i32,
     pub y_max: i32,
+}
+
+/// A discovered device, as reported to the caller before the reader starts.
+#[derive(Debug, Clone)]
+pub struct DeviceInfo {
+    pub path: PathBuf,
+    pub name: String,
+}
+
+impl std::fmt::Display for DeviceInfo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{} ({})", self.name, self.path.display())
+    }
 }
 
 fn has_bit(bits: &[u8], code: u16) -> bool {
@@ -137,60 +157,149 @@ fn probe(path: &Path) -> io::Result<Touchpad> {
     })
 }
 
-pub fn list_touchpads() -> io::Result<Vec<Touchpad>> {
-    let mut out = Vec::new();
-    for entry in fs::read_dir("/dev/input")? {
-        let path = entry?.path();
-        let is_event = path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .map(|s| s.starts_with("event"))
-            .unwrap_or(false);
-        if !is_event {
-            continue;
-        }
-        if let Ok(tp) = probe(&path) {
-            out.push(tp);
-        }
-    }
-    Ok(out)
+/// True when udev's property block marks the node as a touchpad.
+fn is_touchpad_props(props: &str) -> bool {
+    props
+        .lines()
+        .any(|line| line.trim() == "ID_INPUT_TOUCHPAD=1")
 }
 
-/// Spawn a reader thread for the first multitouch device.
-/// Returns the device names that were found.
-pub fn spawn_default<F>(mut on_gesture: F) -> io::Result<Vec<String>>
+fn udev_properties(path: &Path) -> io::Result<String> {
+    let out = Command::new("udevadm")
+        .arg("info")
+        .arg("--query=property")
+        .arg("--name")
+        .arg(path)
+        .output()?;
+    if !out.status.success() {
+        return Err(io::Error::new(
+            io::ErrorKind::Other,
+            format!("udevadm info failed for {}", path.display()),
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
+}
+
+fn permission_help(name: &str, path: &Path) -> io::Error {
+    io::Error::new(
+        io::ErrorKind::PermissionDenied,
+        format!(
+            "touchpad {name} ({}) is present but cannot be opened: permission denied.\n\
+             Grant access to this device only with a udev uaccess rule (preferred):\n\
+             /etc/udev/rules.d/69-ss-clone-input.rules\n\
+             SUBSYSTEM==\"input\", KERNEL==\"event*\", ENV{{ID_INPUT_TOUCHPAD}}==\"1\", TAG+=\"uaccess\"\n\
+             then: sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input\n\
+             Coarse alternative (grants every input device, including every keyboard): add this\n\
+             user to the `input` group and start a new login session.",
+            path.display()
+        ),
+    )
+}
+
+/// Discover touchpads through udev. Never hardcodes `eventN`.
+///
+/// A touchpad whose node exists but cannot be opened yields
+/// `PermissionDenied` with both remedies in the message; a genuinely absent
+/// device yields `NotFound`. Probe errors for non-touchpad nodes are ignored.
+pub fn list_touchpads() -> io::Result<Vec<Touchpad>> {
+    let mut pads = Vec::new();
+    let mut denied: Vec<(PathBuf, String)> = Vec::new();
+    let mut udev_missing = false;
+
+    for entry in fs::read_dir("/sys/class/input")? {
+        let entry = entry?;
+        let name = entry.file_name();
+        let name = match name.to_str() {
+            Some(name) if name.starts_with("event") => name.to_string(),
+            _ => continue,
+        };
+        let dev = PathBuf::from("/dev/input").join(&name);
+        if !dev.exists() {
+            continue;
+        }
+        let props = match udev_properties(&dev) {
+            Ok(props) => props,
+            Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                udev_missing = true;
+                continue;
+            }
+            Err(_) => continue,
+        };
+        if !is_touchpad_props(&props) {
+            continue;
+        }
+        match probe(&dev) {
+            Ok(pad) => pads.push(pad),
+            Err(e) if e.kind() == io::ErrorKind::PermissionDenied => {
+                let sys_name = entry.path().join("device/name");
+                let name = fs::read_to_string(sys_name)
+                    .map(|s| s.trim().to_string())
+                    .unwrap_or_else(|_| name.clone());
+                denied.push((dev, name));
+            }
+            Err(_) => {}
+        }
+    }
+
+    if pads.is_empty() {
+        if let Some((path, name)) = denied.into_iter().next() {
+            return Err(permission_help(&name, &path));
+        }
+        if udev_missing {
+            return Err(io::Error::new(
+                io::ErrorKind::NotFound,
+                "no touchpad found: `udevadm` is required to identify ID_INPUT_TOUCHPAD=1 nodes",
+            ));
+        }
+        return Err(io::Error::new(
+            io::ErrorKind::NotFound,
+            "no touchpad found: no /dev/input/event* node has ID_INPUT_TOUCHPAD=1",
+        ));
+    }
+
+    pads.sort_by(|a, b| a.path.cmp(&b.path));
+    Ok(pads)
+}
+
+/// Spawn a reader thread for the first discovered touchpad.
+/// Returns the devices that were found (one is read).
+pub fn spawn_default<F>(mut on_gesture: F, verbose: bool) -> io::Result<Vec<DeviceInfo>>
 where
     F: FnMut(Gesture) + Send + 'static,
 {
     let pads = list_touchpads()?;
-    if pads.is_empty() {
-        return Err(io::Error::new(
-            io::ErrorKind::NotFound,
-            "no multitouch device found under /dev/input (need input group access)",
-        ));
-    }
-    let names = pads.iter().map(|p| p.name.clone()).collect();
+    let infos = pads
+        .iter()
+        .map(|p| DeviceInfo {
+            path: p.path.clone(),
+            name: p.name.clone(),
+        })
+        .collect();
     let pad = pads.into_iter().next().unwrap();
     thread::Builder::new()
         .name("evdev-gestures".into())
         .spawn(move || {
-            if let Err(e) = run(pad, &mut on_gesture) {
+            if let Err(e) = run(pad, &mut on_gesture, verbose) {
                 eprintln!("evdev gesture reader: {e}");
             }
         })?;
-    Ok(names)
+    Ok(infos)
 }
 
-fn run<F>(pad: Touchpad, on_gesture: &mut F) -> io::Result<()>
+fn run<F>(pad: Touchpad, on_gesture: &mut F, verbose: bool) -> io::Result<()>
 where
     F: FnMut(Gesture),
 {
     let file = File::open(&pad.path)?;
     let fd = file.as_raw_fd();
+    if verbose {
+        eprintln!("evdev: opened {} ({})", pad.name, pad.path.display());
+    }
     let mut slots: [Option<(i32, i32, i32)>; 16] = [None; 16]; // (id, raw x, raw y)
     let mut cur_slot = 0usize;
     let mut recognizer = GestureRecognizer::new();
     let mut buf = [0u8; std::mem::size_of::<InputEvent>() * 64];
+    let mut frames = 0u64;
 
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -249,6 +358,10 @@ where
                             y: (*y - pad.y_min) as f32 / yr,
                         })
                         .collect();
+                    frames += 1;
+                    if verbose && frames % 240 == 0 {
+                        eprintln!("evdev: {} frames from {}", frames, pad.name);
+                    }
                     for g in recognizer.process(&points) {
                         on_gesture(g);
                     }
@@ -256,5 +369,26 @@ where
                 _ => {}
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_touchpad_props;
+
+    #[test]
+    fn udev_property_identifies_a_touchpad() {
+        let props = "DEVPATH=/devices/pci0000:00/event10\n\
+                     ID_INPUT=1\n\
+                     ID_INPUT_TOUCHPAD=1\n\
+                     ID_INPUT_TOUCHPAD_INTEGRATION=internal\n";
+        assert!(is_touchpad_props(props));
+    }
+
+    #[test]
+    fn udev_property_does_not_treat_keyboard_or_zero_as_touchpad() {
+        assert!(!is_touchpad_props("ID_INPUT_KEYBOARD=1\nID_INPUT=1\n"));
+        assert!(!is_touchpad_props("ID_INPUT_TOUCHPAD=0\n"));
+        assert!(!is_touchpad_props("XID_INPUT_TOUCHPAD=1\n"));
     }
 }

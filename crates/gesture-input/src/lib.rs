@@ -496,6 +496,9 @@ struct SwipeState {
 pub struct GestureRecognizer {
     last: Option<FrameState>,
     swipe: Option<SwipeState>,
+    /// Set when a two-finger Magnify/Rotate has been emitted and not yet ended.
+    magnify_active: bool,
+    rotate_active: bool,
 }
 
 impl GestureRecognizer {
@@ -521,11 +524,19 @@ impl GestureRecognizer {
                         momentum: None,
                     });
                 }
+                self.finish_two_finger(&mut out, last.cx, last.cy);
             }
             return out;
         }
 
         let (cx, cy) = centroid(points);
+        // A pinch/rotate is a two-finger gesture. Leaving two fingers (lifting
+        // one, touching a third, or all up) ends it exactly once so the GUI can
+        // send Apple's phase-4 frame.
+        if n != 2 {
+            let (ex, ey) = self.last.map(|last| (last.cx, last.cy)).unwrap_or((cx, cy));
+            self.finish_two_finger(&mut out, ex, ey);
+        }
         let (dist, angle) = if n >= 2 {
             let (dx, dy) = (points[1].x - points[0].x, points[1].y - points[0].y);
             ((dx * dx + dy * dy).sqrt(), dy.atan2(dx))
@@ -574,6 +585,7 @@ impl GestureRecognizer {
                     if last.dist > 0.0001 {
                         let factor = dist / last.dist;
                         if (factor - 1.0).abs() > 0.005 {
+                            self.magnify_active = true;
                             out.push(Gesture::Magnify {
                                 factor,
                                 phase: Phase::Changed,
@@ -590,6 +602,7 @@ impl GestureRecognizer {
                         d += 2.0 * std::f32::consts::PI;
                     }
                     if d.abs() > 0.01 {
+                        self.rotate_active = true;
                         out.push(Gesture::Rotate {
                             radians: d,
                             phase: Phase::Changed,
@@ -619,6 +632,27 @@ impl GestureRecognizer {
 
         self.last = Some(FrameState { fingers: n, cx, cy, dist, angle });
         out
+    }
+
+    fn finish_two_finger(&mut self, out: &mut Vec<Gesture>, x: f32, y: f32) {
+        if self.magnify_active {
+            self.magnify_active = false;
+            out.push(Gesture::Magnify {
+                factor: 1.0,
+                phase: Phase::Ended,
+                x,
+                y,
+            });
+        }
+        if self.rotate_active {
+            self.rotate_active = false;
+            out.push(Gesture::Rotate {
+                radians: 0.0,
+                phase: Phase::Ended,
+                x,
+                y,
+            });
+        }
     }
 
     fn swipe_gesture(&self, sw: SwipeState, phase: Phase) -> Gesture {
@@ -733,6 +767,39 @@ mod tests {
         r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
         let out = r.process(&pts(&[(0.5, 0.4), (0.5, 0.6)]));
         assert!(out.iter().any(|g| matches!(g, Gesture::Rotate { .. })));
+    }
+
+    #[test]
+    fn pinch_and_rotate_end_once_when_the_fingers_lift() {
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        let out = r.process(&pts(&[(0.35, 0.5), (0.75, 0.5)]));
+        assert!(out
+            .iter()
+            .any(|g| matches!(g, Gesture::Magnify { phase: Phase::Changed, .. })));
+
+        let end = r.process(&[]);
+        assert_eq!(
+            end.iter()
+                .filter(|g| matches!(g, Gesture::Magnify { phase: Phase::Ended, .. }))
+                .count(),
+            1,
+            "one Magnify end: {end:?}"
+        );
+        assert!(r.process(&[]).iter().all(
+            |g| !matches!(g, Gesture::Magnify { phase: Phase::Ended, .. })
+        ));
+    }
+
+    #[test]
+    fn a_third_finger_ends_an_active_pinch() {
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        r.process(&pts(&[(0.35, 0.5), (0.75, 0.5)]));
+        let out = r.process(&pts(&[(0.3, 0.5), (0.7, 0.5), (0.5, 0.3)]));
+        assert!(out
+            .iter()
+            .any(|g| matches!(g, Gesture::Magnify { phase: Phase::Ended, .. })));
     }
 
     #[test]
