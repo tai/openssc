@@ -28,8 +28,10 @@ pub const SCROLL_PIXELS_PER_UNIT: f32 = 600.0;
 /// scrolled about a screen. Apple's own client sits in the same ballpark (the
 /// agent's double-to-line conversion in `SSAgent_PostScrollEvent_rpc` implies
 /// roughly 8 points per line). 120 was a placeholder and made a flick move one
-/// or two lines, i.e. look broken.
-pub const SCROLL_POINTS_PER_LINE: f32 = 12.0;
+/// or two lines, i.e. look broken. 24 is the owner's calibrated preference
+/// (they asked for "--scroll-speed 0.5" against the previous 12), and stays
+/// runtime-tunable with --scroll-speed.
+pub const SCROLL_POINTS_PER_LINE: f32 = 24.0;
 
 /// Inertia after the fingers lift.
 ///
