@@ -15,6 +15,8 @@
 #      geometry, byte size, decoded pixel count, distinct colours
 #   4. if a real Wayland session is already present, also captures the presented
 #      window with grim and prints the path (best effort; never a pass condition)
+#   5. requires a clean exit (status 0). In grim mode the window is closed
+#      through the compositor after the capture, so the normal teardown runs.
 #
 # Session choice:
 #   * If $WAYLAND_DISPLAY names a live socket under $XDG_RUNTIME_DIR, use it.
@@ -26,10 +28,10 @@
 #   from the Hyprland session already has them.
 #
 # It proves: release build, auth + session, MVS decode, at least one painted
-# framebuffer, a non-trivial dumped image of the expected size, and (with grim)
-# that the compositor has a mapped ss-gui window. It does NOT prove input,
-# gestures, clipboard, file copy, frame rate, latency, colour accuracy, or that
-# the image is the current remote screen (a stale frame would pass).
+# framebuffer, a non-trivial dumped image of the expected size, a clean exit, and
+# (with grim) that the compositor has a mapped ss-gui window. It does NOT prove
+# input, gestures, clipboard, file copy, frame rate, latency, colour accuracy, or
+# that the image is the current remote screen (a stale frame would pass).
 #
 # Exit status: 0 only if every requested check passes; 1 on failure with a
 # message and the client log; 2 on bad usage. Dumps/logs stay under --out (a
@@ -54,7 +56,7 @@ GRIM=auto                       # auto | off
 BIN=${SS_GUI_BIN:-$ROOT/target/release/ss-gui}
 
 usage() {
-  sed -n '2,45p' "$0" | sed 's/^# \{0,1\}//'
+  sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
   exit 2
 }
 
@@ -166,7 +168,6 @@ else
 fi
 
 do_grim=0
-killed_for_grim=0
 if [ "$GRIM" != off ] && [ "$SESSION_KIND" = existing ] && command -v grim >/dev/null 2>&1; then
   do_grim=1
 fi
@@ -176,11 +177,11 @@ ARGS=(--host "$HOST" --port "$PORT" --user "$REMOTE_USER" \
       --password "$PASSWORD" --mvs \
       --dump "$DUMP" --dump-after "$DUMP_AFTER")
 if [ "$do_grim" -eq 1 ]; then
-  # Stay alive after the dump so grim can photograph the presented window;
-  # --exit-after-secs is the backstop if the dump never arrives.
+  # Keep the window alive for grim; close it through the compositor afterwards,
+  # so the normal teardown runs and its exit status is still checked.
   ARGS+=(--exit-after-secs "$SECS")
 else
-  # The headless path: dump, then exit, with the deadline as a backstop.
+  # The headless path: dump, then let the client exit by itself.
   ARGS+=(--exit-after-dump --exit-after-secs "$SECS")
 fi
 
@@ -190,16 +191,20 @@ CLIENT_PID=$!
 
 wait_for_dump() {
   local limit=$1 n=0
-  while [ ! -s "$DUMP" ]; do
+  while :; do
+    # "wrote <path>" is printed only after write_png has returned, so the file
+    # cannot be read half-written.
+    if [ -s "$DUMP" ] && grep -Fq "wrote $DUMP" "$LOG" 2>/dev/null; then
+      return 0
+    fi
     kill -0 "$CLIENT_PID" 2>/dev/null || return 1
     n=$((n + 1))
     [ "$n" -ge $((limit * 5)) ] && return 1
     sleep 0.2
   done
-  return 0
 }
 
-window_geometry() {
+window_info() {
   command -v hyprctl >/dev/null 2>&1 || return 1
   hyprctl -j clients 2>/dev/null | python3 -c '
 import json, sys
@@ -213,16 +218,16 @@ for c in clients:
     if cls == "ss-gui" or title.startswith("ss-clone"):
         if not c.get("mapped", True) or c.get("hidden", False):
             continue
+        addr = c.get("address") or ""
         x, y = c.get("at", [0, 0])
         w, h = c.get("size", [0, 0])
-        if w > 0 and h > 0:
-            print("%d,%d %dx%d" % (x, y, w, h))
+        if addr and w > 0 and h > 0:
+            print("%s %d,%d %dx%d" % (addr, x, y, w, h))
             sys.exit(0)
 sys.exit(1)'
 }
 
-# Watch the process even when the dump arrives early. The app can exit by
-# itself (--exit-after-dump) or hit its deadline; a hung window is killed.
+# Watch the process even when the dump arrives early; a hung window fails.
 client_deadline=$((SECS + 15))
 started=$(date +%s)
 if ! wait_for_dump "$SECS"; then
@@ -233,51 +238,98 @@ if ! wait_for_dump "$SECS"; then
   die "no dump written within ${SECS}s. Check that $HOST:$PORT is reachable and the Wayland variables are exported."
 fi
 
+addr=       # compositor window address, used for a clean close
+geom=       # grim geometry
 if [ "$do_grim" -eq 1 ]; then
   echo "== grim: looking for the ss-gui window"
-  geom=
+  info=
   for _ in $(seq 1 50); do
-    geom=$(window_geometry 2>/dev/null) && break
+    info=$(window_info 2>/dev/null) && break
     sleep 0.2
   done
-  if [ -n "$geom" ]; then
+  if [ -n "$info" ]; then
+    addr=${info%% *}
+    geom=${info#* }
     if grim -g "$geom" "$GRIM_PNG" 2>"$OUT/grim.err"; then
       echo "   window $geom -> $GRIM_PNG"
     else
       echo "   warning: grim -g '$geom' failed (see $OUT/grim.err); falling back to the full output"
-      geom=
     fi
   fi
-  if [ -z "$geom" ] && command -v grim >/dev/null 2>&1; then
+  if [ ! -s "$GRIM_PNG" ] && command -v grim >/dev/null 2>&1; then
     if grim "$GRIM_PNG" 2>"$OUT/grim.err"; then
       echo "   full output (window geometry unavailable) -> $GRIM_PNG"
     else
       echo "   warning: grim failed (see $OUT/grim.err); the dump check still stands"
     fi
   fi
-  kill -TERM "$CLIENT_PID" 2>/dev/null || true
-  killed_for_grim=1
 fi
 
-# Wait for the client to finish (dump mode exits; grim mode was just killed).
+terminated=0
+if [ -n "$addr" ] && command -v hyprctl >/dev/null 2>&1; then
+  echo "== close: hyprctl window close for $addr"
+  # Hyprland 0.56 takes a Lua dispatcher; older releases take
+  # `closewindow address:...`. Try both, and treat an error-looking reply as a
+  # failure (hyprctl exits 0 even when the dispatcher rejects the syntax).
+  out=$(hyprctl dispatch "hl.dsp.window.close({address=\"$addr\"})" 2>&1) || true
+  case "$out" in
+    *error*|*Error*|*expected*|*unknown*) out=$(hyprctl dispatch closewindow "address:$addr" 2>&1) || true;;
+  esac
+  case "$out" in
+    *error*|*Error*|*expected*|*unknown*|"")
+      echo "   warning: compositor close failed; sending SIGTERM"
+      kill -TERM "$CLIENT_PID" 2>/dev/null || true
+      terminated=1;;
+  esac
+elif [ "$do_grim" -eq 1 ]; then
+  echo "== close: no compositor window address; sending SIGTERM (clean exit not checked)"
+  kill -TERM "$CLIENT_PID" 2>/dev/null || true
+  terminated=1
+fi
+
+# Wait for the client to finish. A genuinely hung client is killed at the
+# deadline and reported as a failure.
+timed_out=0
 while kill -0 "$CLIENT_PID" 2>/dev/null; do
   now=$(date +%s)
   if [ $((now - started)) -ge "$client_deadline" ]; then
     kill -TERM "$CLIENT_PID" 2>/dev/null || true
     sleep 0.5
     kill -KILL "$CLIENT_PID" 2>/dev/null || true
+    timed_out=1
     break
   fi
   sleep 0.2
 done
 wait "$CLIENT_PID" 2>/dev/null
 client_rc=$?
-if [ "$killed_for_grim" -eq 1 ]; then
-  client_rc="killed after grim (expected)"
-elif [ "$client_rc" -ne 0 ]; then
-  echo "warning: client exited $client_rc after writing the dump (see $LOG)"
-fi
 CLIENT_PID=
+
+if [ "$timed_out" -eq 1 ]; then
+  echo "--- client log (tail) ---" >&2
+  tail -30 "$LOG" >&2 || true
+  die "client did not exit within ${client_deadline}s after the dump"
+fi
+if [ "$terminated" -eq 1 ]; then
+  echo "warning: client was stopped with SIGTERM; clean exit was not checked"
+  client_rc="stopped with SIGTERM (clean exit not checked)"
+elif [ "$client_rc" -ne 0 ]; then
+  echo "--- client log (tail) ---" >&2
+  tail -30 "$LOG" >&2 || true
+  if [ "$client_rc" -eq 139 ]; then
+    cat >&2 <<'EOF'
+FAIL: the client wrote the dump but segfaulted on exit (status 139, SIGSEGV).
+
+This was a softbuffer Wayland teardown bug, fixed in 4598e4c. If it is back,
+the crash is in drop of WaylandDisplayImpl after winit tears down the
+connection; that is a crates/ss-gui lifetime problem, not the smoke harness.
+Do not edit crates/ here; report it to the platform owner.
+EOF
+  else
+    echo "FAIL: the client exited $client_rc after writing the dump." >&2
+  fi
+  exit 1
+fi
 
 # ----------------------------------------------------------- validate
 [ -s "$DUMP" ] || {
@@ -305,8 +357,13 @@ echo "  log:     $LOG"
 echo "  exit:    $client_rc"
 echo
 echo "Proved: release build; TCP/auth/session to $HOST:$PORT; MVS decode; at least"
-echo "        one painted frame of $EXPECT with non-trivial content; (with grim)"
-echo "        a mapped ss-gui window seen by the compositor."
+if [ "$terminated" -eq 1 ]; then
+  echo "        one painted frame of $EXPECT with non-trivial content;"
+  echo "        clean exit NOT checked (the client was stopped with SIGTERM);"
+else
+  echo "        one painted frame of $EXPECT with non-trivial content; clean exit;"
+fi
+echo "        (with grim) a mapped ss-gui window seen by the compositor."
 echo "Not proved: input, gestures, clipboard/file copy, frame rate, latency, colour"
 echo "        fidelity, or that the frame is current. No camera is involved."
 exit 0
