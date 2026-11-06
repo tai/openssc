@@ -10,6 +10,7 @@
 //! it later.
 
 pub mod chord;
+pub mod evdev;
 pub mod grab;
 pub mod keymap;
 pub mod momentum;

@@ -17,7 +17,10 @@ use std::io;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Weak};
 use std::thread;
+use std::time::{Duration, Instant};
 
 const EV_SYN: u16 = 0;
 const SYN_REPORT: u16 = 0;
@@ -67,6 +70,26 @@ fn eviocgabs(abs: u16) -> libc::c_ulong {
         std::mem::size_of::<InputAbsInfo>(),
     )
 }
+fn eviocgrab() -> libc::c_ulong {
+    // _IOW('E', 0x90, int)
+    ioc(1, b'E', 0x90, std::mem::size_of::<libc::c_int>())
+}
+
+fn now_ms() -> u64 {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    START.get_or_init(Instant::now).elapsed().as_millis() as u64
+}
+
+/// What the reader reports to the GUI.
+#[derive(Debug, Clone, Copy)]
+pub enum DeviceEvent {
+    /// A recognised gesture (scroll, pinch, rotate, swipe).
+    Gesture(Gesture),
+    /// One-finger motion while the trackpad is grabbed, in normalized pad
+    /// units. Only emitted while grabbed: the compositor still owns the
+    /// pointer otherwise and would move it too.
+    Pointer { dx: f32, dy: f32 },
+}
 
 #[derive(Debug, Clone)]
 pub struct Touchpad {
@@ -89,6 +112,131 @@ impl std::fmt::Display for DeviceInfo {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         write!(f, "{} ({})", self.name, self.path.display())
     }
+}
+
+/// Shared state for the device fd. The reader holds an `Arc<File>` only, so
+/// dropping the GUI's handle releases the grab and the watchdog even if the
+/// reader thread is still blocked in `read`.
+struct DeviceInner {
+    file: Arc<File>,
+    name: String,
+    path: PathBuf,
+    /// Also gates one-finger pointer forwarding: the compositor owns the
+    /// pointer unless we have grabbed the device.
+    grabbed: Arc<AtomicBool>,
+    last_beat_ms: AtomicU64,
+    watchdog_started: AtomicBool,
+}
+
+impl Drop for DeviceInner {
+    fn drop(&mut self) {
+        if self.grabbed.load(Ordering::SeqCst) {
+            unsafe {
+                // EVIOCGRAB's argument is the value itself, not a pointer:
+                // arg == 0 releases. Passing a pointer to zero is EBUSY.
+                libc::ioctl(self.file.as_raw_fd(), eviocgrab(), 0 as libc::c_ulong);
+            }
+            self.grabbed.store(false, Ordering::SeqCst);
+        }
+    }
+}
+
+/// Control handle for one trackpad. Cloneable; every clone refers to the same
+/// fd and grab state. `set_grabbed` is the only way to call `EVIOCGRAB`.
+#[derive(Clone)]
+pub struct DeviceHandle {
+    inner: Arc<DeviceInner>,
+}
+
+impl DeviceHandle {
+    pub fn name(&self) -> &str {
+        &self.inner.name
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.inner.path
+    }
+
+    pub fn is_grabbed(&self) -> bool {
+        self.inner.grabbed.load(Ordering::SeqCst)
+    }
+
+    /// Tell the watchdog the UI is alive. Cheap; call from the event loop.
+    pub fn beat(&self) {
+        self.inner
+            .last_beat_ms
+            .store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn set_grabbed(&self, on: bool) -> io::Result<()> {
+        if self.inner.grabbed.load(Ordering::SeqCst) == on {
+            return Ok(());
+        }
+        let value: libc::c_ulong = if on { 1 } else { 0 };
+        let rc = unsafe {
+            // EVIOCGRAB's argument is the value itself, not a pointer. A
+            // pointer to 0 still looks non-zero to the kernel and is EBUSY.
+            libc::ioctl(
+                self.inner.file.as_raw_fd(),
+                eviocgrab(),
+                value,
+            )
+        };
+        if rc < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        self.inner.grabbed.store(on, Ordering::SeqCst);
+        if on {
+            self.inner.last_beat_ms.store(now_ms(), Ordering::Relaxed);
+            eprintln!(
+                "evdev: grabbed {} ({})",
+                self.inner.name,
+                self.inner.path.display()
+            );
+            self.start_watchdog();
+        } else {
+            eprintln!(
+                "evdev: released {} ({})",
+                self.inner.name,
+                self.inner.path.display()
+            );
+        }
+        Ok(())
+    }
+
+    fn start_watchdog(&self) {
+        if self.inner.watchdog_started.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak: Weak<DeviceInner> = Arc::downgrade(&self.inner);
+        let _ = thread::Builder::new()
+            .name("evdev-grab-watchdog".into())
+            .spawn(move || loop {
+                thread::sleep(Duration::from_millis(500));
+                let Some(inner) = weak.upgrade() else {
+                    return;
+                };
+                if !inner.grabbed.load(Ordering::SeqCst) {
+                    continue;
+                }
+                let stalled = now_ms().saturating_sub(inner.last_beat_ms.load(Ordering::Relaxed));
+                if stalled > 3000 {
+                    eprintln!(
+                        "evdev: grab watchdog: UI stalled for {stalled} ms; releasing {} ({})",
+                        inner.name,
+                        inner.path.display()
+                    );
+                    let handle = DeviceHandle { inner };
+                    let _ = handle.set_grabbed(false);
+                }
+            });
+    }
+}
+
+/// A started reader plus the control handle for the device it uses.
+pub struct EvdevReader {
+    pub devices: Vec<DeviceInfo>,
+    pub device: DeviceHandle,
 }
 
 fn has_bit(bits: &[u8], code: u16) -> bool {
@@ -263,12 +411,12 @@ pub fn list_touchpads() -> io::Result<Vec<Touchpad>> {
 
 /// Spawn a reader thread for the first discovered touchpad.
 /// Returns the devices that were found (one is read).
-pub fn spawn_default<F>(mut on_gesture: F, verbose: bool) -> io::Result<Vec<DeviceInfo>>
+pub fn spawn_default<F>(mut on_event: F, verbose: bool) -> io::Result<EvdevReader>
 where
-    F: FnMut(Gesture) + Send + 'static,
+    F: FnMut(DeviceEvent) + Send + 'static,
 {
     let pads = list_touchpads()?;
-    let infos = pads
+    let devices: Vec<DeviceInfo> = pads
         .iter()
         .map(|p| DeviceInfo {
             path: p.path.clone(),
@@ -276,21 +424,43 @@ where
         })
         .collect();
     let pad = pads.into_iter().next().unwrap();
+    let file = Arc::new(File::open(&pad.path).map_err(|e| {
+        if e.kind() == io::ErrorKind::PermissionDenied {
+            permission_help(&pad.name, &pad.path)
+        } else {
+            e
+        }
+    })?);
+    let grabbed = Arc::new(AtomicBool::new(false));
+    let inner = Arc::new(DeviceInner {
+        file: file.clone(),
+        name: pad.name.clone(),
+        path: pad.path.clone(),
+        grabbed: grabbed.clone(),
+        last_beat_ms: AtomicU64::new(now_ms()),
+        watchdog_started: AtomicBool::new(false),
+    });
+    let device = DeviceHandle { inner };
     thread::Builder::new()
         .name("evdev-gestures".into())
         .spawn(move || {
-            if let Err(e) = run(pad, &mut on_gesture, verbose) {
+            if let Err(e) = run(pad, file, grabbed, &mut on_event, verbose) {
                 eprintln!("evdev gesture reader: {e}");
             }
         })?;
-    Ok(infos)
+    Ok(EvdevReader { devices, device })
 }
 
-fn run<F>(pad: Touchpad, on_gesture: &mut F, verbose: bool) -> io::Result<()>
+fn run<F>(
+    pad: Touchpad,
+    file: Arc<File>,
+    grabbed: Arc<AtomicBool>,
+    on_event: &mut F,
+    verbose: bool,
+) -> io::Result<()>
 where
-    F: FnMut(Gesture),
+    F: FnMut(DeviceEvent),
 {
-    let file = File::open(&pad.path)?;
     let fd = file.as_raw_fd();
     if verbose {
         eprintln!("evdev: opened {} ({})", pad.name, pad.path.display());
@@ -300,6 +470,7 @@ where
     let mut recognizer = GestureRecognizer::new();
     let mut buf = [0u8; std::mem::size_of::<InputEvent>() * 64];
     let mut frames = 0u64;
+    let mut last_one: Option<(f32, f32)> = None;
 
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr() as *mut libc::c_void, buf.len()) };
@@ -362,8 +533,25 @@ where
                     if verbose && frames % 240 == 0 {
                         eprintln!("evdev: {} frames from {}", frames, pad.name);
                     }
+
+                    // One finger while grabbed: forward relative motion so the
+                    // remote pointer keeps moving even though the compositor
+                    // no longer sees the device.
+                    if points.len() == 1 && grabbed.load(Ordering::Relaxed) {
+                        let p = points[0];
+                        if let Some((lx, ly)) = last_one {
+                            let (dx, dy) = (p.x - lx, p.y - ly);
+                            if dx.abs() + dy.abs() > 0.0005 {
+                                on_event(DeviceEvent::Pointer { dx, dy });
+                            }
+                        }
+                        last_one = Some((p.x, p.y));
+                    } else {
+                        last_one = None;
+                    }
+
                     for g in recognizer.process(&points) {
-                        on_gesture(g);
+                        on_event(DeviceEvent::Gesture(g));
                     }
                 }
                 _ => {}

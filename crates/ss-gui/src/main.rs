@@ -490,6 +490,7 @@ Input and keyboard:
   --no-coast               drop it, so a flick stops when the fingers lift
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
+  --grab-trackpad          Linux: grab the trackpad while focused (needs --evdev)
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
   --release-grab <chord>   macOS release chord, e.g. cmd+shift or ctrl+alt+cmd+esc
                            (default: hold Left-Cmd+Shift for 350 ms)
@@ -1174,6 +1175,9 @@ enum UserEvent {
     PullStatus(String),
     /// A keyboard event captured by the platform event tap.
     Grab(grab::GrabEvent),
+    /// One-finger trackpad motion from the evdev reader while grabbed.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    EvdevPointer { dx: f32, dy: f32 },
 }
 
 struct App {
@@ -1226,6 +1230,10 @@ struct App {
     keymap: &'static Keymap,
     /// Platform keyboard grab, when it could be created.
     grab: Option<grab::Grab>,
+    /// Raw evdev trackpad handle, when `--evdev` opened a device.
+    evdev_grab: Option<platform::evdev::GrabHandle>,
+    /// `--grab-trackpad`: grab on focus, release on blur/exit.
+    grab_trackpad: bool,
     /// The release chord fired: stay ungrabbed until focus is lost and
     /// regained (the user pressed it because something was wrong).
     grab_suspended: bool,
@@ -1315,6 +1323,8 @@ impl App {
         remote_path: Arc<std::sync::Mutex<Option<String>>>,
         keymap: &'static Keymap,
         grab: Option<grab::Grab>,
+        evdev_grab: Option<platform::evdev::GrabHandle>,
+        grab_trackpad: bool,
         scroll_test: String,
         frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
         coast: bool,
@@ -1353,6 +1363,8 @@ impl App {
             remote_path,
             keymap,
             grab,
+            evdev_grab,
+            grab_trackpad,
             grab_suspended: false,
             scroll_test,
             demo_cursor,
@@ -2279,6 +2291,25 @@ impl ApplicationHandler<UserEvent> for App {
                     eprintln!("grab: macOS disabled the event tap ({reason}); re-enabled it");
                 }
             },
+            UserEvent::EvdevPointer { dx, dy } => {
+                note_input();
+                // Relative pad motion -> framebuffer position. One full pad
+                // width/height maps to the full screen; the compositor is not
+                // moving the pointer while we hold the grab.
+                let max_x = self.input_w.saturating_sub(1) as f32;
+                let max_y = self.input_h.saturating_sub(1) as f32;
+                let x = (self.cursor.0 as f32 + dx * self.input_w as f32)
+                    .round()
+                    .clamp(0.0, max_x) as u16;
+                let y = (self.cursor.1 as f32 + dy * self.input_h as f32)
+                    .round()
+                    .clamp(0.0, max_y) as u16;
+                if (x, y) != self.cursor {
+                    self.cursor = (x, y);
+                    self.pending_pointer = Some((x, y, self.buttons));
+                    self.flush_pointer(true);
+                }
+            }
         }
     }
 
@@ -2335,6 +2366,17 @@ impl ApplicationHandler<UserEvent> for App {
                     } else if !focused {
                         grab.set_enabled(false);
                         eprintln!("grab: disabled (window lost focus)");
+                    }
+                }
+                if let Some(evdev) = &self.evdev_grab {
+                    if focused && self.grab_trackpad {
+                        if let Err(e) = evdev.set_grabbed(true) {
+                            eprintln!("evdev: cannot grab {}: {e}", evdev.name());
+                        }
+                    } else if !focused {
+                        if let Err(e) = evdev.set_grabbed(false) {
+                            eprintln!("evdev: release on blur failed: {e}");
+                        }
                     }
                 }
                 if !focused {
@@ -2601,6 +2643,9 @@ impl ApplicationHandler<UserEvent> for App {
 
     fn about_to_wait(&mut self, event_loop: &ActiveEventLoop) {
         grab::beat_ui();
+        if let Some(evdev) = &self.evdev_grab {
+            evdev.beat();
+        }
         if self.want_cursor_hidden && !self.cursor_hidden {
             if let Some(w) = &self.window {
                 w.set_cursor_visible(false);
@@ -2866,11 +2911,16 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
         } else if !self.demo_cursor {
-            // While the keyboard is captured, keep waking so the tap watchdog
-            // can tell "idle" from "wedged". An idle app that never ticks is
+            // While a grab is active, keep waking so the watchdog can tell
+            // "idle" from "wedged". An idle app that never ticks is
             // indistinguishable from a hung one, and the watchdog would then
             // release a perfectly healthy grab.
-            if grab::is_active() {
+            let trackpad_grabbed = self
+                .evdev_grab
+                .as_ref()
+                .map(|grab| grab.is_grabbed())
+                .unwrap_or(false);
+            if grab::is_active() || trackpad_grabbed {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(
                     Instant::now() + Duration::from_millis(400),
                 ));
@@ -2972,6 +3022,11 @@ impl ApplicationHandler<UserEvent> for App {
             grab.set_enabled(false);
             eprintln!("grab: disabled (shutdown)");
         }
+        if let Some(evdev) = &self.evdev_grab {
+            if let Err(e) = evdev.set_grabbed(false) {
+                eprintln!("evdev: release on exit failed: {e}");
+            }
+        }
         self.modifiers = ModifiersState::empty();
         self.sync_modifiers(ModifiersState::empty());
         // softbuffer's Wayland context borrows winit's `wl_display`. tear it
@@ -2989,6 +3044,9 @@ fn main() -> Result<()> {
     let mut user = "tai".to_string();
     let mut password = std::env::var("SS_PASSWORD").unwrap_or_default();
     let mut evdev = false;
+    // Explicit opt-in: grab the trackpad device only while the window is
+    // focused. Requires --evdev; never enabled implicitly.
+    let mut grab_trackpad = false;
     let mut dump_path: Option<String> = None;
     let mut dump_after = 4u32;
     let mut exit_after_dump = false;
@@ -3067,6 +3125,10 @@ fn main() -> Result<()> {
             }
             "--evdev" => {
                 evdev = true;
+                i += 1;
+            }
+            "--grab-trackpad" => {
+                grab_trackpad = true;
                 i += 1;
             }
             "--dump" if i + 1 < args.len() => {
@@ -3460,27 +3522,39 @@ fn main() -> Result<()> {
         let _ = tx_out.send(rfb_proto::filecopy::start_file_send(&path, session));
     }
 
+    #[allow(unused_mut)]
+    let mut evdev_grab: Option<platform::evdev::GrabHandle> = None;
     if evdev {
         #[cfg(target_os = "linux")]
         {
             let tx = tx_out.clone();
             let debug = debug_input;
+            let evdev_proxy = proxy.clone();
             let mut gesture_state = EvdevGestureState::default();
             match gesture_input::linux::spawn_default(
-                move |g| {
-                    if debug {
-                        eprintln!("evdev gesture {g:?}");
+                move |event| match event {
+                    gesture_input::linux::DeviceEvent::Gesture(g) => {
+                        if debug {
+                            eprintln!("evdev gesture {g:?}");
+                        }
+                        for body in gesture_bodies(g, input_w, input_h, &mut gesture_state) {
+                            let _ = tx.send(body);
+                        }
                     }
-                    for body in gesture_bodies(g, input_w, input_h, &mut gesture_state) {
-                        let _ = tx.send(body);
+                    gesture_input::linux::DeviceEvent::Pointer { dx, dy } => {
+                        if debug {
+                            eprintln!("evdev pointer dx={dx:.4} dy={dy:.4}");
+                        }
+                        let _ = evdev_proxy.send_event(UserEvent::EvdevPointer { dx, dy });
                     }
                 },
                 debug,
             ) {
-                Ok(devices) => {
-                    for device in devices {
+                Ok(reader) => {
+                    for device in &reader.devices {
                         eprintln!("evdev: using {device}");
                     }
+                    evdev_grab = Some(reader.device);
                 }
                 Err(e) => eprintln!("evdev: {e}"),
             }
@@ -3489,6 +3563,9 @@ fn main() -> Result<()> {
         {
             eprintln!("--evdev is Linux-only; use the trackpad/winit gestures on this platform");
         }
+    }
+    if grab_trackpad && !evdev {
+        eprintln!("--grab-trackpad requires --evdev; not grabbing");
     }
 
     if push {
@@ -3960,6 +4037,8 @@ fn main() -> Result<()> {
         remote_path.clone(),
         keymap,
         grab,
+        evdev_grab,
+        grab_trackpad,
         scroll_test,
         frame_slot.clone(),
         coast,
