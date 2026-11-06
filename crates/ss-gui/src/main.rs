@@ -1161,6 +1161,11 @@ struct App {
     scroll_last: Instant,
     /// Post-release glide, driven by the last scroll velocity.
     scroll_momentum: Momentum,
+    /// True while the OS is coasting after a touch ended; those wheel events
+    /// are momentum, not the fingers, and are dropped.
+    scroll_coasting: bool,
+    /// When the last touch phase ended, for the momentum-start heuristic.
+    scroll_ended_at: Option<Instant>,
     /// `--momentum`: allow the post-release glide. Off by default - the owner
     /// wants the scroll to stop when the fingers stop, and an overshooting
     /// glide is worse than no glide at all.
@@ -1282,6 +1287,8 @@ impl App {
             scroll_last: Instant::now(),
             scroll_momentum: Momentum::new(),
             momentum_enabled,
+            scroll_coasting: false,
+            scroll_ended_at: None,
             scroll_axis: AxisFilter::new(),
             scroll_gliding: false,
             scroll_velocity: (0.0, 0.0),
@@ -2410,6 +2417,38 @@ impl ApplicationHandler<UserEvent> for App {
                     // speed (and, with the old 120 pt/line constant, at 1/24th).
                     MouseScrollDelta::PixelDelta(p) => (p.x as f32, p.y as f32, true),
                 };
+                // After the fingers lift, macOS keeps delivering momentum
+                // scroll events (NSEvent.momentumPhase). winit maps that phase
+                // onto the SAME Started/Moved/Ended sequence as a real touch
+                // (momentum Began -> Started, momentum Ended -> Ended), so it
+                // cannot be told apart by phase alone. What it does have is
+                // timing: momentum starts within a frame or two of the touch
+                // ending, whereas a new touch comes after the hand has moved.
+                // So: a Started inside COAST_WINDOW after an Ended begins the
+                // coasting phase, and its Moved events are dropped.
+                const COAST_WINDOW: Duration = Duration::from_millis(150);
+                let now = Instant::now();
+                match phase {
+                    TouchPhase::Started => {
+                        let soon = self.scroll_ended_at.map_or(false, |t| now - t < COAST_WINDOW);
+                        self.scroll_coasting = soon;
+                        if soon && self.debug_input {
+                            eprintln!("scroll: OS momentum begins (coasting until Ended)");
+                        }
+                    }
+                    TouchPhase::Ended | TouchPhase::Cancelled => {
+                        self.scroll_coasting = false;
+                        self.scroll_ended_at = Some(now);
+                    }
+                    TouchPhase::Moved => {
+                        if self.scroll_coasting {
+                            if self.debug_input {
+                                eprintln!("scroll: dropped OS momentum event ({dx:.0},{dy:.0})");
+                            }
+                            return;
+                        }
+                    }
+                }
                 self.queue_scroll(Gesture::Scroll {
                     dx,
                     dy,
