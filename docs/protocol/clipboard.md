@@ -163,6 +163,16 @@ received the exact string. A second paste of a different non-ASCII string
 the same bytes. The automatic watcher was on (the normal configuration), which
 is required: `AutoPasteboard(1)` is what lets the pushed text land.
 
+**Images work through the same chord (VERIFIED 2026-11-06).** With only
+`image/png` on the local clipboard, Ctrl+V pushes a viewer `0x1f` image archive
+and sends the chord. A 64×64 PNG (501 bytes) read back from the remote clipboard
+through `osascript -e 'the clipboard as «class PNGf»'` had the identical
+sha256, while remote `pbpaste` was empty — so the image, not text, was
+installed. This exposed a bug in `local_clipboard_text()`: untyped `wl-paste`
+returns the raw PNG bytes for an image-only clipboard, which was being accepted
+as lossy UTF-8 text and hid the image path entirely. The text reader now asks
+`wl-paste --list-types` first and only reads a real text flavour.
+
 Limitation: without a keyboard grab the compositor's SUPER+V cannot be
 reclaimed. Ctrl+V is the chord that is guaranteed to reach the window; this is
 documented in `ss-gui --help`. The path needs the automatic clipboard:

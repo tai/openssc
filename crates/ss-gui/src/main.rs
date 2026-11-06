@@ -610,19 +610,67 @@ fn input_is_hot() -> bool {
     }
 }
 
-fn local_clipboard_text() -> Option<String> {
-    use std::io::Write;
-    #[cfg(target_os = "macos")]
-    let (cmd, args): (&str, &[&str]) = ("pbpaste", &[]);
-    #[cfg(not(target_os = "macos"))]
-    let (cmd, args): (&str, &[&str]) = ("wl-paste", &["--no-newline"]);
-
-    let out = std::process::Command::new(cmd).args(args).output().ok()?;
-    let _ = std::io::stdout().flush();
-    if !out.status.success() {
-        return None;
+/// Pick a plain-text flavour from `wl-paste --list-types` output.
+///
+/// `wl-paste` with no type returns *whatever* the clipboard offers, including
+/// raw PNG bytes. Prefer the plain/UTF-8 flavours over `text/html`, then any
+/// other `text/*`, then the legacy X11 atoms.
+#[cfg(not(target_os = "macos"))]
+fn pick_text_type(list: &str) -> Option<&str> {
+    let types: Vec<&str> = list
+        .lines()
+        .map(str::trim)
+        .filter(|t| !t.is_empty())
+        .collect();
+    for want in [
+        "text/plain;charset=utf-8",
+        "text/plain;charset=UTF-8",
+        "text/plain",
+        "UTF8_STRING",
+        "STRING",
+        "TEXT",
+    ] {
+        if let Some(found) = types.iter().find(|t| t.eq_ignore_ascii_case(want)) {
+            return Some(found);
+        }
     }
-    Some(String::from_utf8_lossy(&out.stdout).to_string())
+    types.iter().find(|t| t.starts_with("text/")).copied()
+}
+
+fn local_clipboard_text() -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        use std::io::Write;
+        let out = std::process::Command::new("pbpaste").output().ok()?;
+        let _ = std::io::stdout().flush();
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // Ask what is offered first. Reading an image-only clipboard through
+        // untyped `wl-paste` returns the PNG bytes as text, which would hide
+        // the image path behind lossy UTF-8 garbage.
+        let types = std::process::Command::new("wl-paste")
+            .arg("--list-types")
+            .output()
+            .ok()?;
+        if !types.status.success() {
+            return None;
+        }
+        let offered = String::from_utf8_lossy(&types.stdout);
+        let text_type = pick_text_type(&offered)?;
+        let out = std::process::Command::new("wl-paste")
+            .args(["--no-newline", "--type", text_type])
+            .output()
+            .ok()?;
+        if !out.status.success() {
+            return None;
+        }
+        Some(String::from_utf8_lossy(&out.stdout).to_string())
+    }
 }
 
 /// Stable fingerprint for echo suppression of images.
@@ -4086,6 +4134,21 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[cfg(not(target_os = "macos"))]
+    fn text_type_prefers_plain_and_ignores_images() {
+        assert_eq!(
+            pick_text_type("image/png\ntext/html\ntext/plain;charset=utf-8\n"),
+            Some("text/plain;charset=utf-8")
+        );
+        assert_eq!(
+            pick_text_type("UTF8_STRING\ntext/html\n"),
+            Some("UTF8_STRING")
+        );
+        assert_eq!(pick_text_type("image/png\nimage/tiff\n"), None);
+        assert_eq!(pick_text_type(""), None);
+    }
 
     #[test]
     fn us_table_positions_and_inverse() {
