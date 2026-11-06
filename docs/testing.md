@@ -11,13 +11,14 @@ is right. This file describes methods and records results; the code and
 docs in the same commit, and if you cannot reproduce a number here, say so
 rather than quietly re-quoting it.
 
-Four layers, cheapest first. Use the lowest layer that can answer the question.
+Layers, cheapest first. Use the lowest layer that can answer the question.
 
 | layer | answers | needs lab? | cost |
 |---|---|---|---|
 | unit / contract tests | do the layouts and decoders match their fixtures | no | ~2 s |
 | replay benchmark | how fast is decode, deterministically | no | ~1 s |
 | client-internal timing (`SS_LATDBG`) | is the decoder keeping up with the wire | yes | ~30 s |
+| Wayland smoke (`tools/measure/wayland-smoke.sh`) | does the release client build, connect, paint and present | yes (no camera) | ~30 s + build |
 | two-screen camera A/B | does the picture trail the remote | yes + camera | ~2 min/client |
 | wire capture (pcap) | what was sent, when, how many bytes | yes | ~30 s |
 | native client as oracle | what should the answer look like | yes | manual |
@@ -290,9 +291,242 @@ silently produced nonsense (the parser in `decode_backlog.py` now handles both).
 **Still open (2026-11-06).** Replay target of 150 ms for the burst is not met
 (272 ms dev / 231 ms release); the live client decodes a heavy body ~2.7× slower
 than the replay benchmark decodes the same bytes, which bounds the worst-case
-tail and is unmeasured. Linux/Wayland has not been run end to end at all.
+tail and is unmeasured. Linux/Wayland now builds, connects and paints (§9), but
+input, gestures and clipboard are unverified there, and there is no camera
+measurement of Linux latency.
 
-## 9. Checklist for a measurement or a new test
+**2026-11-06 — Linux/Wayland walk-up.** Asked: can the actual target platform
+build, connect and present a frame without a camera? Ran
+`tools/measure/wayland-smoke.sh` on Arch/Hyprland against `mm.local` and in a
+private headless weston. Measured: release build, auth, MVS decode, 2560×1600
+paints, grim-captured window, clean exit 0. Also measured the runtime library
+set with `ldd`/`LD_DEBUG` and corrected the README's build dependencies (winit
+`dlopen`s Wayland/X11/xkbcommon, so no `-dev` packages are needed). Details and
+what each check does not prove: §9.
+
+## 9. Linux/Wayland
+
+Everything above was developed on macOS. This section is what was actually
+executed on the Linux target: Arch + Hyprland on 2026-11-06, server `mm.local`
+(2560×1600), tree = `main` at `4598e4c` plus the harness branch. It extends the
+layers above; it does not replace the camera for latency claims.
+
+### 9.1 Build
+
+```sh
+export PATH="$HOME/.cargo/bin:$PATH"
+cargo build --release -p ss-gui
+cargo test --workspace
+```
+
+Measured: `cargo check --workspace` and `cargo test --workspace` pass on Linux
+(73 tests: 14 `gesture-input`, 33 `rfb-proto`, 1 replay, 25 `ss-gui`). rustc
+1.99.1 was used; the project's floor is 1.97.
+
+**Build dependencies are smaller than the old README claimed.** Measured with
+`cargo tree -p ss-gui -e build`: there is no `pkg-config`, `cc` build script,
+`bindgen` or `cmake` in the build graph. `wayland-backend` is built with
+`dlopen`, and `xkbcommon-dl` / `x11-dl` load their libraries at runtime, so no
+`-dev` headers are needed to compile. A C linker and glibc are still needed for
+the final link and proc-macros (`gcc`/`clang` + `binutils`; `build-essential` on
+Debian, `base-devel` on Arch). The old list (`libwayland-dev`,
+`libxkbcommon-dev`, `libx11-xcb-dev`, …) was a runtime package list mislabelled
+as build dependencies.
+
+If the build fails with `cannot find module or crate 'grab'`, the tree predates
+the Linux platform seam (`6582290`); that is a `crates/ss-gui` problem, not a
+harness problem. Do not patch around it in `tools/`.
+
+### 9.2 Run
+
+From the Hyprland session:
+
+```sh
+./target/release/ss-gui --host mm.local --mvs
+```
+
+Over ssh, the Wayland session variables must be exported or winit finds no
+display:
+
+```sh
+export WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR=/run/user/1000
+./target/release/ss-gui --host mm.local --mvs
+```
+
+`--mvs` is the fast path on this server; without it the client advertises Zlib
+(6). The Linux log line `grab: not available on this platform` is expected: the
+macOS keyboard grab has no Linux counterpart yet (see §9.6).
+
+### 9.3 Smoke test: build, connect, paint, present
+
+```sh
+tools/measure/wayland-smoke.sh                  # existing session; grim when possible
+tools/measure/wayland-smoke.sh --no-grim        # no screenshot
+
+# session-free: force the nested-compositor route even from a real session
+env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
+  tools/measure/wayland-smoke.sh --no-grim
+```
+
+The script:
+
+1. builds `cargo build --release -p ss-gui`;
+2. runs `ss-gui --mvs --dump <png> --dump-after 6` against `mm.local` with
+   `tai` / `$SS_PASSWORD` (plus `--exit-after-dump` when grim is off, and
+   `--exit-after-secs 30` as the backstop);
+3. waits for the log line `wrote <png>` (printed only after `write_png` returns,
+   so the file cannot be read half-written). With grim enabled it then captures
+   the window and closes it through the compositor; otherwise it uses the
+   client's `--exit-after-dump` path. Either way the client must exit 0;
+4. validates the dump with `tools/measure/png_probe.py`, a stdlib-only PNG
+   reader. It checks the decoded IHDR geometry, a byte floor of
+   `max(10 KiB, 0.5% of raw RGB)`, at least 8 distinct colours, and that not
+   every pixel equals the first. No `pngcheck`, `file(1)`, Pillow or camera;
+5. if `$WAYLAND_DISPLAY` names a live socket, finds the mapped `ss-gui` window
+   through `hyprctl -j clients` and captures it with `grim -g`. If geometry is
+   unavailable it falls back to a full-output `grim`, and if grim fails it warns
+   rather than failing the run. With no real session it starts a private
+   headless `weston` and skips grim.
+
+Measured runs (2026-11-06, `--mvs`, `--dump-after 6`):
+
+| session | dump | decoded content | grim | exit |
+|---|---|---|---|---|
+| Hyprland `wayland-1` | 2560×1600, 1,582,635 B | 64,559 colours, 97.8% non-background | window 360×319 → PNG | 0 |
+| Hyprland `wayland-1`, `--no-grim` | 2560×1600, 1,552,952 B | 64,149 colours, 97.8% non-background | n/a | 0 |
+| private headless weston | 2560×1600, 1,581,159 B | ≥65,536 colours, 97.8% non-background | n/a (headless backend) | 0 |
+
+Sizes vary with screen content; the byte floor is a blank-frame guard, not a
+quality or speed metric.
+
+**What this proves:** the release binary starts on Wayland, resolves `mm.local`,
+completes Apple auth and session setup, decodes an MVS frame, paints at least six
+frames, dumps a non-trivial image at the expected geometry, and exits 0 on the
+normal teardown. With grim it also proves the compositor has a mapped window
+whose pixels can be photographed.
+
+**What it deliberately does not prove:** input (keyboard, pointer, gestures),
+clipboard and file copy, frame rate, latency, colour fidelity, or that the frame
+is current — a stale but non-blank dump passes. grim's full-output fallback can
+photograph other windows, so it is evidence of a mapped window, not a correct
+one. There is no camera harness on Linux yet, so there is no Linux counterpart
+to §4 and no Linux visual-latency number.
+
+### 9.4 Runtime dependencies (measured, not guessed)
+
+`ldd target/release/ss-gui` and `readelf -d` show the direct dependencies:
+
+```text
+linux-vdso.so.1
+libgcc_s.so.1
+libm.so.6
+libc.so.6
+ld-linux-x86-64.so.2
+```
+
+That is the whole `DT_NEEDED` list: the GUI does **not** link Wayland, X11 or
+xkbcommon. They are `dlopen`ed. Measured by running a real Wayland session with
+`LD_DEBUG=libs` (2026-11-06), the client also loads:
+
+```text
+libwayland-client.so.0
+libxkbcommon.so.0
+libX11.so.6
+libX11-xcb.so.1
+libxcb.so.1
+libXau.so.6
+libXdmcp.so.6
+```
+
+The X11 set is loaded by the same winit/softbuffer build even in a Wayland
+session. The Wayland path needs `libwayland-client` and `libxkbcommon`; the X11
+set is present on a normal desktop and is only used if the client falls back to
+XWayland. A Wayland-only container without any X11 libraries is untested
+(HYPOTHESIS: winit's Wayland backend would still run).
+
+Package mapping. The Arch column was confirmed on this host with `pacman -Qo`;
+the Debian names are the standard split (VERIFIED library names, HYPOTHESIS
+package names — this host cannot query Debian):
+
+| loaded library | Debian/Ubuntu package | Arch package |
+|---|---|---|
+| `libc.so.6`, `libm.so.6`, `ld-linux-x86-64.so.2` | `libc6` | `glibc` |
+| `libgcc_s.so.1` | `libgcc-s1` | `libgcc` (older: `gcc-libs`) |
+| `libwayland-client.so.0` | `libwayland-client0` | `wayland` |
+| `libxkbcommon.so.0` | `libxkbcommon0` | `libxkbcommon` |
+| `libX11.so.6`, `libX11-xcb.so.1` | `libx11-6`, `libx11-xcb1` | `libx11` |
+| `libxcb.so.1` | `libxcb1` | `libxcb` |
+| `libXau.so.6` | `libxau6` | `libxau` |
+| `libXdmcp.so.6` | `libxdmcp6` | `libxdmcp` |
+
+Optional, because the client shells out to them:
+
+| command | Debian package | Arch package | used for |
+|---|---|---|---|
+| `wl-copy`, `wl-paste` | `wl-clipboard` | `wl-clipboard` | text/image clipboard |
+| `grim` | `grim` | `grim` | smoke-test screenshot only |
+| `weston` | `weston` | `weston` | session-free smoke-test mode only |
+| `hyprctl` | n/a | `hyprland` | window geometry for grim |
+
+**The clipboard shells out** on Linux: `wl-paste --no-newline` for text,
+`wl-paste --type image/png` for images, and `wl-copy` (optionally
+`--type <mime>`) to write. The watcher polls every 700 ms. Measured with
+`PATH` pointing at an empty directory: the session connects, decodes and dumps
+normally, and there is **no warning and no crash** — clipboard reads return
+`None` and writes silently do nothing. In other words, `wl-clipboard` is a soft
+dependency: without it the remote session works but local clipboard sync is
+absent. The `clipboard: automatic duplex` log line still appears because the
+protocol side is still trying. `--no-clipboard` disables the 700 ms poll.
+
+### 9.5 Packaging
+
+`packaging/ss-clone.desktop` used to call `ss-gui` without `--mvs`, silently
+selecting the slow Zlib path. It now launches `ss-clone-launch`, which always
+passes `--mvs`, keeps stderr in `$XDG_STATE_HOME/ss-clone/ss-gui.log` and sends a
+desktop notification if the client exits non-zero. `SS_HOST` can be set in the
+environment or in `$XDG_CONFIG_HOME/ss-clone/config`.
+
+```sh
+./packaging/install.sh                  # ~/.local, builds release first
+./packaging/install.sh --no-build       # use target/release/ss-gui
+./packaging/install.sh --prefix /usr/local
+```
+
+The installer copies `ss-gui`, `ss-clone-launch`, the desktop entry and
+`ss-clone.svg`, and rewrites `Exec=`/`TryExec=` to absolute paths because
+`~/.local/bin` is not always on a GUI session's `PATH`. Installed to a temporary
+prefix on 2026-11-06 and the generated entry inspected; launching it from a
+desktop menu was not automated.
+
+### 9.6 Known gaps on Wayland
+
+- **No camera harness on Linux.** `tools/measure/camera_ab.sh` is
+  macOS/avfoundation. There is no Linux visual-latency measurement yet; use
+  `SS_LATDBG`/`decode_backlog.py` for decoder health and the camera on the macOS
+  harness for feel.
+- **Window geometry pinning and `focus_window` do not exist on Wayland.** A
+  Wayland client cannot place itself at a chosen rectangle or raise/focus itself;
+  the compositor owns that. Measured on Hyprland: the window was tiled at
+  360×319 (the size varies with the workspace) instead of the 800×600 the client
+  asks for. The macOS A/B pins both clients to the
+  same rectangle before filming, which is why cross-client crops are comparable;
+  that step has no Wayland equivalent. `--dump` sidesteps it for correctness
+  checks, and grim captures whatever the compositor presents, which is enough to
+  prove presentation but not to compare two clients on screen geometry.
+- **Raw evdev is partial and unexercised.** `--evdev` in `ss-gui` does spawn
+  the `gesture-input` MT-protocol-B reader on Linux and does **not** grab the
+  device, but it could not be run here: this user has no access to
+  `/dev/input/event*` (no `input` group, no seat ACL). It also discovers devices
+  by ioctl capability probing and takes the first MT device, rather than by udev
+  `ID_INPUT_TOUCHPAD`. `EVIOCGRAB`, a release chord and a keyboard grab are the
+  next phase; the prerequisites are in
+  [`docs/findings/2026-11-06-evdev-prerequisites.md`](findings/2026-11-06-evdev-prerequisites.md).
+- **No keyboard grab.** `grab: not available on this platform` at startup is
+  expected. Local shortcuts reach the compositor, not the remote; the macOS
+  Left-Cmd+Shift release chord does not exist here.
+
+## 10. Checklist for a measurement or a new test
 
 1. State the question and the number that would answer it *before* measuring.
 2. Prefer the cheapest layer that can answer it (§table at the top).
