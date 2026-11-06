@@ -171,6 +171,17 @@ export WAYLAND_DISPLAY=wayland-1
 export XDG_RUNTIME_DIR=/run/user/1000
 ```
 
+Presentation defaults to the sharp path: an exact integer downscale (the common
+2:1 case) uses box/area averaging, any other ratio uses bilinear, and a 1:1
+window is still a plain memcpy. `--filter nearest` reproduces the old
+sample-one-pixel mapping for A/B tests; `--filter box|bilinear` force a filter.
+
+The initial window size is chosen for the monitor the window lands on: 1:1 with
+the framebuffer when it fits (e.g. 1280x800 logical on a 2x 2880x1800 panel),
+otherwise the largest 16:10 size up to 1600x1000 that fits. `--window-size WxH`
+pins it. Measured filter quality, draw cost and caveats:
+[`docs/testing.md` §10](docs/testing.md#10-render-quality-and-presentation).
+
 ### Verify without a camera
 
 ```sh
@@ -185,6 +196,17 @@ The script builds release, dumps six painted frames with the built-in
 floor, distinct colours), requires a clean exit, and in a real session captures
 the window with grim before closing it. It proves build/connect/paint/present/
 teardown; it does not prove input, gestures, clipboard, frame rate or latency.
+
+For the presentation filter specifically, `tools/measure/render-capture.sh`
+runs one filter at one window size, keeps the 1:1 dump and a grim capture of the
+actual window, and reports p50/p95 draw time:
+
+```sh
+tools/measure/render-capture.sh --filter nearest --size 1280x800 \
+    --workspace 12 --out artifacts/render-quality/nearest-1280
+tools/measure/render-capture.sh --filter auto --size 1600x1000 \
+    --workspace 12 --out artifacts/render-quality/bilinear-1600
+```
 
 ### Desktop entry
 
