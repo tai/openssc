@@ -4,6 +4,14 @@
 
 - Phase / milestone: M1/M6 — the client must keep up with the server during a
   scroll at 2560x1600 without shrinking the image.
+- **Camera parity check (VERIFIED):** two screens filmed at 30 fps, identical
+  synthetic scroll into each client, window geometry pinned for both. Envelope
+  lag between the remote screen and the client window fell from **483 ms** to
+  **157 ms** for ss-gui (SS.app: 237 ms); time after the remote settles before
+  the window settles fell from 533 ms to 133 ms (SS.app: 267 ms). The client now
+  presents the motion in about the time the remote takes (stretch x0.94, was
+  x1.38). Before/after runs were on the same page with the old client rebuilt
+  from `2d0ea47`. Record: `docs/findings/2026-11-06-visual-latency-parity.md`.
 - Verified: a captured scroll burst (132 bodies, 1,471,236 tiles, 233,522 DCT
   blocks, 94.2 Mpx) now decodes in **271.6 ms / 346.7 Mpx/s**, from
   **1000.2 ms / 94.1 Mpx/s** before. Live backlog over the same 300 px scroll:

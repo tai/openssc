@@ -605,6 +605,36 @@ client plus a pcap and experiment note.
 
 ## 13. Current status snapshot
 
+### Unreleased — 2026-11-06
+
+- **Visual latency is solved, and it was decode, not the wire.** Two prior fixes
+  cut the *receive* path to link capacity (48-85 → 112 Mbit/s against a
+  114 Mbit/s link), but the picture still trailed the remote by a third of a
+  second and kept moving long after the remote had stopped. Filming both
+  screens settled it: the client presented a scroll over x2.67 the remote's
+  duration because the decoder rendered every intermediate state and fell
+  behind — a backlog of p50 183 ms / max 640 ms at 2560x1600, collapsing to
+  p50 15 ms at `--scale 0.5`. The old `Idct::plane` was a naive `f64`
+  separable transform (~140 Mpx/s) and a scroll burst needs ~190 Mpx/s before
+  counting tile copies.
+- **Fixed**: fixed-point `islow` IDCT, direct-to-framebuffer tile writes (no
+  `fb → tile → fb` for CopyPrevious/CopyAbove), run spans for fills,
+  incremental raster position, and one publish per drained batch in the
+  session decoder thread. Replay benchmark: 1000 → 272 ms for a captured
+  burst (94 → 347 Mpx/s). Live backlog p50 681 → 16 ms. Camera: envelope lag
+  483 → 157 ms against SS.app's 237 ms, tail 533 → 133 ms against 267 ms, so
+  the client is now on parity with `Screen Sharing.app` and marginally ahead
+  on this link (SS.app spends ~1.6 MB per burst, we spend 0.05-1 MB).
+  Record: `docs/findings/2026-11-06-visual-latency-parity.md`.
+- **Watchdogs corrected**: an idle push screen is normal, not a failure — the
+  2 s "giving up on push" message is now an idle note, and the reader
+  heartbeat advances on socket reads, so the keyboard grab no longer releases
+  itself during a still screen.
+- **Measured, not assumed**: the server's first-byte reaction is *not* worth
+  chasing — the first visible change arrives at the same time in both clients.
+- Still open: the 150 ms replay target (272 ms), and the live client decoding
+  a heavy body ~2.7x slower than the replay benchmark decodes the same bytes.
+
 ### v1.4.1 — 2026-11-05
 
 - **Keyboard grab**: a `CGEventTap` consumes key events while the window is
