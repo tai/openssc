@@ -19,6 +19,7 @@ Layers, cheapest first. Use the lowest layer that can answer the question.
 | replay benchmark | how fast is decode, deterministically | no | ~1 s |
 | client-internal timing (`SS_LATDBG`) | is the decoder keeping up with the wire | yes | ~30 s |
 | Wayland smoke (`tools/measure/wayland-smoke.sh`) | does the release client build, connect, paint and present | yes (no camera) | ~30 s + build |
+| render capture (`tools/measure/render-capture.sh`) | does the presented window match a high-quality downscale, and what does draw cost | yes + Hyprland | ~15 s/run |
 | two-screen camera A/B | does the picture trail the remote | yes + camera | ~2 min/client |
 | wire capture (pcap) | what was sent, when, how many bytes | yes | ~30 s |
 | native client as oracle | what should the answer look like | yes | manual |
@@ -526,7 +527,123 @@ desktop menu was not automated.
   expected. Local shortcuts reach the compositor, not the remote; the macOS
   Left-Cmd+Shift release chord does not exist here.
 
-## 10. Checklist for a measurement or a new test
+## 10. Render quality and presentation
+
+This is the layer that answers "why did the text look rough when the remote
+desktop is crisp?". It is separate from decode: a correct framebuffer can still
+be presented badly.
+
+### 10.1 The measured root cause
+
+On 2026-11-06 the lab server sent a 2560x1600 framebuffer, Hyprland put the
+window on `DP-1` (1920x1080, scale 1), and the default window was 1280x800
+logical. `draw()` mapped each output pixel to one source pixel with
+`floor(dst * src / dst_len)`: at exactly 2:1 that keeps every other row and
+column and **discards three of every four source pixels**. On a 2x backing
+(macOS, or this host's eDP-1 at scale 2) the logical 1280x800 becomes physical
+2560x1600, the 1:1 `copy_from_slice` path runs, and the same window is crisp.
+That is the whole discrepancy.
+
+Before/after grim captures and 2x text crops are in the gitignored
+`artifacts/render-quality/` (screen contents are never committed). The
+`before-*` files are `--filter nearest`, which reproduces the old mapping; the
+`after-*` files are the new default.
+
+### 10.2 What the client does now
+
+`crates/ss-gui/src/render.rs` owns the resampler and `draw()` calls it:
+
+- **1:1 whole-frame memcpy** is unchanged and still the first branch.
+- **`auto`** (default): exact integer downscale -> area/box averaging; every
+  other ratio -> bilinear. 2560x1600 -> 1280x800 is the unrolled 2x2 box case.
+- **`nearest`** preserves the old `floor(dst * src / dst_len)` mapping exactly,
+  for A/B tests and when the user wants the old look.
+- **`box`** uses area averaging when both axes divide exactly, otherwise falls
+  back to bilinear. **`bilinear`** forces bilinear even for the 2:1 case.
+- Maps and weights are built in `Scaler::new`, only on a window/framebuffer
+  resize. `apply()` allocates nothing. On x86_64 the bilinear loop processes
+  four output pixels at a time with SSE2; a scalar implementation is kept for
+  other targets and is compared against the SIMD output by a unit test.
+
+`--filter nearest|auto|box|bilinear` selects the mode. `SS_DRAW_TIMING=1` makes
+`--debug-input` print every present time, not only the >5 ms warnings; the
+budget warning itself is unchanged.
+
+### 10.3 Default window size
+
+`--window-size WxH` pins a logical size. Without it the client starts at a safe
+1280x800 request and, once the compositor tells it which monitor it landed on,
+asks for:
+
+- **1:1 with the framebuffer** when that fits inside 95% of the monitor's
+  logical area (eDP-1 2880x1800 at scale 2 -> 1280x800 logical = 2560x1600
+  physical, so no resampling at all);
+- otherwise the largest **16:10** size that fits, starting from 1600x1000
+  (DP-1 1920x1080 at scale 1 -> 1600x1000).
+
+Measured with `--debug-input`: `window: 1600x1000 logical for monitor scale 1`
+on DP-1 and `window: 1280x800 logical for monitor scale 2` on eDP-1. A tiling
+compositor may ignore the request entirely (Hyprland tiled the test window to
+331x584); this is a request, not a geometry pin. `--window-size` is the
+deterministic option for a capture.
+
+### 10.4 Measured filter quality and draw cost
+
+Method: one run per filter/size, 2560x1600 source, window on DP-1, grim capture
+of the actual presented window, and the same run's 1:1 `--dump` downscaled with
+an area filter as the reference. The metric is normalized MAE/RMSE of a text
+crop against that reference (lower is closer), plus distinct colours in the
+crop. This is a consistency check, not a perceptual score.
+
+| window | filter | MAE | RMSE | colours | draw p50 | draw p95 |
+|---|---|---|---:|---:|---:|---:|
+| 1280x800 | nearest (old) | 0.0300 | 0.0729 | 4,975 | 1.85 ms | 3.90 ms |
+| 1280x800 | auto / box | **0.0096** | **0.0104** | 5,556 | 2.80 ms | 4.90 ms |
+| 1600x1000 | nearest | 0.0381 | 0.1084 | 6,831 | 2.60 ms | 5.10 ms |
+| 1600x1000 | auto / bilinear | **0.0140** | **0.0226** | 7,647 | 7.00 ms | 11.20 ms |
+
+The 2:1 box path is 3.1x closer to the reference in MAE and 7.0x closer in
+RMSE than nearest, while staying under the 5 ms budget at p95. The 1600x1000
+bilinear path is 2.7x closer in MAE and 4.8x in RMSE than nearest, at p50
+7.0 ms: above the 5 ms warning but well inside a 16.7 ms frame. The biggest
+perceived gain is the larger window, because 1600x1000 keeps more source pixels
+than 1280x800 even before the filter.
+
+Reproduce with the committed capture harness (Hyprland lab; it serializes on
+`/tmp/ss-clone-gui.lock`, uses `--no-clipboard`, bounds the run and verifies the
+process is gone):
+
+```sh
+cargo build --release -p ss-gui
+tools/measure/render-capture.sh --filter nearest --size 1280x800 --workspace 12 \
+    --out artifacts/render-quality/nearest-1280
+tools/measure/render-capture.sh --filter auto --size 1280x800 --workspace 12 \
+    --out artifacts/render-quality/box-1280
+tools/measure/render-capture.sh --filter nearest --size 1600x1000 --workspace 12 \
+    --out artifacts/render-quality/nearest-1600
+tools/measure/render-capture.sh --filter auto --size 1600x1000 --workspace 12 \
+    --out artifacts/render-quality/bilinear-1600
+```
+
+`--workspace 12` is the lab's DP-1 workspace. On another desktop omit it (the
+window opens on the active workspace) and use `--size` to compare like with
+like. The 1:1 `dump.png` in each output directory is the unfiltered reference.
+
+**What this proves:** the presented pixels come from all source pixels in the
+2:1 case (box) or a weighted four-sample interpolation otherwise, not one in
+four; the filter choice is deterministic and testable; the 1:1 path is still a
+memcpy; the draw cost at the common sizes is measured.
+
+**What it cannot prove:** perceptual quality needs the human's eyes. The
+reference is generated by another filter, not from a ground-truth display, and
+the text crop is only one region. grim captures the compositor's output, so a
+wrong window geometry or an overlapping window changes the image; the 1:1 dump
+cannot. There is no colour-management/HDR check, no frame-pacing measurement,
+and no camera here. Finally, the numbers are this host and this 2560x1600
+stream; a different source size, monitor scale or compositor changes both the
+chosen filter and the draw cost.
+
+## 11. Checklist for a measurement or a new test
 
 1. State the question and the number that would answer it *before* measuring.
 2. Prefer the cheapest layer that can answer it (§table at the top).

@@ -36,8 +36,10 @@ use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 
 mod filecopy;
 mod platform;
+mod render;
 
 use platform::{grab, momentum};
+use render::{Filter, Scaler};
 
 /// Scroll deltas accumulated between subtype-11 messages, in the portable
 /// model's units (pixels).
@@ -476,6 +478,10 @@ Connection:
 
 Display and codec:
   --scale <f>              present the framebuffer at this scale (default 1.0)
+  --filter <mode>          presentation filter: auto, nearest, box, bilinear
+                           (default auto: box for integer downscale, else bilinear)
+  --window-size <WxH>      initial logical window size (default: fit the
+                           window's monitor, 1:1 when the framebuffer fits)
   --mvs                    advertise MultiVariant (0x3f3); server push by default
   --poll                   MVS request loop instead of server push
   --push                   accepted no-op (push is the default with --mvs)
@@ -578,6 +584,14 @@ static PUSH_PAINTED: AtomicBool = AtomicBool::new(false);
 /// backlog can be attributed to a stage instead of guessed at.
 static LATDBG: OnceLock<bool> = OnceLock::new();
 fn latdbg() -> bool { *LATDBG.get_or_init(|| std::env::var("SS_LATDBG").is_ok()) }
+
+/// `SS_DRAW_TIMING=1` prints every present timing, not only the >5 ms budget
+/// warnings, so a filter/geometry comparison has samples even when the draw is
+/// cheap. Lab-only; unset in normal use.
+static DRAWDBG: OnceLock<bool> = OnceLock::new();
+fn drawdbg() -> bool {
+    *DRAWDBG.get_or_init(|| std::env::var("SS_DRAW_TIMING").is_ok())
+}
 /// Timestamp of the oldest local input event that has not been answered by a
 /// painted rectangle yet; `u64::MAX` means "nothing pending".
 static INPUT_PENDING_MS: AtomicU64 = AtomicU64::new(u64::MAX);
@@ -1491,8 +1505,10 @@ struct App {
     /// Modifiers the remote has actually been told are down. Shift is excluded:
     /// it is synthesised around shifted characters instead.
     forwarded_mods: ModifiersState,
-    xmap: Vec<usize>,
-    render_size: (u32, u32),
+    scaler: Option<Scaler>,
+    filter: Filter,
+    window_size: Option<(f64, f64)>,
+    size_pending: bool,
     surface_size: (u32, u32),
     last_pointer_sent: Instant,
     pending_pointer: Option<(u16, u16, u8)>,
@@ -1560,6 +1576,8 @@ impl App {
         dump_after: u32,
         exit_after_dump: bool,
         debug_input: bool,
+        filter: Filter,
+        window_size: Option<(f64, f64)>,
         ime: bool,
         deadline: Option<Instant>,
         demo_cursor: bool,
@@ -1628,8 +1646,10 @@ impl App {
             dirty: true,
             modifiers: ModifiersState::empty(),
             forwarded_mods: ModifiersState::empty(),
-            xmap: Vec::new(),
-            render_size: (0, 0),
+            scaler: None,
+            filter,
+            size_pending: window_size.is_none(),
+            window_size,
             surface_size: (0, 0),
             last_pointer_sent: Instant::now() - Duration::from_millis(100),
             pending_pointer: None,
@@ -2386,11 +2406,29 @@ impl App {
                 .map_err(|e| anyhow::anyhow!("softbuffer resize: {e:?}"))?;
             self.surface_size = (w, h);
         }
-        if self.render_size != (w, h) {
-            self.xmap = (0..w as usize)
-                .map(|x| (x as u64 * self.fb_w as u64 / w as u64) as usize)
-                .collect();
-            self.render_size = (w, h);
+        let needs_scaler = self
+            .scaler
+            .as_ref()
+            .map_or(true, |s| !s.matches(self.fb_w as usize, self.fb_h as usize, w as usize, h as usize, self.filter));
+        if needs_scaler {
+            let scaler = Scaler::new(
+                self.fb_w as usize,
+                self.fb_h as usize,
+                w as usize,
+                h as usize,
+                self.filter,
+            );
+            if self.debug_input {
+                eprintln!(
+                    "render: {}x{} -> {}x{} mode {}",
+                    self.fb_w,
+                    self.fb_h,
+                    w,
+                    h,
+                    scaler.mode_name()
+                );
+            }
+            self.scaler = Some(scaler);
         }
         let mut buffer = surface
             .buffer_mut()
@@ -2400,23 +2438,8 @@ impl App {
             // 1:1: one memcpy for the whole frame.
             buffer.copy_from_slice(&self.fb[..w as usize * h as usize]);
         } else {
-            let fw = self.fb_w as usize;
-            let fh = self.fb_h as u64;
-            // Row-copy fast path when the x mapping is the identity (the usual
-            // "window is the same width, slightly different height" case).
-            let identity_x = w == self.fb_w as u32;
-            for y in 0..h as usize {
-                let sy = (y as u64 * fh / h as u64) as usize;
-                let row = &self.fb[sy * fw..sy * fw + fw];
-                let out = &mut buffer[y * w as usize..(y + 1) * w as usize];
-                if identity_x {
-                    out.copy_from_slice(row);
-                } else {
-                    for (x, dst) in out.iter_mut().enumerate() {
-                        *dst = row[self.xmap[x]];
-                    }
-                }
-            }
+            let scaler = self.scaler.as_ref().expect("scaler is built above");
+            scaler.apply(&self.fb, &mut buffer);
         }
         Self::composite_cursor(
             &self.cursor_shape,
@@ -2429,9 +2452,9 @@ impl App {
             w,
             h,
         );
-        if self.debug_input {
+        if self.debug_input || drawdbg() {
             let ms = started.elapsed().as_secs_f64() * 1000.0;
-            if ms > 5.0 {
+            if ms > 5.0 || drawdbg() {
                 eprintln!("draw took {ms:.1} ms ({}x{} -> {}x{})", self.fb_w, self.fb_h, w, h);
             }
         }
@@ -2706,9 +2729,12 @@ impl ApplicationHandler<UserEvent> for App {
         if self.window.is_some() {
             return;
         }
+        // Start with a safe request; if the user did not pin a size, the
+        // first about_to_wait picks the actual monitor and may resize once.
+        let (win_w, win_h) = self.window_size.unwrap_or((1280.0, 800.0));
         let attrs = Window::default_attributes()
             .with_title("ss-clone — Apple Screen Sharing")
-            .with_inner_size(LogicalSize::new(1280.0, 800.0));
+            .with_inner_size(LogicalSize::new(win_w, win_h));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let Some(context) = self.context.as_ref() else {
             return;
@@ -3084,6 +3110,25 @@ impl ApplicationHandler<UserEvent> for App {
                 self.update_title();
             }
         }
+        if self.size_pending {
+            if let Some(w) = &self.window {
+                if let Some(monitor) = w.current_monitor() {
+                    let (ww, wh) = window_size_for_monitor(self.fb_w, self.fb_h, &monitor);
+                    let scale = w.scale_factor();
+                    let current = w.inner_size().to_logical::<f64>(scale);
+                    if (current.width - ww).abs() > 1.0 || (current.height - wh).abs() > 1.0 {
+                        let _ = w.request_inner_size(LogicalSize::new(ww, wh));
+                        if self.debug_input {
+                            eprintln!(
+                                "window: {:.0}x{:.0} logical for monitor scale {scale} (framebuffer {}x{})",
+                                ww, wh, self.fb_w, self.fb_h
+                            );
+                        }
+                    }
+                    self.size_pending = false;
+                }
+            }
+        }
         if self.want_cursor_hidden && !self.cursor_hidden {
             if let Some(w) = &self.window {
                 w.set_cursor_visible(false);
@@ -3396,7 +3441,7 @@ impl ApplicationHandler<UserEvent> for App {
                 self.fb_h = h;
                 self.fb = vec![0u32; w as usize * h as usize];
                 // Force the draw mapping to be rebuilt for the new geometry.
-                self.render_size = (0, 0);
+                self.scaler = None;
             }
             let dst_w = w as usize;
             if self.debug_input {
@@ -3491,6 +3536,43 @@ impl ApplicationHandler<UserEvent> for App {
     }
 }
 
+/// Pick a logical window size for the monitor the window actually landed on.
+/// Prefer 1:1 with the framebuffer when it fits (a 2880x1800 panel at scale 2
+/// shows the 1280x800-point framebuffer exactly); otherwise use the largest
+/// 16:10 window that fits with a 5% margin. The compositor still owns
+/// placement and may tile the window.
+fn window_size_for_monitor(
+    fb_w: u16,
+    fb_h: u16,
+    monitor: &winit::monitor::MonitorHandle,
+) -> (f64, f64) {
+    let size = monitor.size();
+    choose_window_size(fb_w, fb_h, monitor.scale_factor(), size.width, size.height)
+}
+
+fn choose_window_size(
+    fb_w: u16,
+    fb_h: u16,
+    scale: f64,
+    monitor_w: u32,
+    monitor_h: u32,
+) -> (f64, f64) {
+    let margin = 0.95;
+    let max_w = monitor_w as f64 / scale * margin;
+    let max_h = monitor_h as f64 / scale * margin;
+    let fb_lw = fb_w as f64 / scale;
+    let fb_lh = fb_h as f64 / scale;
+    if fb_lw <= max_w && fb_lh <= max_h {
+        return (fb_lw, fb_lh);
+    }
+    let mut w = 1600.0f64.min(max_w);
+    let h = (w * 0.625).min(max_h);
+    if h < w * 0.625 {
+        w = h / 0.625;
+    }
+    (w.max(1.0), h.max(1.0))
+}
+
 fn main() -> Result<()> {
     let mut host = "mm.local".to_string();
     let mut port = 5900u16;
@@ -3507,6 +3589,8 @@ fn main() -> Result<()> {
     let mut dump_after = 4u32;
     let mut exit_after_dump = false;
     let mut scale = 1.0f64;
+    let mut filter = Filter::Auto;
+    let mut window_size: Option<(f64, f64)> = None;
     let mut debug_input = false;
     // Clipboard sync is automatic and bidirectional. The 0x0b fetch is sent
     // as the full 8-byte message (a 1-byte fetch shifts the server's message
@@ -3605,6 +3689,26 @@ fn main() -> Result<()> {
             }
             "--scale" if i + 1 < args.len() => {
                 scale = args[i + 1].parse()?;
+                i += 2;
+            }
+            "--filter" if i + 1 < args.len() => {
+                filter = Filter::parse(&args[i + 1]).unwrap_or_else(|| {
+                    eprintln!("unknown --filter {:?}; expected auto, nearest, box or bilinear", args[i + 1]);
+                    std::process::exit(2);
+                });
+                i += 2;
+            }
+            "--window-size" if i + 1 < args.len() => {
+                let raw = &args[i + 1];
+                let (w, h) = raw
+                    .split_once('x')
+                    .and_then(|(w, h)| Some((w.parse::<f64>().ok()?, h.parse::<f64>().ok()?)))
+                    .filter(|(w, h)| *w > 0.0 && *h > 0.0)
+                    .unwrap_or_else(|| {
+                        eprintln!("--window-size {raw:?}: expected WxH, e.g. 1600x1000");
+                        std::process::exit(2);
+                    });
+                window_size = Some((w, h));
                 i += 2;
             }
             "--debug-input" => {
@@ -4549,6 +4653,8 @@ fn main() -> Result<()> {
         dump_after,
         exit_after_dump,
         debug_input,
+        filter,
+        window_size,
         ime,
         exit_after_secs.map(|s| Instant::now() + Duration::from_secs_f64(s)),
         demo_cursor,
@@ -4856,4 +4962,23 @@ mod tests {
             Some(Key::Named(NamedKey::Escape))
         ));
     }
+
+    #[test]
+    fn window_size_prefers_one_to_one_when_it_fits() {
+        // 2880x1800 at scale 2: the 2560x1600 framebuffer is 1280x800 points.
+        assert_eq!(choose_window_size(2560, 1600, 2.0, 2880, 1800), (1280.0, 800.0));
+        // 3840x2160 at scale 1: the framebuffer fits exactly.
+        assert_eq!(choose_window_size(2560, 1600, 1.0, 3840, 2160), (2560.0, 1600.0));
+    }
+
+    #[test]
+    fn window_size_uses_a_16_10_fit_on_a_smaller_monitor() {
+        // 1920x1080 at scale 1: 95% is 1824x1026, so 1600x1000 fits.
+        assert_eq!(choose_window_size(2560, 1600, 1.0, 1920, 1080), (1600.0, 1000.0));
+        // 1280x800 at scale 1: clamp to 95% and keep 16:10.
+        let (w, h) = choose_window_size(2560, 1600, 1.0, 1280, 800);
+        assert!((w - 1216.0).abs() < 0.01 && (h - 760.0).abs() < 0.01);
+        assert!((w / h - 1.6).abs() < 0.001);
+    }
+
 }
