@@ -41,6 +41,12 @@ pub fn supported() -> bool {
     cfg!(target_os = "macos")
 }
 
+/// Whether [`note`] records anything here. Guard hot-path calls with this so
+/// the `format!` argument is compiled away on platforms without a grab.
+pub const fn note_enabled() -> bool {
+    cfg!(target_os = "macos")
+}
+
 #[cfg(target_os = "macos")]
 mod macos;
 #[cfg(target_os = "macos")]

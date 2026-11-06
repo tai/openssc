@@ -667,6 +667,7 @@ fn local_clipboard_image() -> Option<(&'static str, Vec<u8>)> {
 /// bytes (`public.png`/`public.tiff`/`public.jpeg`), so write them to a temp
 /// file and let the platform clipboard service take the file's contents.
 fn set_local_clipboard_image(uti: &str, data: &[u8]) {
+    #[cfg_attr(not(target_os = "macos"), allow(unused_variables))]
     let (ext, class) = match uti {
         "public.tiff" => ("tiff", "TIFF"),
         "public.jpeg" => ("jpg", "JPEG"),
@@ -896,7 +897,9 @@ impl Decoder {
         let applied = {
             let Self { mvs, mvs_bytes, .. } = self;
             let Some(dec) = mvs.as_mut() else { return };
-            grab::note(&format!("mvs apply {}x{}+{}+{}", r.w, r.h, r.x, r.y));
+            if grab::note_enabled() {
+                grab::note(&format!("mvs apply {}x{}+{}+{}", r.w, r.h, r.x, r.y));
+            }
             match dec.apply(&r.pixels, rect, mvs_bytes) {
                 Ok(Some(stats)) => {
                     if debug {
