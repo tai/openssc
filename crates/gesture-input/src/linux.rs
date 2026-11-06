@@ -22,10 +22,11 @@ use std::sync::{Arc, Weak};
 use std::thread;
 use std::time::{Duration, Instant};
 
+pub mod keyboard;
+
 const EV_SYN: u16 = 0;
 const SYN_REPORT: u16 = 0;
-const EV_ABS: u16 = 3;
-const ABS_MT_SLOT: u16 = 0x2f;
+const EV_ABS: u16 = 3;const ABS_MT_SLOT: u16 = 0x2f;
 const ABS_MT_TRACKING_ID: u16 = 0x39;
 const ABS_MT_POSITION_X: u16 = 0x35;
 const ABS_MT_POSITION_Y: u16 = 0x36;
@@ -89,6 +90,11 @@ pub enum DeviceEvent {
     /// units. Only emitted while grabbed: the compositor still owns the
     /// pointer otherwise and would move it too.
     Pointer { dx: f32, dy: f32 },
+    /// A raw keyboard key from the grabbed keyboard (`value` 0=up, 1=down,
+    /// 2=repeat). The GUI owns keycode translation; this crate never logs it.
+    Key { code: u16, down: bool, repeat: bool },
+    /// The LeftCtrl+LeftAlt+Esc release chord completed.
+    ReleaseChord,
 }
 
 #[derive(Debug, Clone)]
@@ -126,11 +132,20 @@ struct DeviceInner {
     grabbed: Arc<AtomicBool>,
     last_beat_ms: AtomicU64,
     watchdog_started: AtomicBool,
+    /// "trackpad" or "keyboard"; only used in the one-line grab/release log.
+    role: &'static str,
+    /// Called before the grab is released, on every release path. Keyboard
+    /// sessions use it to send key-ups and modifier releases to the remote
+    /// even when the watchdog, not the GUI, is releasing.
+    on_release: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 impl Drop for DeviceInner {
     fn drop(&mut self) {
         if self.grabbed.load(Ordering::SeqCst) {
+            if let Some(on_release) = &self.on_release {
+                on_release();
+            }
             unsafe {
                 // EVIOCGRAB's argument is the value itself, not a pointer:
                 // arg == 0 releases. Passing a pointer to zero is EBUSY.
@@ -172,6 +187,13 @@ impl DeviceHandle {
         if self.inner.grabbed.load(Ordering::SeqCst) == on {
             return Ok(());
         }
+        if !on {
+            // Send key-ups while the grab is still held, so the remote cannot
+            // keep a modifier down if the release itself fails.
+            if let Some(on_release) = &self.inner.on_release {
+                on_release();
+            }
+        }
         let value: libc::c_ulong = if on { 1 } else { 0 };
         let rc = unsafe {
             // EVIOCGRAB's argument is the value itself, not a pointer. A
@@ -189,14 +211,16 @@ impl DeviceHandle {
         if on {
             self.inner.last_beat_ms.store(now_ms(), Ordering::Relaxed);
             eprintln!(
-                "evdev: grabbed {} ({})",
+                "evdev: {} grabbed {} ({})",
+                self.inner.role,
                 self.inner.name,
                 self.inner.path.display()
             );
             self.start_watchdog();
         } else {
             eprintln!(
-                "evdev: released {} ({})",
+                "evdev: {} released {} ({})",
+                self.inner.role,
                 self.inner.name,
                 self.inner.path.display()
             );
@@ -439,6 +463,8 @@ where
         grabbed: grabbed.clone(),
         last_beat_ms: AtomicU64::new(now_ms()),
         watchdog_started: AtomicBool::new(false),
+        role: "trackpad",
+        on_release: None,
     });
     let device = DeviceHandle { inner };
     thread::Builder::new()

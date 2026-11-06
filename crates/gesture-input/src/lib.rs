@@ -712,6 +712,8 @@ pub fn scroll_to_wheel(dx: f32, dy: f32) -> (i16, i16) {
 #[cfg(target_os = "linux")]
 pub mod linux;
 
+pub mod chord;
+
 #[cfg(test)]
 mod tests {
     use super::*;

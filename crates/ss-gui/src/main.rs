@@ -491,6 +491,8 @@ Input and keyboard:
   --ime                    enable IME; composed text arrives via Ime::Commit
   --evdev                  Linux only: raw multitouch gestures from /dev/input
   --grab-trackpad          Linux: grab the trackpad while focused (needs --evdev)
+  --grab-keyboard          Linux: grab the keyboard 500 ms after focus
+                           (release: hold LeftCtrl+LeftAlt+Esc for 350 ms)
   --no-grab                macOS: do not capture the keyboard; local shortcuts stay local
   --release-grab <chord>   macOS release chord, e.g. cmd+shift or ctrl+alt+cmd+esc
                            (default: hold Left-Cmd+Shift for 350 ms)
@@ -1167,6 +1169,149 @@ fn touch_phase(phase: TouchPhase) -> u32 {
     }
 }
 
+/// Linux `input-event-codes.h` keycode -> winit physical key. Only the keys a
+/// desktop keyboard needs for normal typing and navigation.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn linux_keycode_to_winit(code: u16) -> Option<KeyCode> {
+    use KeyCode as K;
+    Some(match code {
+        1 => K::Escape,
+        2 => K::Digit1,
+        3 => K::Digit2,
+        4 => K::Digit3,
+        5 => K::Digit4,
+        6 => K::Digit5,
+        7 => K::Digit6,
+        8 => K::Digit7,
+        9 => K::Digit8,
+        10 => K::Digit9,
+        11 => K::Digit0,
+        12 => K::Minus,
+        13 => K::Equal,
+        14 => K::Backspace,
+        15 => K::Tab,
+        16 => K::KeyQ,
+        17 => K::KeyW,
+        18 => K::KeyE,
+        19 => K::KeyR,
+        20 => K::KeyT,
+        21 => K::KeyY,
+        22 => K::KeyU,
+        23 => K::KeyI,
+        24 => K::KeyO,
+        25 => K::KeyP,
+        26 => K::BracketLeft,
+        27 => K::BracketRight,
+        28 => K::Enter,
+        29 => K::ControlLeft,
+        30 => K::KeyA,
+        31 => K::KeyS,
+        32 => K::KeyD,
+        33 => K::KeyF,
+        34 => K::KeyG,
+        35 => K::KeyH,
+        36 => K::KeyJ,
+        37 => K::KeyK,
+        38 => K::KeyL,
+        39 => K::Semicolon,
+        40 => K::Quote,
+        41 => K::Backquote,
+        42 => K::ShiftLeft,
+        43 => K::Backslash,
+        44 => K::KeyZ,
+        45 => K::KeyX,
+        46 => K::KeyC,
+        47 => K::KeyV,
+        48 => K::KeyB,
+        49 => K::KeyN,
+        50 => K::KeyM,
+        51 => K::Comma,
+        52 => K::Period,
+        53 => K::Slash,
+        54 => K::ShiftRight,
+        55 => K::NumpadMultiply,
+        56 => K::AltLeft,
+        57 => K::Space,
+        58 => K::CapsLock,
+        59 => K::F1,
+        60 => K::F2,
+        61 => K::F3,
+        62 => K::F4,
+        63 => K::F5,
+        64 => K::F6,
+        65 => K::F7,
+        66 => K::F8,
+        67 => K::F9,
+        68 => K::F10,
+        69 => K::NumLock,
+        70 => K::ScrollLock,
+        87 => K::F11,
+        88 => K::F12,
+        97 => K::ControlRight,
+        100 => K::AltRight,
+        102 => K::Home,
+        103 => K::ArrowUp,
+        104 => K::PageUp,
+        105 => K::ArrowLeft,
+        106 => K::ArrowRight,
+        107 => K::End,
+        108 => K::ArrowDown,
+        109 => K::PageDown,
+        110 => K::Insert,
+        111 => K::Delete,
+        125 => K::SuperLeft,
+        126 => K::SuperRight,
+        _ => return None,
+    })
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn evdev_named(code: u16) -> Option<NamedKey> {
+    Some(match code {
+        1 => NamedKey::Escape,
+        14 => NamedKey::Backspace,
+        15 => NamedKey::Tab,
+        28 => NamedKey::Enter,
+        57 => NamedKey::Space,
+        59 => NamedKey::F1,
+        60 => NamedKey::F2,
+        61 => NamedKey::F3,
+        62 => NamedKey::F4,
+        63 => NamedKey::F5,
+        64 => NamedKey::F6,
+        65 => NamedKey::F7,
+        66 => NamedKey::F8,
+        67 => NamedKey::F9,
+        68 => NamedKey::F10,
+        87 => NamedKey::F11,
+        88 => NamedKey::F12,
+        102 => NamedKey::Home,
+        103 => NamedKey::ArrowUp,
+        104 => NamedKey::PageUp,
+        105 => NamedKey::ArrowLeft,
+        106 => NamedKey::ArrowRight,
+        107 => NamedKey::End,
+        108 => NamedKey::ArrowDown,
+        109 => NamedKey::PageDown,
+        110 => NamedKey::Insert,
+        111 => NamedKey::Delete,
+        _ => return None,
+    })
+}
+
+/// Build the logical key from a raw evdev code using the local US table. The
+/// remote layout then resolves the character through `character_keysym`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn evdev_logical(code: u16, win: Option<KeyCode>, shift: bool) -> Option<Key> {
+    if let Some(named) = evdev_named(code) {
+        return Some(Key::Named(named));
+    }
+    let win = win?;
+    let (plain, shifted) = US.row(win)?;
+    let c = if shift { shifted } else { plain };
+    Some(Key::Character(c.to_string().into()))
+}
+
 #[derive(Debug, Clone)]
 enum UserEvent {
     Refresh,
@@ -1178,6 +1323,12 @@ enum UserEvent {
     /// One-finger trackpad motion from the evdev reader while grabbed.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EvdevPointer { dx: f32, dy: f32 },
+    /// A raw key from the grabbed evdev keyboard.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    EvdevKey { code: u16, down: bool, repeat: bool },
+    /// LeftCtrl+LeftAlt+Esc completed on the grabbed evdev keyboard.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    EvdevReleaseChord,
 }
 
 struct App {
@@ -1234,6 +1385,17 @@ struct App {
     evdev_grab: Option<platform::evdev::GrabHandle>,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
     grab_trackpad: bool,
+    /// Raw evdev keyboard handle, when `--grab-keyboard` opened one.
+    evdev_keyboard: Option<platform::evdev::GrabHandle>,
+    /// Wire keysyms currently down on the grabbed keyboard.
+    evdev_keys_down: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+    /// `--grab-keyboard`: request the grab on focus.
+    grab_keyboard: bool,
+    /// The evdev keyboard is currently captured.
+    keyboard_grabbed: bool,
+    /// `--grab-keyboard` arms 500 ms after focus, so the window is visible
+    /// before keys stop reaching the desktop.
+    keyboard_grab_at: Option<Instant>,
     /// The release chord fired: stay ungrabbed until focus is lost and
     /// regained (the user pressed it because something was wrong).
     grab_suspended: bool,
@@ -1261,6 +1423,8 @@ struct App {
     debug_input: bool,
     ime: bool,
     focused_once: bool,
+    /// Last known window focus state, used to keep the grab indicator title.
+    window_focused: bool,
     deadline: Option<Instant>,
     /// Sub-line scroll remainder, so small pixel deltas still accumulate.
     scroll_rem: (f32, f32),
@@ -1325,6 +1489,9 @@ impl App {
         grab: Option<grab::Grab>,
         evdev_grab: Option<platform::evdev::GrabHandle>,
         grab_trackpad: bool,
+        evdev_keyboard: Option<platform::evdev::GrabHandle>,
+        evdev_keys_down: Option<Arc<std::sync::Mutex<Vec<u32>>>>,
+        grab_keyboard: bool,
         scroll_test: String,
         frame_slot: Arc<std::sync::Mutex<Option<Frame>>>,
         coast: bool,
@@ -1365,6 +1532,11 @@ impl App {
             grab,
             evdev_grab,
             grab_trackpad,
+            evdev_keyboard,
+            evdev_keys_down,
+            grab_keyboard,
+            keyboard_grabbed: false,
+            keyboard_grab_at: None,
             grab_suspended: false,
             scroll_test,
             demo_cursor,
@@ -1388,6 +1560,7 @@ impl App {
             debug_input,
             ime,
             focused_once: false,
+            window_focused: false,
             deadline,
             scroll_rem: (0.0, 0.0),
             scroll_pending: None,
@@ -1530,7 +1703,7 @@ impl App {
                 if let Some(ks) = named_keysym(named)
                     .or_else(|| code.and_then(|code| self.keymap.special(code)))
                 {
-                    self.send(key_event(ks, pressed));
+                    self.send_key(ks, pressed);
                 } else if pressed && !repeat {
                     eprintln!(
                         "key: unmapped named {named:?} (physical {:?})",
@@ -1574,7 +1747,7 @@ impl App {
                         }
                         text_keysym(c)
                     });
-                    self.send(key_event(ks, pressed));
+                    self.send_key(ks, pressed);
                 }
             }
             // Dead keys and unidentified keys have no character; send
@@ -1583,7 +1756,7 @@ impl App {
                 self.keymap
                     .wire_keysym(code, self.modifiers.shift_key())
             }) {
-                Some(ks) => self.send(key_event(ks, pressed)),
+                Some(ks) => self.send_key(ks, pressed),
                 None => {
                     if pressed && !repeat {
                         eprintln!(
@@ -1628,6 +1801,83 @@ impl App {
                 self.forwarded_mods.remove(*bit);
             }
         }
+    }
+
+    fn send_key(&mut self, keysym: u32, pressed: bool) {
+        if self.grab_keyboard || self.keyboard_grabbed {
+            if let Some(down) = &self.evdev_keys_down {
+                let mut down = down.lock().unwrap_or_else(|e| e.into_inner());
+                if pressed {
+                    if !down.contains(&keysym) {
+                        down.push(keysym);
+                    }
+                } else {
+                    down.retain(|&k| k != keysym);
+                }
+            }
+        }
+        self.send(key_event(keysym, pressed));
+    }
+
+    /// Send key-ups for everything the grabbed keyboard left down, release the
+    /// modifiers, and update the title. Safe to call more than once.
+    fn release_evdev_keyboard(&mut self, _reason: &str) {
+        if let Some(down) = &self.evdev_keys_down {
+            let mut down = down.lock().unwrap_or_else(|e| e.into_inner());
+            for keysym in down.drain(..) {
+                self.send(key_event(keysym, false));
+            }
+        }
+        self.sync_modifiers(ModifiersState::empty());
+        self.modifiers = ModifiersState::empty();
+        self.keyboard_grabbed = false;
+        self.keyboard_grab_at = None;
+        self.update_title();
+    }
+
+    fn update_title(&self) {
+        let Some(window) = &self.window else { return };
+        if self.keyboard_grabbed {
+            window.set_title("ss-clone — keyboard grabbed: Ctrl+Alt+Esc to release");
+        } else if self.window_focused {
+            window.set_title("ss-clone — Apple Screen Sharing");
+        } else {
+            window.set_title("ss-clone — click to focus");
+        }
+    }
+
+    /// Translate one raw evdev key through the same keymap the winit path
+    /// uses. `--grab-keyboard` assumes the local layout matches the remote
+    /// `--keymap` (US by default); the evdev API has no composed character.
+    fn handle_evdev_key(&mut self, code: u16, down: bool, repeat: bool) {
+        let bit = match code {
+            29 | 97 => ModifiersState::CONTROL,
+            56 | 100 => ModifiersState::ALT,
+            42 | 54 => ModifiersState::SHIFT,
+            125 | 126 => ModifiersState::SUPER,
+            _ => ModifiersState::empty(),
+        };
+        if !bit.is_empty() {
+            if down {
+                self.modifiers.insert(bit);
+            } else {
+                self.modifiers.remove(bit);
+            }
+            self.sync_modifiers(self.modifiers);
+            return;
+        }
+        // CapsLock / NumLock / ScrollLock have no wire keysym in this model.
+        if matches!(code, 58 | 69 | 70) {
+            return;
+        }
+        let win = linux_keycode_to_winit(code);
+        let Some(logical) = evdev_logical(code, win, self.modifiers.shift_key()) else {
+            if down && !repeat {
+                eprintln!("key: unsupported evdev keycode {code}");
+            }
+            return;
+        };
+        self.handle_key(win, &logical, down, repeat);
     }
 
     /// Cmd+Shift+V: pull the file/folder named on the remote clipboard.
@@ -2310,6 +2560,17 @@ impl ApplicationHandler<UserEvent> for App {
                     self.flush_pointer(true);
                 }
             }
+            UserEvent::EvdevKey { code, down, repeat } => {
+                self.handle_evdev_key(code, down, repeat);
+            }
+            UserEvent::EvdevReleaseChord => {
+                if let Some(keyboard) = &self.evdev_keyboard {
+                    if let Err(e) = keyboard.set_grabbed(false) {
+                        eprintln!("evdev keyboard: release failed: {e}");
+                    }
+                }
+                self.release_evdev_keyboard("release chord");
+            }
         }
     }
 
@@ -2356,6 +2617,7 @@ impl ApplicationHandler<UserEvent> for App {
                 }
             }
             WindowEvent::Focused(focused) => {
+                self.window_focused = focused;
                 if self.debug_input {
                     eprintln!("window focused={focused}");
                 }
@@ -2379,6 +2641,22 @@ impl ApplicationHandler<UserEvent> for App {
                         }
                     }
                 }
+                if focused && self.grab_keyboard && self.evdev_keyboard.is_some() {
+                    // Do not steal the keyboard the instant focus lands: give
+                    // the human half a second to see the window first.
+                    self.keyboard_grab_at =
+                        Some(Instant::now() + Duration::from_millis(500));
+                } else if !focused {
+                    self.keyboard_grab_at = None;
+                    if self.keyboard_grabbed {
+                        if let Some(keyboard) = &self.evdev_keyboard {
+                            if let Err(e) = keyboard.set_grabbed(false) {
+                                eprintln!("evdev keyboard: release on blur failed: {e}");
+                            }
+                        }
+                        self.release_evdev_keyboard("blur");
+                    }
+                }
                 if !focused {
                     // Re-arm the chord on the next focus, and never leave a
                     // modifier down on the remote when focus leaves us.
@@ -2386,13 +2664,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.modifiers = ModifiersState::empty();
                     self.sync_modifiers(ModifiersState::empty());
                 }
-                if let Some(w) = &self.window {
-                    w.set_title(if focused {
-                        "ss-clone — Apple Screen Sharing"
-                    } else {
-                        "ss-clone — click to focus"
-                    });
-                }
+                self.update_title();
             }
             WindowEvent::Ime(Ime::Enabled) => {
                 if self.debug_input {
@@ -2645,6 +2917,36 @@ impl ApplicationHandler<UserEvent> for App {
         grab::beat_ui();
         if let Some(evdev) = &self.evdev_grab {
             evdev.beat();
+        }
+        if let Some(keyboard) = &self.evdev_keyboard {
+            keyboard.beat();
+            if let Some(at) = self.keyboard_grab_at {
+                if Instant::now() >= at {
+                    self.keyboard_grab_at = None;
+                    if self.window_focused {
+                        let was_grabbed = self.keyboard_grabbed;
+                        self.keyboard_grabbed = true;
+                        match keyboard.set_grabbed(true) {
+                            Ok(()) => {
+                                self.update_title();
+                            }
+                            Err(e) => {
+                                self.keyboard_grabbed = was_grabbed;
+                                eprintln!("evdev keyboard: cannot grab: {e}");
+                            }
+                        }
+                    }
+                }
+            }
+            if self.keyboard_grabbed && !keyboard.is_grabbed() {
+                // The watchdog released it (or the device went away). The
+                // release callback already sent key-ups; just clear local state.
+                eprintln!("evdev keyboard: grab is no longer active");
+                self.keyboard_grabbed = false;
+                self.modifiers = ModifiersState::empty();
+                self.forwarded_mods = ModifiersState::empty();
+                self.update_title();
+            }
         }
         if self.want_cursor_hidden && !self.cursor_hidden {
             if let Some(w) = &self.window {
@@ -2911,21 +3213,28 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
         } else if !self.demo_cursor {
-            // While a grab is active, keep waking so the watchdog can tell
-            // "idle" from "wedged". An idle app that never ticks is
-            // indistinguishable from a hung one, and the watchdog would then
-            // release a perfectly healthy grab.
+            // While a grab is active (or arming), keep waking so the
+            // watchdogs can tell "idle" from "wedged", and so the delayed
+            // keyboard grab fires even if no window event arrives.
             let trackpad_grabbed = self
                 .evdev_grab
                 .as_ref()
                 .map(|grab| grab.is_grabbed())
                 .unwrap_or(false);
-            if grab::is_active() || trackpad_grabbed {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(
-                    Instant::now() + Duration::from_millis(400),
-                ));
+            let mut wake_at = if grab::is_active()
+                || trackpad_grabbed
+                || self.keyboard_grabbed
+            {
+                Some(Instant::now() + Duration::from_millis(400))
             } else {
-                event_loop.set_control_flow(ControlFlow::Wait);
+                None
+            };
+            if let Some(at) = self.keyboard_grab_at {
+                wake_at = Some(wake_at.map_or(at, |w| w.min(at)));
+            }
+            match wake_at {
+                Some(at) => event_loop.set_control_flow(ControlFlow::WaitUntil(at)),
+                None => event_loop.set_control_flow(ControlFlow::Wait),
             }
         }
         if self.rotate_active
@@ -3027,6 +3336,14 @@ impl ApplicationHandler<UserEvent> for App {
                 eprintln!("evdev: release on exit failed: {e}");
             }
         }
+        if self.keyboard_grabbed {
+            if let Some(keyboard) = &self.evdev_keyboard {
+                if let Err(e) = keyboard.set_grabbed(false) {
+                    eprintln!("evdev keyboard: release on exit failed: {e}");
+                }
+            }
+            self.release_evdev_keyboard("exit");
+        }
         self.modifiers = ModifiersState::empty();
         self.sync_modifiers(ModifiersState::empty());
         // softbuffer's Wayland context borrows winit's `wl_display`. tear it
@@ -3047,6 +3364,9 @@ fn main() -> Result<()> {
     // Explicit opt-in: grab the trackpad device only while the window is
     // focused. Requires --evdev; never enabled implicitly.
     let mut grab_trackpad = false;
+    // Explicit opt-in: grab the keyboard after a short focus delay. Needs the
+    // Apple keyboard's uaccess ACL; this is deliberately separate from --evdev.
+    let mut grab_keyboard = false;
     let mut dump_path: Option<String> = None;
     let mut dump_after = 4u32;
     let mut exit_after_dump = false;
@@ -3129,6 +3449,10 @@ fn main() -> Result<()> {
             }
             "--grab-trackpad" => {
                 grab_trackpad = true;
+                i += 1;
+            }
+            "--grab-keyboard" => {
+                grab_keyboard = true;
                 i += 1;
             }
             "--dump" if i + 1 < args.len() => {
@@ -3524,6 +3848,10 @@ fn main() -> Result<()> {
 
     #[allow(unused_mut)]
     let mut evdev_grab: Option<platform::evdev::GrabHandle> = None;
+    #[allow(unused_mut)]
+    let mut evdev_keyboard: Option<platform::evdev::GrabHandle> = None;
+    #[allow(unused_mut)]
+    let mut evdev_keys_down: Option<Arc<std::sync::Mutex<Vec<u32>>>> = None;
     if evdev {
         #[cfg(target_os = "linux")]
         {
@@ -3547,6 +3875,7 @@ fn main() -> Result<()> {
                         }
                         let _ = evdev_proxy.send_event(UserEvent::EvdevPointer { dx, dy });
                     }
+                    _ => {}
                 },
                 debug,
             ) {
@@ -3566,6 +3895,58 @@ fn main() -> Result<()> {
     }
     if grab_trackpad && !evdev {
         eprintln!("--grab-trackpad requires --evdev; not grabbing");
+    }
+
+    if grab_keyboard {
+        #[cfg(target_os = "linux")]
+        {
+            let down = Arc::new(std::sync::Mutex::new(Vec::<u32>::new()));
+            let keys_down = down.clone();
+            let tx = tx_out.clone();
+            let on_release: Arc<dyn Fn() + Send + Sync> = Arc::new(move || {
+                let mut down = keys_down.lock().unwrap_or_else(|e| e.into_inner());
+                for keysym in down.drain(..) {
+                    let _ = tx.send(key_event(keysym, false));
+                }
+                // The chord/release must never leave a modifier stuck on the
+                // remote, even if the UI never got to process the key-ups.
+                for keysym in [0xffe1u32, 0xffe3, 0xffe7, 0xffeb] {
+                    let _ = tx.send(key_event(keysym, false));
+                }
+            });
+            let keyboard_proxy = proxy.clone();
+            match gesture_input::linux::keyboard::spawn_keyboard(
+                move |event| match event {
+                    gesture_input::linux::DeviceEvent::Key { code, down, repeat } => {
+                        let _ = keyboard_proxy.send_event(UserEvent::EvdevKey {
+                            code,
+                            down,
+                            repeat,
+                        });
+                    }
+                    gesture_input::linux::DeviceEvent::ReleaseChord => {
+                        let _ = keyboard_proxy.send_event(UserEvent::EvdevReleaseChord);
+                    }
+                    _ => {}
+                },
+                debug_input,
+                on_release,
+            ) {
+                Ok(keyboard) => {
+                    eprintln!(
+                        "evdev keyboard: using {} (local layout assumed US)",
+                        keyboard.info
+                    );
+                    evdev_keyboard = Some(keyboard.handle);
+                    evdev_keys_down = Some(down);
+                }
+                Err(e) => eprintln!("evdev keyboard: {e}"),
+            }
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            eprintln!("--grab-keyboard is Linux-only");
+        }
     }
 
     if push {
@@ -4039,6 +4420,9 @@ fn main() -> Result<()> {
         grab,
         evdev_grab,
         grab_trackpad,
+        evdev_keyboard,
+        evdev_keys_down,
+        grab_keyboard,
         scroll_test,
         frame_slot.clone(),
         coast,
@@ -4278,5 +4662,30 @@ mod tests {
             &mut state,
         );
         assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 250, 600)]);
+    }
+
+    #[test]
+    fn evdev_keycodes_map_to_the_same_characters_as_winit() {
+        assert_eq!(linux_keycode_to_winit(28), Some(KeyCode::Enter));
+        assert!(matches!(
+            evdev_logical(30, Some(KeyCode::KeyA), false),
+            Some(Key::Character(ref s)) if s.as_str() == "a"
+        ));
+        assert!(matches!(
+            evdev_logical(30, Some(KeyCode::KeyA), true),
+            Some(Key::Character(ref s)) if s.as_str() == "A"
+        ));
+        assert!(matches!(
+            evdev_logical(3, Some(KeyCode::Digit2), true),
+            Some(Key::Character(ref s)) if s.as_str() == "@"
+        ));
+        assert!(matches!(
+            evdev_logical(39, Some(KeyCode::Semicolon), true),
+            Some(Key::Character(ref s)) if s.as_str() == ":"
+        ));
+        assert!(matches!(
+            evdev_logical(1, Some(KeyCode::Escape), false),
+            Some(Key::Named(NamedKey::Escape))
+        ));
     }
 }
