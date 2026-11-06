@@ -968,6 +968,19 @@ impl Decoder {
 /// Hand the changed region to the UI. The region is the union of everything
 /// changed since the UI last took a frame, so replacing an unconsumed frame
 /// never loses content: the next publish covers both.
+/// A copy of `u` without its encoded rects, for the UI's metadata channel.
+fn update_for_meta(u: &Update) -> Update {
+    Update {
+        rects: Vec::new(),
+        display: u.display,
+        cursor: u.cursor.clone(),
+        cursor_position: u.cursor_position,
+        clipboard: u.clipboard.clone(),
+        clipboard_changed: u.clipboard_changed,
+        filecopy: u.filecopy.clone(),
+    }
+}
+
 fn publish_frame(dec: &mut Decoder, slot: &std::sync::Mutex<Option<Frame>>) {
     let Some(mut region) = dec.dirty.take() else {
         return;
@@ -3277,6 +3290,11 @@ fn main() -> Result<()> {
     // replaying a backlog.
     let frame_slot: Arc<std::sync::Mutex<Option<Frame>>> =
         Arc::new(std::sync::Mutex::new(None));
+    // Reader -> decoder handoff. The reader must never decode: while it decodes
+    // it is not draining the socket, the TCP window closes and the server
+    // stalls, which is what made the picture lag the remote by hundreds of ms.
+    // MVS bodies are stateful, so nothing may be dropped here - order matters.
+    let (tx_decode, rx_decode) = mpsc::channel::<Update>();
 
     // File copy: received items always land in ~/Downloads; dropped files are
     // sent to /Users/<remote user>/Downloads (the native client's shape).
@@ -3469,6 +3487,22 @@ fn main() -> Result<()> {
     let reader_proxy = proxy.clone();
     let frame_slot_reader = frame_slot.clone();
     let debug_reader = debug_input;
+    // Decoder thread: owns the session decoder, applies bodies in arrival
+    // order and publishes whole frames for the UI. It never touches the
+    // socket.
+    {
+        let frame_slot_dec = frame_slot.clone();
+        let debug_dec = debug_input;
+        thread::spawn(move || {
+            let mut decoder = Decoder::new(fb_w, fb_h, mvs, debug_dec);
+            for update in rx_decode {
+                for r in &update.rects {
+                    decoder.apply(r);
+                }
+                publish_frame(&mut decoder, &frame_slot_dec);
+            }
+        });
+    }
     thread::spawn(move || {
         let mut reader = reader;
         let mut decoder = Decoder::new(fb_w, fb_h, mvs, debug_reader);
@@ -3653,16 +3687,13 @@ fn main() -> Result<()> {
                         .rects
                         .iter()
                         .any(|r| r.encoding == 0x3f3 && r.w == fb_w && r.h == fb_h);
-                    // Decode here, on the reader thread: an MVS rect can be
-                    // 12,000 DCT blocks, and doing that on the event loop
-                    // starved the window. The UI gets a ready frame.
-                    for r in &update.rects {
-                        decoder.apply(r);
+                    // The UI only needs the metadata, not the encoded rects.
+                    let meta = update_for_meta(&update);
+                    // Hand off instead of decoding here: the decoder runs on
+                    // its own thread so this thread keeps draining the socket.
+                    if tx_decode.send(update).is_err() {
+                        break;
                     }
-                    publish_frame(&mut decoder, &frame_slot_reader);
-                    // The UI has no use for the encoded rects any more.
-                    let mut meta = update;
-                    meta.rects.clear();
                     if tx_upd.send(meta).is_err() {
                         break;
                     }
