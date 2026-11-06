@@ -34,6 +34,7 @@ use winit::window::{Window, WindowId};
 use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 
 mod filecopy;
+mod platform;
 
 #[cfg(target_os = "macos")]
 mod grab;
