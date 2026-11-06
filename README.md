@@ -27,7 +27,7 @@ rather than judged by eye.
 | File copy both directions | verified (drop to send, `Cmd+Shift+V` to pull) |
 | Keyboard grab so local shortcuts reach the remote | verified |
 | Visual latency vs `Screen Sharing.app` | on par (measured, see below) |
-| Linux/Wayland | code paths exist and the evdev backend is tested; **never run end to end on Linux** |
+| Linux/Wayland | builds, connects, decodes and paints end to end (smoke test, 2026-11-06); input/gestures/clipboard not yet verified on Linux |
 
 ## Quick start (macOS lab)
 
@@ -109,7 +109,9 @@ docs/protocol/            verified protocol documentation
 docs/findings/            dated experiment notes
 tools/probe/              Python reference clients and probes
 tools/instrument/         event injection and framework introspection helpers
-tools/measure/            latency harness: scroll injector, camera A/B, analysis
+tools/measure/            latency harness: camera A/B, scroll, decode backlog,
+                          Wayland smoke test and PNG probe
+packaging/                .desktop entry, launcher, icon, user installer
 crates/rfb-proto/         portable protocol crate (no I/O, no OS types)
 crates/ss-client/         CLI client (probe/snapshot/input/gestures)
 crates/ss-gui/            winit + softbuffer frontend
@@ -119,25 +121,96 @@ captures/, artifacts/     untracked captures and test fixtures
 
 ## Linux/Wayland
 
-`rfb-proto`, `ss-client` and `ss-gui` are platform-neutral. `ss-gui` uses
-`winit` + `softbuffer`, which select the native Wayland backend on Linux and
-CoreGraphics on macOS.
+Linux/Wayland is the target platform; the macOS lab is the development harness.
+As of 2026-11-06 the client builds and runs natively on Wayland: release build,
+Apple auth, MVS decode, a 2560×1600 paint and a compositor-presented window were
+measured on Arch/Hyprland against `mm.local`. Input, gestures and clipboard have
+not yet been verified on Linux. Method, numbers and caveats:
+[`docs/testing.md` §9](docs/testing.md#9-linuxwayland).
+
+### Build
 
 ```sh
+export PATH="$HOME/.cargo/bin:$PATH"   # rustup installs user-space
 cargo build --release -p ss-gui
-./target/release/ss-gui --host <linux-host> --user tai --password <password> --mvs
-
-# raw evdev multitouch (requires input group access)
-sudo usermod -aG input "$USER"   # then log out/in
-./target/release/ss-gui --host <linux-host> --evdev
+cargo test --workspace
 ```
 
-Typical Debian/Ubuntu build dependencies: `libwayland-dev`, `libxkbcommon-dev`,
-`libx11-xcb-dev`, `libxcb1-dev`, `libxkbcommon-x11-dev`; runtime packages
-include `libwayland-client0` and `libxkbcommon0`.
+Build requirements are **Rust 1.97+ and a C linker** (`build-essential` on
+Debian, `base-devel` on Arch), plus a normal glibc. No `-dev` packages are
+needed: `winit`/`softbuffer` load Wayland, X11 and xkbcommon with `dlopen` at
+runtime. The old list of `libwayland-dev`, `libxkbcommon-dev`, `libx11-xcb-dev`
+and friends was a runtime list mislabelled as build dependencies.
 
-This has not been exercised end to end on a Linux host yet. It is the last
-unwalked mile for the actual target platform, and the most valuable next step.
+Runtime libraries (measured with `ldd`, `readelf -d` and `LD_DEBUG=libs`):
+
+| library | Debian/Ubuntu | Arch |
+|---|---|---|
+| `libc.so.6`, `libm.so.6` | `libc6` | `glibc` |
+| `libgcc_s.so.1` | `libgcc-s1` | `libgcc` (older: `gcc-libs`) |
+| `libwayland-client.so.0` | `libwayland-client0` | `wayland` |
+| `libxkbcommon.so.0` | `libxkbcommon0` | `libxkbcommon` |
+| `libX11.so.6`, `libX11-xcb.so.1`, `libxcb.so.1` | `libx11-6`, `libx11-xcb1`, `libxcb1` | `libx11`, `libxcb` |
+
+The X11 libraries are loaded by the same winit build even under Wayland; the
+Wayland path needs `libwayland-client` and `libxkbcommon`. Clipboard sync shells
+out to `wl-copy`/`wl-paste` from `wl-clipboard`; without it the session still
+works but local clipboard sync is silently absent.
+
+### Run
+
+```sh
+./target/release/ss-gui --host mm.local --mvs
+```
+
+`--mvs` is the fast path; without it the client advertises Zlib (6), the slow
+path. A Wayland session started from ssh needs both variables exported:
+
+```sh
+export WAYLAND_DISPLAY=wayland-1
+export XDG_RUNTIME_DIR=/run/user/1000
+```
+
+### Verify without a camera
+
+```sh
+tools/measure/wayland-smoke.sh              # build + connect + paint + grim, if present
+tools/measure/wayland-smoke.sh --no-grim    # headless
+env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
+  tools/measure/wayland-smoke.sh --no-grim  # private headless weston
+```
+
+The script builds release, dumps six painted frames with the built-in
+`--dump`/`--dump-after` path, decodes the PNG with stdlib Python (geometry, byte
+floor, distinct colours), requires a clean exit, and in a real session captures
+the window with grim before closing it. It proves build/connect/paint/present/
+teardown; it does not prove input, gestures, clipboard, frame rate or latency.
+
+### Desktop entry
+
+```sh
+./packaging/install.sh                  # ~/.local, builds first
+./packaging/install.sh --no-build       # install the existing release binary
+```
+
+The entry launches `ss-clone-launch`, which always passes `--mvs`, logs stderr to
+`${XDG_STATE_HOME:-~/.local/state}/ss-clone/ss-gui.log`, and notifies on a
+failed connect. Set `SS_HOST` in the environment or in
+`~/.config/ss-clone/config`.
+
+### Not on Wayland yet
+
+- **No keyboard grab.** macOS's `CGEventTap` and release chord have no Wayland
+  equivalent; the log says `grab: not available on this platform`.
+- **No window geometry pinning or `focus_window`.** The compositor owns
+  placement and focus, so the macOS camera A/B's pinned rectangles cannot be
+  reproduced here. `--dump` is the geometry-independent check.
+- **Raw evdev is partial.** `--evdev` reads MT-protocol-B without grabbing, but
+  this host's user cannot open `/dev/input/event*` (no `input` group), so it was
+  not exercised; `EVIOCGRAB`, udev-based discovery, a release chord and a
+  keyboard grab are the next phase. The prerequisites and escape-chord
+  constraints are written down in
+  [`docs/findings/2026-11-06-evdev-prerequisites.md`](docs/findings/2026-11-06-evdev-prerequisites.md).
 
 The GUI also accepts `Ctrl+Alt+Arrow` to emit a synthetic swipe and
 `Ctrl+Alt+=`/`-` to emit magnify, which calibrates the server without a physical

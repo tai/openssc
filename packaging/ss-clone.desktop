@@ -1,9 +1,16 @@
 [Desktop Entry]
 Type=Application
+Version=1.0
 Name=ss-clone
+GenericName=Apple Screen Sharing client
 Comment=Apple Screen Sharing client (RFB 003.889 + Apple gestures)
-Exec=sh -c 'SS_HOST=${SS_HOST:-mm.local}; exec ss-gui --host "$SS_HOST"'
-Icon=computer
+# --mvs is not optional for a desktop launch: without it the client advertises
+# Zlib (6), which this server produces at 700-880 ms/frame instead of 44-49 ms.
+Exec=ss-clone-launch
+TryExec=ss-clone-launch
+Icon=ss-clone
 Terminal=false
 Categories=Network;RemoteAccess;
+Keywords=screen sharing;vnc;rfb;apple;remote desktop;
+StartupNotify=true
 StartupWMClass=ss-gui
