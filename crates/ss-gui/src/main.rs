@@ -1159,6 +1159,7 @@ fn gesture_bodies(
     g: Gesture,
     fb_w: u16,
     fb_h: u16,
+    anchor: (u16, u16),
     state: &mut EvdevGestureState,
 ) -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -1196,17 +1197,11 @@ fn gesture_bodies(
                 out.push(gesture_begin_end(2, 0, px, py));
             }
         }
-        Gesture::Scroll { .. } => {
-            // Same synthesis as the winit path: the portable gesture model
-            // carries pixels, `scroll_message` owns every wire number.
-            let (msg, _, _, _) = scroll_message(&g, fb_w / 2, fb_h / 2, (0.0, 0.0));
-            if let Some(msg) = msg {
-                out.push(msg);
-            }
-        }
-        Gesture::Magnify { factor, phase, x, y } => {
-            let px = (x * fb_w as f32).clamp(0.0, fb_w as f32 - 1.0) as u16;
-            let py = (y * fb_h as f32).clamp(0.0, fb_h as f32 - 1.0) as u16;
+        // Scroll is handled on the GUI thread through queue_scroll so it uses
+        // the same cursor anchor, axis filter and momentum queue as winit.
+        Gesture::Scroll { .. } => {}
+        Gesture::Magnify { factor, phase, .. } => {
+            let (px, py) = anchor;
             match phase {
                 Phase::Began => {
                     out.push(gesture_magnify(0.0, 1, 31, px, py));
@@ -1226,9 +1221,8 @@ fn gesture_bodies(
                 }
             }
         }
-        Gesture::Rotate { radians, phase, x, y } => {
-            let px = (x * fb_w as f32).clamp(0.0, fb_w as f32 - 1.0) as u16;
-            let py = (y * fb_h as f32).clamp(0.0, fb_h as f32 - 1.0) as u16;
+        Gesture::Rotate { radians, phase, .. } => {
+            let (px, py) = anchor;
             match phase {
                 Phase::Began => {
                     out.push(gesture_rotate(0.0, 1, 31, px, py));
@@ -1496,6 +1490,10 @@ enum UserEvent {
     /// One-finger trackpad motion from the evdev reader while grabbed.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EvdevPointer { dx: f32, dy: f32 },
+    /// A gesture from the raw evdev reader. It is turned into wire bodies on
+    /// the GUI thread so pinch/rotate use the current remote pointer anchor.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    EvdevGesture { g: Gesture, at: Instant },
     /// A raw key from the grabbed evdev keyboard.
     #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
     EvdevKey { code: u16, down: bool, repeat: bool },
@@ -1556,6 +1554,8 @@ struct App {
     grab: Option<grab::Grab>,
     /// Raw evdev trackpad handle, when `--evdev` opened a device.
     evdev_grab: Option<platform::evdev::GrabHandle>,
+    /// Persistent begin/end state for evdev pinch and rotate.
+    evdev_gesture_state: EvdevGestureState,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
     grab_trackpad: bool,
     /// Raw evdev keyboard handle, when `--grab-keyboard` opened one.
@@ -1728,6 +1728,7 @@ impl App {
             keymap,
             grab,
             evdev_grab,
+            evdev_gesture_state: EvdevGestureState::default(),
             grab_trackpad,
             evdev_keyboard,
             evdev_keys_down,
@@ -2139,6 +2140,28 @@ impl App {
             return;
         };
         self.handle_key(win, &logical, down, repeat);
+    }
+
+    /// Turn one raw evdev gesture into wire bodies on the GUI thread. Pinch and
+    /// rotate are anchored at the current remote pointer, not at the trackpad
+    /// centroid: the server zooms around the coordinates in the message.
+    fn handle_evdev_gesture(&mut self, g: Gesture, _at: Instant) {
+        note_input();
+        if matches!(g, Gesture::Scroll { .. }) {
+            // Same queue, axis filter and cursor anchor as the winit path.
+            self.queue_scroll(g);
+            return;
+        }
+        let anchor = self.cursor;
+        for body in gesture_bodies(
+            g,
+            self.fb_w,
+            self.fb_h,
+            anchor,
+            &mut self.evdev_gesture_state,
+        ) {
+            self.send(body);
+        }
     }
 
     /// Cmd+Shift+V: pull the file/folder named on the remote clipboard.
@@ -2914,6 +2937,9 @@ impl ApplicationHandler<UserEvent> for App {
                     self.pending_pointer = Some((x, y, self.buttons));
                     self.flush_pointer(true);
                 }
+            }
+            UserEvent::EvdevGesture { g, at } => {
+                self.handle_evdev_gesture(g, at);
             }
             UserEvent::EvdevKey { code, down, repeat } => {
                 self.handle_evdev_key(code, down, repeat);
@@ -4308,19 +4334,18 @@ fn main() -> Result<()> {
     if evdev {
         #[cfg(target_os = "linux")]
         {
-            let tx = tx_out.clone();
             let debug = debug_input;
             let evdev_proxy = proxy.clone();
-            let mut gesture_state = EvdevGestureState::default();
             match gesture_input::linux::spawn_default(
                 move |event| match event {
                     gesture_input::linux::DeviceEvent::Gesture(g) => {
                         if debug {
                             eprintln!("evdev gesture {g:?}");
                         }
-                        for body in gesture_bodies(g, input_w, input_h, &mut gesture_state) {
-                            let _ = tx.send(body);
-                        }
+                        let _ = evdev_proxy.send_event(UserEvent::EvdevGesture {
+                            g,
+                            at: Instant::now(),
+                        });
                     }
                     gesture_input::linux::DeviceEvent::Pointer { dx, dy } => {
                         if debug {
@@ -5088,11 +5113,16 @@ mod tests {
             },
             1000,
             800,
+            (100, 700),
             &mut state,
         );
         assert_eq!(pinch.len(), 2, "begin + change");
-        assert_eq!(pinch[0], gesture_magnify(0.0, 1, 31, 500, 400));
-        assert_eq!(pinch[1], gesture_magnify((1.25f32 - 1.0) as f64, 2, 31, 500, 400));
+        // The anchor is the remote pointer, not the 0.5/0.5 centroid.
+        assert_eq!(pinch[0], gesture_magnify(0.0, 1, 31, 100, 700));
+        assert_eq!(
+            pinch[1],
+            gesture_magnify((1.25f32 - 1.0) as f64, 2, 31, 100, 700)
+        );
 
         let end = gesture_bodies(
             Gesture::Magnify {
@@ -5103,9 +5133,10 @@ mod tests {
             },
             1000,
             800,
+            (100, 700),
             &mut state,
         );
-        assert_eq!(end, vec![gesture_magnify(0.0, 4, 31, 500, 400)]);
+        assert_eq!(end, vec![gesture_magnify(0.0, 4, 31, 100, 700)]);
 
         let rotate = gesture_bodies(
             Gesture::Rotate {
@@ -5116,11 +5147,15 @@ mod tests {
             },
             1000,
             800,
+            (900, 120),
             &mut state,
         );
         assert_eq!(rotate.len(), 2, "begin + change");
-        assert_eq!(rotate[0], gesture_rotate(0.0, 1, 31, 250, 600));
-        assert_eq!(rotate[1], gesture_rotate(0.2f32 as f64, 2, 31, 250, 600));
+        assert_eq!(rotate[0], gesture_rotate(0.0, 1, 31, 900, 120));
+        assert_eq!(
+            rotate[1],
+            gesture_rotate(0.2f32 as f64, 2, 31, 900, 120)
+        );
 
         let end = gesture_bodies(
             Gesture::Rotate {
@@ -5131,9 +5166,10 @@ mod tests {
             },
             1000,
             800,
+            (900, 120),
             &mut state,
         );
-        assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 250, 600)]);
+        assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 900, 120)]);
     }
 
     #[test]
