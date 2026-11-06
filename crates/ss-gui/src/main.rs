@@ -36,7 +36,7 @@ use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 mod filecopy;
 mod platform;
 
-use platform::{grab, momentum};
+use platform::{chord, grab, momentum};
 
 /// Scroll deltas accumulated between subtype-11 messages, in the portable
 /// model's units (pixels).
@@ -189,6 +189,14 @@ struct PullState {
 const PULL_FETCHES: u8 = 3;
 const PULL_RETRY: Duration = Duration::from_millis(180);
 const PULL_WINDOW: Duration = Duration::from_millis(700);
+
+/// How long the remote pasteboard agent gets to take the text we just pushed
+/// before the remote `Cmd+V` is sent. It is a settle delay, not a round trip:
+/// the local clipboard is read first, the cut-text and archive go out on the
+/// same connection, and the agent needs a moment to install the data before a
+/// paste reads the pasteboard. 200 ms was measured to be enough on the lab pair
+/// and still feels immediate.
+const PASTE_SETTLE: Duration = Duration::from_millis(200);
 
 /// One physical position in a layout: the character it produces plain and
 /// with Shift. macOS key codes are positions, so this table is the layout.
@@ -495,6 +503,8 @@ Input and keyboard:
                            (default: hold Left-Cmd+Shift for 350 ms)
 
 Clipboard and file copy:
+  Ctrl+V                   paste the local clipboard on the remote
+                           (Wayland: SUPER+V belongs to the compositor)
   --clipboard              accepted no-op; the automatic clipboard is on by default
   --no-clipboard           disable the automatic duplex clipboard
   --send-clipboard         accepted no-op; the local clipboard is pushed when it changes
@@ -743,6 +753,25 @@ fn set_local_clipboard(text: &str) {
             let _ = child.wait();
         }
     });
+}
+
+/// Put local text on the remote pasteboard.
+///
+/// `0x06 ClientCutText` is the standard RFB path and is sent first, but on this
+/// server it installs only a *promise*: `osascript` can read it while `pbpaste`
+/// and app-level paste see nothing (verified 2026-11-06). A viewer `0x1f`
+/// archive carries real data, so the text is also sent that way. Order matters:
+/// the archive arrives after the cut-text and replaces the promise. Both are
+/// needed — standard RFB for other servers, the archive for this one.
+fn push_local_text(tx: &Sender<Vec<u8>>, text: &str, debug: bool) -> bool {
+    if debug {
+        eprintln!("clipboard -> text {:?}", text);
+    }
+    if tx.send(client_cut_text(text.as_bytes())).is_err() {
+        return false;
+    }
+    let archive = pasteboard_archive(&[rfb_proto::text_item(text)]);
+    tx.send(viewer_clipboard_send(&archive, false)).is_ok()
 }
 
 fn write_png(path: &str, width: u16, height: u16, bgrx: &[u32]) -> Result<()> {
@@ -1135,6 +1164,8 @@ enum UserEvent {
     Disconnected(String),
     /// Status text for the window title after a pull attempt.
     PullStatus(String),
+    /// Status text for the window title after an explicit paste.
+    PasteStatus(String),
     /// A keyboard event captured by the platform event tap.
     Grab(grab::GrabEvent),
 }
@@ -1215,6 +1246,10 @@ struct App {
     exit_after_dump: bool,
     debug_input: bool,
     ime: bool,
+    /// A Ctrl+V we translated into the explicit paste is still down locally;
+    /// its repeats and release are swallowed so the remote never sees a bare
+    /// Ctrl+V or a V key-up without a V key-down.
+    paste_key_held: bool,
     focused_once: bool,
     deadline: Option<Instant>,
     /// Sub-line scroll remainder, so small pixel deltas still accumulate.
@@ -1254,6 +1289,16 @@ struct App {
     /// `--debug-input` samples of input event -> first painted rectangle.
     lat: Vec<f64>,
     lat_next_report: u32,
+}
+
+/// Translate winit's modifier state into the portable paste-chord flags.
+fn paste_modifiers(m: ModifiersState) -> chord::PasteModifiers {
+    chord::PasteModifiers {
+        control: m.control_key(),
+        shift: m.shift_key(),
+        alt: m.alt_key(),
+        command: m.super_key(),
+    }
 }
 
 impl App {
@@ -1338,6 +1383,7 @@ impl App {
             exit_after_dump,
             debug_input,
             ime,
+            paste_key_held: false,
             focused_once: false,
             deadline,
             scroll_rem: (0.0, 0.0),
@@ -1402,6 +1448,27 @@ impl App {
                 self.pull_from_remote();
             }
             return;
+        }
+        // Ctrl+V alone: paste the local clipboard on the remote. Wayland
+        // compositors own SUPER+V before the client sees it (Hyprland binds
+        // both universal paste and its clipboard manager), and a Linux client
+        // has no keyboard grab, so Ctrl is the chord that reliably arrives.
+        // The path stays inert while the platform grab is active (macOS),
+        // where Cmd+V already reaches the remote natively.
+        if is_v && !grab::is_active() {
+            let paste = chord::is_paste_chord(paste_modifiers(self.modifiers));
+            // Swallow the release too, even if Ctrl went up first: the V down
+            // that would pair with it never reached the remote.
+            if self.paste_key_held || (pressed && paste) {
+                if pressed && !repeat && !self.paste_key_held {
+                    self.paste_key_held = true;
+                    self.paste_local_clipboard();
+                }
+                if !pressed {
+                    self.paste_key_held = false;
+                }
+                return;
+            }
         }
         // Test shortcuts for gesture calibration on macOS: Ctrl+Alt+arrows
         // emit a swipe; Ctrl+Alt+=/- emit a magnify. A held key is still a
@@ -1673,6 +1740,82 @@ impl App {
             let _ = proxy.send_event(UserEvent::PullStatus(
                 "ss-clone — No path on the remote clipboard - on the remote, put the path on the clipboard as TEXT (e.g. copy it from a Terminal), then press Cmd+Shift+V again; or drop the file on this window."
                     .to_string(),
+            ));
+        });
+    }
+
+    /// Ctrl+V: force the local clipboard onto the remote, then paste it with
+    /// the remote's own Cmd+V.
+    ///
+    /// This exists because neither normal chord works on Wayland: the
+    /// compositor consumes SUPER+V (Hyprland binds it to its clipboard
+    /// manager), and forwarding Ctrl+V literally reaches macOS as Ctrl+V,
+    /// which is not paste there. Reading the clipboard here rather than
+    /// waiting for the ~700 ms watcher also means a copy followed immediately
+    /// by a paste still works.
+    ///
+    /// Everything after reading the modifiers runs on a worker thread: both
+    /// `wl-paste` and the settle delay would otherwise stall the UI (and the
+    /// framebuffer pump). Repeats and the key-up are swallowed by the caller.
+    fn paste_local_clipboard(&mut self) {
+        // Ctrl is already down on the remote (winit reports the modifier
+        // before the key). Lift it so the remote sees Cmd+V, not Ctrl+Cmd+V;
+        // the next real key re-synthesises whatever is still held.
+        self.sync_modifiers(ModifiersState::empty());
+        if let Some(window) = &self.window {
+            window.set_title("ss-clone — sending local clipboard…");
+        }
+        let tx = self.tx.clone();
+        let debug = self.debug_input;
+        let proxy = self.proxy.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let text = local_clipboard_text().unwrap_or_default();
+            let sent = if !text.is_empty() {
+                // Always re-send, even if the watcher already pushed the same
+                // text: a paste that races the watcher must not depend on it.
+                push_local_text(&tx, &text, debug)
+            } else if let Some((uti, data)) = local_clipboard_image() {
+                if debug {
+                    eprintln!(
+                        "paste: local image {uti} {} bytes -> viewer clipboard archive",
+                        data.len()
+                    );
+                }
+                let archive = pasteboard_archive(&[image_item(uti, &data)]);
+                tx.send(viewer_clipboard_send(&archive, false)).is_ok()
+            } else {
+                eprintln!("paste: local clipboard has no text or image - nothing sent");
+                let _ = proxy.send_event(UserEvent::PasteStatus(
+                    "ss-clone — local clipboard is empty".to_string(),
+                ));
+                return;
+            };
+            if !sent {
+                eprintln!("paste: input channel closed; clipboard not sent");
+                return;
+            }
+            // Give the server's pasteboard agent time to install the data
+            // before asking the focused remote app to paste it.
+            thread::sleep(PASTE_SETTLE);
+            // Apple's paste chord is Command+V: Super_L (0xffeb) plus 'v'.
+            // Sent explicitly, not through the local modifier state, so a
+            // stuck/reordered local modifier cannot corrupt it.
+            if tx.send(key_event(0xffeb, true)).is_err()
+                || tx.send(key_event(0x76, true)).is_err()
+                || tx.send(key_event(0x76, false)).is_err()
+                || tx.send(key_event(0xffeb, false)).is_err()
+            {
+                return;
+            }
+            if debug {
+                eprintln!(
+                    "paste: remote Cmd+V sent {} ms after the clipboard",
+                    started.elapsed().as_millis()
+                );
+            }
+            let _ = proxy.send_event(UserEvent::PasteStatus(
+                "ss-clone — Apple Screen Sharing".to_string(),
             ));
         });
     }
@@ -2193,6 +2336,12 @@ impl ApplicationHandler<UserEvent> for App {
                     w.set_title(&status);
                 }
             }
+            UserEvent::PasteStatus(status) => {
+                eprintln!("window title: {status}");
+                if let Some(w) = &self.window {
+                    w.set_title(&status);
+                }
+            }
             UserEvent::Grab(event) => match event {
                 grab::GrabEvent::Key {
                     keycode,
@@ -2304,6 +2453,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // Re-arm the chord on the next focus, and never leave a
                     // modifier down on the remote when focus leaves us.
                     self.grab_suspended = false;
+                    self.paste_key_held = false;
                     self.modifiers = ModifiersState::empty();
                     self.sync_modifiers(ModifiersState::empty());
                 }
@@ -3508,15 +3658,13 @@ fn main() -> Result<()> {
                         // send it straight back to the server.
                         continue;
                     }
-                    if debug_clip {
-                        eprintln!("clipboard -> {:?}", text);
-                    }
                     // Remember what we sent: the server echoes the viewer's
                     // own pasteboard back via a cmd=2 fetch.
                     if let Ok(mut e) = clip_echo.lock() {
                         *e = Some(text.clone());
                     }
-                    if tx_clip.send(client_cut_text(text.as_bytes())).is_err() {
+                    // 0x06 plus a real-data 0x1f archive; see push_local_text.
+                    if !push_local_text(&tx_clip, &text, debug_clip) {
                         break;
                     }
                     continue;

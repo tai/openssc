@@ -111,6 +111,32 @@ fn keycode_name(keycode: u16) -> String {
     }
 }
 
+/// Modifier flags for the explicit local→remote paste chord.
+///
+/// Kept as plain booleans, not winit types, so the matcher is portable and
+/// testable without a window system.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct PasteModifiers {
+    pub control: bool,
+    pub shift: bool,
+    pub alt: bool,
+    pub command: bool,
+}
+
+/// Ctrl+V with no other modifier: the chord that pastes the local clipboard on
+/// the remote.
+///
+/// SUPER+V cannot be used on Wayland: compositors bind it before the client
+/// sees it (Hyprland binds both `SUPER+V` universal paste and
+/// `SUPER+SHIFT+V` clipboard manager), and a Linux client has no keyboard
+/// grab to take it back. Ctrl+V is the chord the compositor leaves alone, and
+/// the client translates it into the remote's own Cmd+V. Excluding the other
+/// modifiers keeps Ctrl+Shift+V (pull file) and the Ctrl+Alt gesture-test
+/// shortcuts untouched.
+pub fn is_paste_chord(m: PasteModifiers) -> bool {
+    m.control && !m.shift && !m.alt && !m.command
+}
+
 /// Parse `--release-grab`, e.g. `cmd+shift`, `ctrl+alt+cmd+esc`, `f12`.
 pub fn parse_chord(spec: &str) -> Result<Chord, String> {
     let mut command = false;
@@ -266,5 +292,28 @@ mod tests {
             _ => panic!("expected a key chord"),
         }
         assert!(parse_chord("bogus").is_err());
+    }
+
+    #[test]
+    fn paste_chord_is_ctrl_v_alone() {
+        let ctrl = PasteModifiers {
+            control: true,
+            ..PasteModifiers::default()
+        };
+        assert!(is_paste_chord(ctrl));
+        // Every other modifier must disqualify the chord, so the existing
+        // Ctrl+Shift+V pull and Ctrl+Alt gesture shortcuts keep their paths.
+        for extra in [
+            PasteModifiers { shift: true, ..ctrl },
+            PasteModifiers { alt: true, ..ctrl },
+            PasteModifiers { command: true, ..ctrl },
+        ] {
+            assert!(!is_paste_chord(extra), "{extra:?} must not paste");
+        }
+        assert!(!is_paste_chord(PasteModifiers::default()));
+        assert!(!is_paste_chord(PasteModifiers {
+            shift: true,
+            ..PasteModifiers::default()
+        }));
     }
 }
