@@ -47,7 +47,7 @@ pub const MOMENTUM_MAX_GESTURE: std::time::Duration = std::time::Duration::from_
 pub const MOMENTUM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
 /// Velocity e-folding rate: v *= exp(-DECAY * dt). Fast, so a flick stops in
 /// about a second like the native client.
-pub const MOMENTUM_DECAY_PER_SEC: f32 = 9.0;
+pub const MOMENTUM_DECAY_PER_SEC: f32 = 5.0;
 /// Stop the glide when the decaying speed drops below this (points/second).
 pub const MOMENTUM_STOP_SPEED: f32 = 40.0;
 /// Hard stop, so a flick cannot glide forever.
@@ -55,7 +55,7 @@ pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(9
 /// Total distance the glide may cover, whatever the release speed. This is
 /// the only way to guarantee "a few pages": the integral of the decay alone
 /// is v0/decay, which a hard flick pushes past a screen or two.
-pub const MOMENTUM_BUDGET: f32 = 400.0;
+pub const MOMENTUM_BUDGET: f32 = 1200.0;
 
 /// Time constant of the axis dominance average (~100 ms of recent motion).
 pub const AXIS_TIME_CONSTANT: std::time::Duration = std::time::Duration::from_millis(100);
@@ -529,11 +529,11 @@ impl GestureRecognizer {
         let mut out = Vec::new();
         let n = points.len();
 
-        if n == 0 {
-            if let Some(sw) = self.swipe.take() {
-                out.push(self.finish_swipe(sw, Phase::Ended));
-            }
-            if let Some(last) = self.last.take() {
+        // Leaving two fingers ends the scroll even when one finger lifts
+        // first. Waiting for all fingers to be gone missed the phase-4 frame
+        // and left the server gesture open, so no post-lift glide could start.
+        if n != 2 {
+            if let Some(last) = self.last {
                 if last.fingers == 2 {
                     out.push(Gesture::Scroll {
                         dx: 0.0,
@@ -543,6 +543,14 @@ impl GestureRecognizer {
                         momentum: None,
                     });
                 }
+            }
+        }
+
+        if n == 0 {
+            if let Some(sw) = self.swipe.take() {
+                out.push(self.finish_swipe(sw, Phase::Ended));
+            }
+            if let Some(last) = self.last.take() {
                 self.finish_two_finger(&mut out, last.cx, last.cy);
             }
             return out;
@@ -869,6 +877,24 @@ mod tests {
         assert!(second
             .iter()
             .any(|g| matches!(g, Gesture::Magnify { .. })));
+    }
+
+    #[test]
+    fn a_scroll_ends_when_one_finger_lifts_first() {
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        let one = r.process(&pts(&[(0.5, 0.5)]));
+        assert!(
+            one.iter()
+                .any(|g| matches!(g, Gesture::Scroll { phase: Phase::Ended, .. })),
+            "one-finger lift must close the scroll: {one:?}"
+        );
+        let none = r.process(&[]);
+        assert!(
+            none.iter()
+                .all(|g| !matches!(g, Gesture::Scroll { phase: Phase::Ended, .. })),
+            "the end must not be emitted twice"
+        );
     }
 
     #[test]

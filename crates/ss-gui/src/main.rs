@@ -6,6 +6,7 @@
 
 use anyhow::Result;
 use gesture_input::chord::{ResumeChord, TapAction};
+use gesture_input::Momentum;
 use gesture_input::{AxisFilter, Gesture, Phase, SCROLL_POINTS_PER_LINE};
 use rfb_proto::mvs::{MvsDecoder, Rect};
 use rfb_proto::{
@@ -1196,6 +1197,95 @@ impl EvdevGestureGate {
 /// The macOS client sends a zero-length scroll Begin/End before every pinch or
 /// rotate. The Linux path was leaving its scroll gesture open, so the server
 /// carried the old scroll anchor into the zoom.
+/// Post-lift glide tracker for evdev scroll. Uses the evdev frame timestamps,
+/// so a queued/batched UI cannot inflate the release velocity.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct ScrollCoast {
+    start: Option<Instant>,
+    last: Option<(Instant, f32, f32)>,
+    velocity: (f32, f32),
+    travel: f32,
+    momentum: Option<Momentum>,
+}
+
+/// Only a genuine flick should coast. A normal or micro scroll may still have
+/// a fast final sample, so require both a short gesture with real total travel
+/// and a high average speed.
+const FLICK_MIN_TRAVEL: f32 = 15.0;
+const FLICK_MIN_AVERAGE_SPEED: f32 = 600.0;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl ScrollCoast {
+    fn begin(&mut self, at: Instant) {
+        self.start = Some(at);
+        self.last = Some((at, 0.0, 0.0));
+        self.velocity = (0.0, 0.0);
+        self.travel = 0.0;
+        self.momentum = None;
+    }
+
+    fn sample(&mut self, dx: f32, dy: f32, at: Instant) {
+        self.travel += dx.abs() + dy.abs();
+        if self.start.is_none() {
+            return;
+        }
+        if let Some((prev, _, _)) = self.last {
+            let dt = at.saturating_duration_since(prev).as_secs_f32();
+            if dt > 0.0001 {
+                self.velocity = (dx / dt, dy / dt);
+            }
+        }
+        self.last = Some((at, dx, dy));
+    }
+
+    fn end(&mut self, at: Instant, coast: bool) {
+        self.momentum = None;
+        let (Some(start), Some((_, _, _))) = (self.start.take(), self.last.take()) else {
+            return;
+        };
+        let duration = at.saturating_duration_since(start);
+        let (vx, vy) = self.velocity;
+        let travel = self.travel;
+        self.velocity = (0.0, 0.0);
+        self.travel = 0.0;
+        if !coast {
+            return;
+        }
+        let seconds = duration.as_secs_f32();
+        if travel < FLICK_MIN_TRAVEL
+            || seconds <= 0.0
+            || travel / seconds < FLICK_MIN_AVERAGE_SPEED
+        {
+            return;
+        }
+        let mut momentum = Momentum::new();
+        if momentum.start(vx, vy, duration, Instant::now()) {
+            self.momentum = Some(momentum);
+        }
+    }
+
+    fn stop(&mut self) {
+        *self = Self::default();
+    }
+
+    fn active(&self) -> bool {
+        self.momentum.is_some()
+    }
+
+    fn next_at(&self) -> Option<Instant> {
+        self.momentum.as_ref().and_then(|m| m.next_at())
+    }
+
+    fn tick(&mut self, now: Instant) -> Option<Gesture> {
+        let gesture = self.momentum.as_mut().and_then(|m| m.tick(now));
+        if gesture.is_some() && self.momentum.as_ref().map_or(true, |m| !m.active()) {
+            self.momentum = None;
+        }
+        gesture
+    }
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn zero_scroll_pair(anchor: (u16, u16)) -> [Vec<u8>; 2] {
     let (x, y) = anchor;
@@ -1611,6 +1701,10 @@ struct App {
     evdev_gate: EvdevGestureGate,
     /// True between an evdev scroll Begin and its close/End.
     scroll_open: bool,
+    /// Post-lift glide from the evdev release velocity.
+    evdev_coast: ScrollCoast,
+    /// Drop winit momentum while our glide replaces it.
+    suppress_winit_scroll: bool,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
     grab_trackpad: bool,
     /// Raw evdev keyboard handle, when `--grab-keyboard` opened one.
@@ -1786,6 +1880,8 @@ impl App {
             evdev_gesture_state: EvdevGestureState::default(),
             evdev_gate: EvdevGestureGate::default(),
             scroll_open: false,
+            evdev_coast: ScrollCoast::default(),
+            suppress_winit_scroll: false,
             grab_trackpad,
             evdev_keyboard,
             evdev_keys_down,
@@ -2223,6 +2319,7 @@ impl App {
     /// a pinch/rotate. Reproduce that so the server cannot keep the scroll
     /// anchor for the zoom.
     fn close_scroll_before_gesture(&mut self) {
+        self.evdev_coast.stop();
         self.flush_scroll();
         let closed = self.close_open_scroll();
         let (x, y) = self.cursor;
@@ -2236,7 +2333,7 @@ impl App {
         }
     }
 
-    fn handle_evdev_gesture(&mut self, g: Gesture, _at: Instant) {
+    fn handle_evdev_gesture(&mut self, g: Gesture, at: Instant) {
         match self.evdev_gate.check(self.window_focused, self.pointer_inside) {
             GestureGateDecision::Allow => {}
             GestureGateDecision::DropFirst => {
@@ -2249,6 +2346,8 @@ impl App {
                 }
                 self.close_open_scroll();
                 self.evdev_gesture_state = EvdevGestureState::default();
+                self.evdev_coast.stop();
+                self.suppress_winit_scroll = false;
                 return;
             }
             GestureGateDecision::Drop => {
@@ -2257,21 +2356,46 @@ impl App {
                 }
                 self.close_open_scroll();
                 self.evdev_gesture_state = EvdevGestureState::default();
+                self.evdev_coast.stop();
+                self.suppress_winit_scroll = false;
                 return;
             }
         }
         note_input();
-        if let Gesture::Scroll { phase, .. } = g {
+        if let Gesture::Scroll {
+            dx, dy, phase, ..
+        } = g
+        {
             if self.evdev_gesture_state.scroll_suppressed() {
                 // The same two fingers are pinching/rotating; their centroid
                 // motion must not pan the content during the zoom.
                 self.close_open_scroll();
+                self.evdev_coast.stop();
                 return;
             }
             match phase {
-                Phase::Began => self.scroll_open = true,
-                Phase::Ended | Phase::Cancelled => self.scroll_open = false,
-                Phase::Changed => {}
+                Phase::Began => {
+                    self.scroll_open = true;
+                    self.suppress_winit_scroll = false;
+                    self.evdev_coast.stop();
+                    self.evdev_coast.begin(at);
+                }
+                Phase::Changed => self.evdev_coast.sample(dx, dy, at),
+                Phase::Ended => {
+                    self.scroll_open = false;
+                    self.queue_scroll(g);
+                    self.suppress_winit_scroll = true;
+                    self.evdev_coast.end(at, self.coast);
+                    if self.debug_input && self.evdev_coast.active() {
+                        eprintln!("scroll: evdev coast started");
+                    }
+                    return;
+                }
+                Phase::Cancelled => {
+                    self.scroll_open = false;
+                    self.evdev_coast.stop();
+                    self.suppress_winit_scroll = false;
+                }
             }
             // Same queue, axis filter and cursor anchor as the winit path.
             self.queue_scroll(g);
@@ -3201,6 +3325,8 @@ impl ApplicationHandler<UserEvent> for App {
                     // window owns the pointer.
                     self.close_open_scroll();
                     self.evdev_gesture_state = EvdevGestureState::default();
+                    self.evdev_coast.stop();
+                    self.suppress_winit_scroll = false;
                     // Re-arm the chord on the next focus, and never leave a
                     // modifier down on the remote when focus leaves us.
                     self.grab_suspended = false;
@@ -3331,6 +3457,16 @@ impl ApplicationHandler<UserEvent> for App {
                 self.flush_pointer(true);
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
+                if self.suppress_winit_scroll {
+                    if phase == TouchPhase::Started {
+                        self.suppress_winit_scroll = false;
+                        self.evdev_coast.stop();
+                    } else {
+                        // The compositor's momentum tail would fight our own
+                        // longer glide; ours replaces it until a new touch.
+                        return;
+                    }
+                }
                 note_input();
                 // Trackpads report pixel deltas (and a real phase) on macOS;
                 // a wheel reports lines. Both go out as subtype 11: the point
@@ -3769,6 +3905,14 @@ impl ApplicationHandler<UserEvent> for App {
                 event_loop.set_control_flow(ControlFlow::WaitUntil(at));
             }
         }
+        // Tick the evdev post-lift glide. Its points go through the same
+        // scroll queue as the winit samples.
+        let coast_tick = self.evdev_coast.tick(Instant::now());
+        if let Some(gesture) = coast_tick {
+            self.queue_scroll(gesture);
+        }
+        let coast_next = self.evdev_coast.next_at();
+
         // A coalesced scroll batch must not sit until the next wheel event:
         // flush it when the interval expires, or wake up to do so. Without
         // this the tail of a flick (and every wheel tick) would arrive late.
@@ -3776,9 +3920,9 @@ impl ApplicationHandler<UserEvent> for App {
             let deadline = self.scroll_last + SCROLL_INTERVAL;
             if Instant::now() >= deadline {
                 self.flush_scroll();
-            } else {
-                event_loop.set_control_flow(ControlFlow::WaitUntil(deadline));
             }
+            let wake = coast_next.map_or(deadline, |at| at.min(deadline));
+            event_loop.set_control_flow(ControlFlow::WaitUntil(wake));
         } else if !self.demo_cursor {
             // While a grab is active (or arming), keep waking so the
             // watchdogs can tell "idle" from "wedged", and so the delayed
@@ -3797,6 +3941,9 @@ impl ApplicationHandler<UserEvent> for App {
                 None
             };
             if let Some(at) = self.keyboard_grab_at {
+                wake_at = Some(wake_at.map_or(at, |w| w.min(at)));
+            }
+            if let Some(at) = coast_next {
                 wake_at = Some(wake_at.map_or(at, |w| w.min(at)));
             }
             match wake_at {
@@ -5317,6 +5464,60 @@ mod tests {
             &mut state,
         );
         assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 900, 120)]);
+    }
+
+    #[test]
+    fn evdev_coast_starts_only_for_a_fast_flick_and_honours_no_coast() {
+        let t0 = Instant::now();
+        let mut fast = ScrollCoast::default();
+        fast.begin(t0);
+        fast.sample(0.0, -100.0, t0 + Duration::from_millis(16));
+        fast.end(t0 + Duration::from_millis(100), true);
+        assert!(fast.active(), "a fast flick must glide");
+        assert!(fast.next_at().is_some());
+        let glide = fast.tick(Instant::now() + Duration::from_millis(20)).expect("glide");
+        assert!(matches!(glide, Gesture::Scroll { dy, .. } if dy < 0.0));
+        fast.begin(t0 + Duration::from_millis(200));
+        assert!(!fast.active(), "a new touch stops the glide");
+
+        let mut slow = ScrollCoast::default();
+        slow.begin(t0);
+        slow.sample(0.0, -5.0, t0 + Duration::from_millis(16));
+        slow.end(t0 + Duration::from_millis(100), true);
+        assert!(!slow.active(), "a slow drag must not glide");
+
+        let mut no_coast = ScrollCoast::default();
+        no_coast.begin(t0);
+        no_coast.sample(0.0, -100.0, t0 + Duration::from_millis(16));
+        no_coast.end(t0 + Duration::from_millis(100), false);
+        assert!(!no_coast.active(), "--no-coast must not glide");
+    }
+
+    #[test]
+    fn only_a_flick_coasts_not_a_normal_or_micro_scroll() {
+        let t0 = Instant::now();
+
+        let mut normal = ScrollCoast::default();
+        normal.begin(t0);
+        for i in 1..=30 {
+            normal.sample(0.0, -5.0, t0 + Duration::from_millis(16 * i));
+        }
+        normal.end(t0 + Duration::from_millis(500), true);
+        assert!(!normal.active(), "a normal scroll must not coast");
+
+        let mut micro = ScrollCoast::default();
+        micro.begin(t0);
+        micro.sample(0.0, -2.0, t0 + Duration::from_millis(100));
+        micro.end(t0 + Duration::from_millis(100), true);
+        assert!(!micro.active(), "a micro nudge must not coast");
+
+        let mut flick = ScrollCoast::default();
+        flick.begin(t0);
+        for i in 1..=10 {
+            flick.sample(0.0, -10.0, t0 + Duration::from_millis(8 * i));
+        }
+        flick.end(t0 + Duration::from_millis(80), true);
+        assert!(flick.active(), "a fast flick must coast");
     }
 
     #[test]
