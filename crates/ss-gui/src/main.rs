@@ -1154,6 +1154,57 @@ struct EvdevGestureState {
     rotate_active: bool,
 }
 
+impl EvdevGestureState {
+    fn scroll_suppressed(&self) -> bool {
+        self.pinch_active || self.rotate_active
+    }
+}
+
+/// The raw evdev reader sees the whole trackpad, not just events addressed to
+/// our window. A gesture made while another app is focused must not be sent to
+/// the remote with a stale cursor anchor. Drop it and log the inactive episode
+/// once, then stay quiet until the window is active again.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Default)]
+struct EvdevGestureGate {
+    warned: bool,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GestureGateDecision {
+    Allow,
+    DropFirst,
+    Drop,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl EvdevGestureGate {
+    fn check(&mut self, focused: bool, pointer_inside: bool) -> GestureGateDecision {
+        if focused && pointer_inside {
+            self.warned = false;
+            GestureGateDecision::Allow
+        } else if self.warned {
+            GestureGateDecision::Drop
+        } else {
+            self.warned = true;
+            GestureGateDecision::DropFirst
+        }
+    }
+}
+
+/// The macOS client sends a zero-length scroll Begin/End before every pinch or
+/// rotate. The Linux path was leaving its scroll gesture open, so the server
+/// carried the old scroll anchor into the zoom.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn zero_scroll_pair(anchor: (u16, u16)) -> [Vec<u8>; 2] {
+    let (x, y) = anchor;
+    [
+        gesture_mouse_scroll(0, 0, 0, (0, 0, 0), (0, 0, 0), 1, 0, x, y),
+        gesture_mouse_scroll(0, 0, 0, (0, 0, 0), (0, 0, 0), 4, 0, x, y),
+    ]
+}
+
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn gesture_bodies(
     g: Gesture,
@@ -1556,6 +1607,10 @@ struct App {
     evdev_grab: Option<platform::evdev::GrabHandle>,
     /// Persistent begin/end state for evdev pinch and rotate.
     evdev_gesture_state: EvdevGestureState,
+    /// Drops evdev gestures while another window owns the pointer.
+    evdev_gate: EvdevGestureGate,
+    /// True between an evdev scroll Begin and its close/End.
+    scroll_open: bool,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
     grab_trackpad: bool,
     /// Raw evdev keyboard handle, when `--grab-keyboard` opened one.
@@ -1729,6 +1784,8 @@ impl App {
             grab,
             evdev_grab,
             evdev_gesture_state: EvdevGestureState::default(),
+            evdev_gate: EvdevGestureGate::default(),
+            scroll_open: false,
             grab_trackpad,
             evdev_keyboard,
             evdev_keys_down,
@@ -2145,12 +2202,97 @@ impl App {
     /// Turn one raw evdev gesture into wire bodies on the GUI thread. Pinch and
     /// rotate are anchored at the current remote pointer, not at the trackpad
     /// centroid: the server zooms around the coordinates in the message.
+    /// Close an open scroll at the current cursor. Idempotent.
+    fn close_open_scroll(&mut self) -> bool {
+        if !self.scroll_open {
+            return false;
+        }
+        self.flush_scroll();
+        self.queue_scroll(Gesture::Scroll {
+            dx: 0.0,
+            dy: 0.0,
+            phase: Phase::Ended,
+            precise: true,
+            momentum: None,
+        });
+        self.scroll_open = false;
+        true
+    }
+
+    /// macOS closes the active scroll and sends a zero-length Begin/End before
+    /// a pinch/rotate. Reproduce that so the server cannot keep the scroll
+    /// anchor for the zoom.
+    fn close_scroll_before_gesture(&mut self) {
+        self.flush_scroll();
+        let closed = self.close_open_scroll();
+        let (x, y) = self.cursor;
+        let [begin, end] = zero_scroll_pair((x, y));
+        self.send(begin);
+        self.send(end);
+        if self.debug_input {
+            eprintln!(
+                "evdev: scroll reset before gesture (closed_open={closed}, anchor=({x},{y}))"
+            );
+        }
+    }
+
     fn handle_evdev_gesture(&mut self, g: Gesture, _at: Instant) {
+        match self.evdev_gate.check(self.window_focused, self.pointer_inside) {
+            GestureGateDecision::Allow => {}
+            GestureGateDecision::DropFirst => {
+                eprintln!(
+                    "evdev: gesture dropped: window is not the active target (focus={} pointer_inside={})",
+                    self.window_focused, self.pointer_inside
+                );
+                if self.debug_input {
+                    eprintln!("evdev: dropped gesture {g:?}");
+                }
+                self.close_open_scroll();
+                self.evdev_gesture_state = EvdevGestureState::default();
+                return;
+            }
+            GestureGateDecision::Drop => {
+                if self.debug_input {
+                    eprintln!("evdev: dropped gesture {g:?}");
+                }
+                self.close_open_scroll();
+                self.evdev_gesture_state = EvdevGestureState::default();
+                return;
+            }
+        }
         note_input();
-        if matches!(g, Gesture::Scroll { .. }) {
+        if let Gesture::Scroll { phase, .. } = g {
+            if self.evdev_gesture_state.scroll_suppressed() {
+                // The same two fingers are pinching/rotating; their centroid
+                // motion must not pan the content during the zoom.
+                self.close_open_scroll();
+                return;
+            }
+            match phase {
+                Phase::Began => self.scroll_open = true,
+                Phase::Ended | Phase::Cancelled => self.scroll_open = false,
+                Phase::Changed => {}
+            }
             // Same queue, axis filter and cursor anchor as the winit path.
             self.queue_scroll(g);
             return;
+        }
+        let starts_non_scroll = !self.evdev_gesture_state.scroll_suppressed()
+            && match g {
+                Gesture::Swipe {
+                    phase: Phase::Began,
+                    ..
+                } => true,
+                Gesture::Magnify { phase, .. } => {
+                    phase == Phase::Began || phase == Phase::Changed
+                }
+                Gesture::Rotate { phase, .. } => {
+                    phase == Phase::Began || phase == Phase::Changed
+                }
+                _ => false,
+            };
+        if starts_non_scroll {
+            self.close_scroll_before_gesture();
         }
         let anchor = self.cursor;
         for body in gesture_bodies(
@@ -3054,6 +3196,11 @@ impl ApplicationHandler<UserEvent> for App {
                     }
                 }
                 if !focused {
+                    // Close an evdev scroll and clear gesture state; a global
+                    // trackpad must not keep a scroll open while another
+                    // window owns the pointer.
+                    self.close_open_scroll();
+                    self.evdev_gesture_state = EvdevGestureState::default();
                     // Re-arm the chord on the next focus, and never leave a
                     // modifier down on the remote when focus leaves us.
                     self.grab_suspended = false;
@@ -5170,6 +5317,119 @@ mod tests {
             &mut state,
         );
         assert_eq!(end, vec![gesture_rotate(0.0, 4, 31, 900, 120)]);
+    }
+
+    #[test]
+    fn evdev_gestures_are_gated_while_the_window_is_inactive() {
+        let mut gate = EvdevGestureGate::default();
+        assert_eq!(gate.check(true, true), GestureGateDecision::Allow);
+        assert_eq!(gate.check(false, true), GestureGateDecision::DropFirst);
+        assert_eq!(gate.check(false, true), GestureGateDecision::Drop);
+        assert_eq!(gate.check(true, false), GestureGateDecision::Drop);
+        assert_eq!(gate.check(true, true), GestureGateDecision::Allow);
+        assert_eq!(gate.check(false, false), GestureGateDecision::DropFirst);
+    }
+
+    #[test]
+    fn zero_scroll_pair_precedes_magnify_after_scroll() {
+        fn be16(body: &[u8], at: usize) -> u16 {
+            u16::from_be_bytes([body[at], body[at + 1]])
+        }
+        fn be32(body: &[u8], at: usize) -> u32 {
+            u32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]])
+        }
+        fn be64(body: &[u8], at: usize) -> u64 {
+            u64::from_be_bytes([
+                body[at], body[at + 1], body[at + 2], body[at + 3],
+                body[at + 4], body[at + 5], body[at + 6], body[at + 7],
+            ])
+        }
+        let anchor = (2180u16, 1229u16);
+        let (scroll_body, _, _, _) = scroll_message(
+            &Gesture::Scroll {
+                dx: 0.0,
+                dy: -2.0,
+                phase: Phase::Changed,
+                precise: true,
+                momentum: None,
+            },
+            anchor.0,
+            anchor.1,
+            (0.0, 0.0),
+        );
+        let scroll_body = scroll_body.expect("scroll body");
+        let [begin, end] = zero_scroll_pair(anchor);
+
+        for (body, phase) in [(&begin, 1u32), (&end, 4u32)] {
+            assert_eq!(body[0], 0x17);
+            assert_eq!(be16(body, 6), 11, "scroll subtype");
+            assert_eq!(be16(body, 8), 0, "dx is zero");
+            assert_eq!(be16(body, 10), 0, "dy is zero");
+            assert_eq!(be32(body, 14), 0, "fixed dx is zero");
+            assert_eq!(be32(body, 18), 0, "fixed dy is zero");
+            assert_eq!(be32(body, 46), phase);
+            assert_eq!(be16(body, 54), anchor.0);
+            assert_eq!(be16(body, 56), anchor.1);
+        }
+
+        let mut state = EvdevGestureState::default();
+        let mut sequence = vec![scroll_body, begin, end];
+        sequence.extend(gesture_bodies(
+            Gesture::Magnify {
+                factor: 1.2,
+                phase: Phase::Changed,
+                x: 0.5,
+                y: 0.5,
+            },
+            2560,
+            1600,
+            anchor,
+            &mut state,
+        ));
+        assert_eq!(sequence.len(), 5, "scroll, reset pair, magnify begin/change");
+        assert_eq!(be16(&sequence[0], 6), 11, "scroll precedes the reset");
+        assert_eq!(be32(&sequence[0], 46), 2, "open scroll was phase 2");
+        assert_eq!(be32(&sequence[1], 46), 1, "reset begin");
+        assert_eq!(be32(&sequence[2], 46), 4, "reset end");
+        assert_eq!(be16(&sequence[3], 6), 3, "magnify subtype");
+        assert_eq!(be64(&sequence[3], 20), 1, "magnify begins after reset");
+        assert_eq!(be64(&sequence[4], 20), 2);
+        for body in &sequence[3..] {
+            assert_eq!(be16(body, 16), anchor.0);
+            assert_eq!(be16(body, 18), anchor.1);
+        }
+    }
+
+    #[test]
+    fn a_pinch_suppresses_scroll_and_ends_cleanly() {
+        let mut state = EvdevGestureState::default();
+        assert!(!state.scroll_suppressed());
+        gesture_bodies(
+            Gesture::Magnify {
+                factor: 1.1,
+                phase: Phase::Changed,
+                x: 0.5,
+                y: 0.5,
+            },
+            2560,
+            1600,
+            (100, 100),
+            &mut state,
+        );
+        assert!(state.scroll_suppressed());
+        gesture_bodies(
+            Gesture::Magnify {
+                factor: 1.0,
+                phase: Phase::Ended,
+                x: 0.5,
+                y: 0.5,
+            },
+            2560,
+            1600,
+            (100, 100),
+            &mut state,
+        );
+        assert!(!state.scroll_suppressed());
     }
 
     #[test]
