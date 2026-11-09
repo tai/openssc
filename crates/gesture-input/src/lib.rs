@@ -499,11 +499,30 @@ pub struct GestureRecognizer {
     /// Set when a two-finger Magnify/Rotate has been emitted and not yet ended.
     magnify_active: bool,
     rotate_active: bool,
+    /// Cumulative scale/angle change since this two-finger gesture began.
+    /// Fingers settle and drift during a plain scroll; those small changes must
+    /// not switch the gesture into pinch/rotate mode.
+    pinch_accum: f32,
+    rotate_accum: f32,
 }
+
+/// Cumulative scale change that arms a pinch (5%). The first two-finger
+/// frames settle by 2-3% on this hardware and a plain scroll drifts a few
+/// percent; a deliberate pinch reaches 8%+.
+pub const MAGNIFY_DEADZONE: f32 = 0.05;
+/// Cumulative rotation that arms a rotate gesture (~3.4 degrees).
+pub const ROTATE_DEADZONE: f32 = 0.06;
+/// Normalized centroid movement above which a frame is a scroll, not a pinch
+/// (~1.5 points/frame on this pad). A fast two-finger scroll also changes the
+/// finger separation by several percent; that must not arm a pinch.
+pub const SCROLL_DOMINANCE: f32 = 0.0025;
 
 impl GestureRecognizer {
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            pinch_accum: 1.0,
+            ..Self::default()
+        }
     }
 
     pub fn process(&mut self, points: &[TouchPoint]) -> Vec<Gesture> {
@@ -569,10 +588,23 @@ impl GestureRecognizer {
         }
 
         if n == 2 {
+            if self.last.map_or(true, |last| last.fingers != 2) {
+                self.pinch_accum = 1.0;
+                self.rotate_accum = 0.0;
+            }
             if let Some(last) = self.last {
                 if last.fingers == 2 {
                     let dx = cx - last.cx;
                     let dy = cy - last.cy;
+                    let scroll_dominant = (dx * dx + dy * dy).sqrt() > SCROLL_DOMINANCE;
+                    let non_scroll_allowed =
+                        !scroll_dominant || self.magnify_active || self.rotate_active;
+                    if scroll_dominant && !self.magnify_active && !self.rotate_active {
+                        // This frame is finger travel; do not let incidental
+                        // scale/angle drift accumulate into a pinch.
+                        self.pinch_accum = 1.0;
+                        self.rotate_accum = 0.0;
+                    }
                     if dx.abs() + dy.abs() > 0.0005 {
                         out.push(Gesture::Scroll {
                             dx: dx * SCROLL_PIXELS_PER_UNIT,
@@ -584,14 +616,35 @@ impl GestureRecognizer {
                     }
                     if last.dist > 0.0001 {
                         let factor = dist / last.dist;
-                        if (factor - 1.0).abs() > 0.005 {
+                        // A very large scale step is a deliberate pinch even
+                        // if the centroid also moved; ordinary scroll drift
+                        // is a few percent at most.
+                        let strong = (factor - 1.0).abs() >= 0.15;
+                        if !non_scroll_allowed && !strong {
+                            // skip this frame's scale sample
+                        } else {
+                        if factor.is_finite() && factor > 0.0 {
+                            self.pinch_accum *= factor;
+                        }
+                        let emit = if self.magnify_active {
+                            (factor - 1.0).abs() > 0.005
+                        } else {
+                            (self.pinch_accum - 1.0).abs() >= MAGNIFY_DEADZONE
+                        };
+                        if emit {
+                            let value = if self.magnify_active {
+                                factor
+                            } else {
+                                self.pinch_accum
+                            };
                             self.magnify_active = true;
                             out.push(Gesture::Magnify {
-                                factor,
+                                factor: value,
                                 phase: Phase::Changed,
                                 x: cx,
                                 y: cy,
                             });
+                        }
                         }
                     }
                     let mut d = angle - last.angle;
@@ -601,14 +654,27 @@ impl GestureRecognizer {
                     while d < -std::f32::consts::PI {
                         d += 2.0 * std::f32::consts::PI;
                     }
-                    if d.abs() > 0.01 {
-                        self.rotate_active = true;
-                        out.push(Gesture::Rotate {
-                            radians: d,
-                            phase: Phase::Changed,
-                            x: cx,
-                            y: cy,
-                        });
+                    if non_scroll_allowed || d.abs() >= 0.1 {
+                        self.rotate_accum += d;
+                        let emit = if self.rotate_active {
+                            d.abs() > 0.01
+                        } else {
+                            self.rotate_accum.abs() >= ROTATE_DEADZONE
+                        };
+                        if emit {
+                            let value = if self.rotate_active {
+                                d
+                            } else {
+                                self.rotate_accum
+                            };
+                            self.rotate_active = true;
+                            out.push(Gesture::Rotate {
+                                radians: value,
+                                phase: Phase::Changed,
+                                x: cx,
+                                y: cy,
+                            });
+                        }
                     }
                 } else {
                     out.push(Gesture::Scroll {
@@ -653,6 +719,8 @@ impl GestureRecognizer {
                 y,
             });
         }
+        self.pinch_accum = 1.0;
+        self.rotate_accum = 0.0;
     }
 
     fn swipe_gesture(&self, sw: SwipeState, phase: Phase) -> Gesture {
@@ -756,11 +824,51 @@ mod tests {
 
     #[test]
     fn two_finger_scroll_and_pinch() {
+        // Finger travel is scroll, not pinch, even when the separation drifts.
         let mut r = GestureRecognizer::new();
         r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
-        let out = r.process(&pts(&[(0.45, 0.5), (0.7, 0.5)]));
+        let out = r.process(&pts(&[(0.45, 0.5), (0.65, 0.5)]));
         assert!(out.iter().any(|g| matches!(g, Gesture::Scroll { .. })));
+        assert!(out.iter().all(|g| !matches!(g, Gesture::Magnify { .. })));
+
+        // A symmetric finger separation is a pinch.
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        let out = r.process(&pts(&[(0.35, 0.5), (0.65, 0.5)]));
         assert!(out.iter().any(|g| matches!(g, Gesture::Magnify { .. })));
+    }
+
+    #[test]
+    fn a_jittery_scroll_does_not_become_a_pinch_or_rotate() {
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        for (left, right) in [
+            ((0.401, 0.5), (0.6, 0.5)),
+            ((0.400, 0.5), (0.601, 0.5)),
+            ((0.402, 0.503), (0.6, 0.497)),
+            ((0.399, 0.498), (0.601, 0.502)),
+        ] {
+            let out = r.process(&pts(&[left, right]));
+            assert!(
+                out.iter().all(|g| !matches!(
+                    g,
+                    Gesture::Magnify { .. } | Gesture::Rotate { .. }
+                )),
+                "incidental finger drift must stay scroll: {out:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_slow_pinch_still_arms_after_the_cumulative_deadzone() {
+        let mut r = GestureRecognizer::new();
+        r.process(&pts(&[(0.4, 0.5), (0.6, 0.5)]));
+        let first = r.process(&pts(&[(0.398, 0.5), (0.602, 0.5)])); // 2%
+        assert!(first.iter().all(|g| !matches!(g, Gesture::Magnify { .. })));
+        let second = r.process(&pts(&[(0.394, 0.5), (0.606, 0.5)])); // 6% cumulative
+        assert!(second
+            .iter()
+            .any(|g| matches!(g, Gesture::Magnify { .. })));
     }
 
     #[test]
