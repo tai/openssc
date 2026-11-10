@@ -68,53 +68,60 @@ const SCROLL_INTERVAL: Duration = Duration::from_millis(4);
 /// own acceleration to multi-line deltas, so this is a 1:1 tracking choice.
 const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
 
-/// The evdev recogniser reports points as normalized pad delta * 600, which on
-/// this host is only ~0.4-2.0 points per frame for a normal two-finger scroll.
-/// winit's Wayland PixelDelta on the same target is ~4.7-8.5 points per event,
-/// so raw evdev motion was several times too slow (and never reached the
-/// Momentum 1200 points/s flick threshold). The plateau is 8.0 for flick-sized
-/// deltas; below the 1.5-point knee the scale ramps down so a deliberate micro
-/// scroll does not become a line step. `--scroll-speed` still multiplies on top
-/// inside `scroll_message`, so the user-facing speed control is unchanged.
+/// The evdev recogniser reports points as normalized pad delta * 600. A
+/// gesture is classified once at its start and then uses one constant scale
+/// for the whole gesture: a micro scroll must not accelerate when the finger
+/// moves faster (the rate changes, the distance per finger travel does not).
+const EVDEV_MICRO_SCALE: f32 = 1.0;
+const EVDEV_NORMAL_SCALE: f32 = 5.5;
 const EVDEV_SCROLL_SCALE: f32 = 8.0;
-/// Below this per-event magnitude (raw points) the scale ramps down toward
-/// `EVDEV_MICRO_SCALE`: a small deliberate finger movement must stay a micro
-/// scroll, not become a line step. At/above it the full flick scale applies.
-const EVDEV_MICRO_THRESHOLD: f32 = 1.5;
-const EVDEV_MICRO_SCALE: f32 = 2.5;
+/// Initial raw speed thresholds (points/second) for the locked gesture mode.
+const EVDEV_MICRO_SPEED: f32 = 60.0;
+const EVDEV_FLICK_SPEED: f32 = 200.0;
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn evdev_scroll_factor(magnitude: f32) -> f32 {
-    if magnitude >= EVDEV_MICRO_THRESHOLD {
-        EVDEV_SCROLL_SCALE
-    } else {
-        EVDEV_MICRO_SCALE
-            + (EVDEV_SCROLL_SCALE - EVDEV_MICRO_SCALE) * magnitude / EVDEV_MICRO_THRESHOLD
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum ScrollMode {
+    #[default]
+    Micro,
+    Normal,
+    Flick,
+}
+
+impl ScrollMode {
+    fn scale(self) -> f32 {
+        match self {
+            ScrollMode::Micro => EVDEV_MICRO_SCALE,
+            ScrollMode::Normal => EVDEV_NORMAL_SCALE,
+            ScrollMode::Flick => EVDEV_SCROLL_SCALE,
+        }
     }
 }
 
-/// Test/helper wrapper around the stateless factor.
-#[allow(dead_code)]
-fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
-    let factor = evdev_scroll_factor((dx * dx + dy * dy).sqrt());
-    (dx * factor, dy * factor)
-}
-
-/// Smoothed per-event magnitude for the micro/flick response. A single larger
-/// sample must not turn a slow micro scroll into a normal one: the EMA needs
-/// sustained motion before the scale ramps up, while the steady normal/flick
-/// speeds stay at the measured plateau.
+/// Classifies a gesture from its first few non-zero samples, then locks the
+/// mode. No mid-gesture scale change means no acceleration: a micro gesture
+/// stays micro even if the finger speeds up; only the rate of scrolling
+/// changes.
 #[derive(Default)]
 struct EvdevScrollCurve {
     last: Option<Instant>,
-    magnitude: f32,
+    samples: u8,
+    speeds: [f32; 3],
+    mode: ScrollMode,
+    classified: bool,
 }
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl EvdevScrollCurve {
     fn begin(&mut self, at: Instant) {
         self.last = Some(at);
-        self.magnitude = 0.0;
+        self.samples = 0;
+        self.speeds = [0.0; 3];
+        self.mode = ScrollMode::Micro;
+        self.classified = false;
+    }
+
+    fn is_micro(&self) -> bool {
+        self.mode == ScrollMode::Micro
     }
 
     fn scale(&mut self, dx: f32, dy: f32, at: Instant) -> (f32, f32) {
@@ -124,12 +131,27 @@ impl EvdevScrollCurve {
             .map(|last| at.saturating_duration_since(last).as_secs_f32())
             .unwrap_or(0.008)
             .clamp(0.001, 0.05);
-        // ~50 ms: a deliberate micro scroll stays low; a sustained flick
-        // reaches the plateau in a few frames.
-        let alpha = 1.0 - (-dt / 0.05).exp();
-        self.magnitude += alpha * (magnitude - self.magnitude);
         self.last = Some(at);
-        let factor = evdev_scroll_factor(self.magnitude);
+        if !self.classified && magnitude > 0.0 {
+            if (self.samples as usize) < self.speeds.len() {
+                self.speeds[self.samples as usize] = magnitude / dt;
+                self.samples += 1;
+            }
+            if self.samples as usize == self.speeds.len() {
+                let mut speeds = self.speeds;
+                speeds.sort_by(f32::total_cmp);
+                let median = speeds[1];
+                self.mode = if median < EVDEV_MICRO_SPEED {
+                    ScrollMode::Micro
+                } else if median < EVDEV_FLICK_SPEED {
+                    ScrollMode::Normal
+                } else {
+                    ScrollMode::Flick
+                };
+                self.classified = true;
+            }
+        }
+        let factor = self.mode.scale();
         (dx * factor, dy * factor)
     }
 }
@@ -1782,8 +1804,11 @@ struct App {
     scroll_open: bool,
     /// Post-lift glide from the evdev release velocity.
     evdev_coast: ScrollCoast,
-    /// Smoothed evdev scroll response (micro vs normal/flick).
+    /// Per-gesture evdev scroll response (micro vs normal/flick).
     evdev_scroll_curve: EvdevScrollCurve,
+    /// The current evdev gesture is a micro scroll: bypass the axis filter so
+    /// tiny diagonal motion is not dropped or snapped to one axis.
+    scroll_micro: bool,
     /// Drop winit momentum while our glide replaces it.
     suppress_winit_scroll: bool,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
@@ -1963,6 +1988,7 @@ impl App {
             scroll_open: false,
             evdev_coast: ScrollCoast::default(),
             evdev_scroll_curve: EvdevScrollCurve::default(),
+            scroll_micro: false,
             suppress_winit_scroll: false,
             grab_trackpad,
             evdev_keyboard,
@@ -2467,7 +2493,15 @@ impl App {
                     eprintln!("scroll: coast stopped by new touch");
                 }
             }
+            let was_micro = self.scroll_micro;
             let (dx, dy) = self.evdev_scroll_curve.scale(dx, dy, at);
+            let is_micro = self.evdev_scroll_curve.is_micro();
+            if was_micro && !is_micro {
+                // First normal/flick sample after a micro start: the axis
+                // filter was bypassed, so start its history here.
+                self.scroll_axis.begin();
+            }
+            self.scroll_micro = is_micro;
             let gesture = Gesture::Scroll {
                 dx,
                 dy,
@@ -2482,11 +2516,13 @@ impl App {
                     self.evdev_coast.stop();
                     self.evdev_coast.begin(at);
                     self.evdev_scroll_curve.begin(at);
+                    self.scroll_micro = true;
                 }
                 Phase::Changed => self.evdev_coast.sample(dx, dy, at),
                 Phase::Ended => {
                     self.scroll_open = false;
                     self.queue_scroll(gesture);
+                    self.scroll_micro = false;
                     self.suppress_winit_scroll = true;
                     self.evdev_coast.end(at, self.coast);
                     if self.debug_input && self.evdev_coast.active() {
@@ -2496,6 +2532,7 @@ impl App {
                 }
                 Phase::Cancelled => {
                     self.scroll_open = false;
+                    self.scroll_micro = false;
                     self.evdev_coast.stop();
                     self.suppress_winit_scroll = false;
                 }
@@ -2747,13 +2784,17 @@ impl App {
             return;
         };
         let now = Instant::now();
-        if phase == Phase::Began {
+        if phase == Phase::Began && !self.scroll_micro {
             self.scroll_axis.begin();
         }
-        // Continuous axis weighting: the minor axis is scaled by how much of
-        // the recent motion it represents, so jitter disappears while a
-        // diagonal or a direction change still works.
-        let (dx, dy) = self.scroll_axis.apply(dx, dy, now);
+        // A micro scroll bypasses the axis filter: it must keep both tiny axes
+        // instead of being dropped or snapped to one axis. Normal/flick scroll
+        // still gets the direction weighting.
+        let (dx, dy) = if self.scroll_micro {
+            (dx, dy)
+        } else {
+            self.scroll_axis.apply(dx, dy, now)
+        };
         if self.debug_input {
             if let Some(t) = self.scroll_axis.take_transition() {
                 eprintln!(
@@ -3567,6 +3608,7 @@ impl ApplicationHandler<UserEvent> for App {
                     // mouse wheel is ignored in --evdev mode.
                     return;
                 }
+                self.scroll_micro = false;
                 if self.suppress_winit_scroll {
                     if phase == TouchPhase::Started {
                         self.suppress_winit_scroll = false;
@@ -5613,60 +5655,44 @@ mod tests {
     }
 
     #[test]
-    fn evdev_scroll_scale_matches_winit() {
-        // Measured on this host: evdev raw Changed samples were mean 0.77,
-        // median 0.39, p90 2.01 points/event; winit's PixelDelta sample was
-        // 4.7-8.5. The curve keeps a flick event at 8x, pulls the mean normal
-        // event to ~4.1 and micro events down to ~2.5-3x.
-        let (_, p90) = scale_evdev_scroll(0.0, -2.01);
-        let (_, median) = scale_evdev_scroll(0.0, -0.39);
-        let (_, mean) = scale_evdev_scroll(0.0, -0.77);
-        assert!((p90 + 16.08).abs() < 0.01);
-        assert!((median + 1.53).abs() < 0.01);
-        assert!((mean + 4.10).abs() < 0.01);
-        let (_, micro) = scale_evdev_scroll(0.0, -0.10);
-        assert!(micro.abs() < mean.abs() * 0.30);
-
-        // A fast flick now reaches the coast threshold; an ordinary scroll
-        // still does not (this ScrollCoast requires travel and average speed).
-        let t0 = Instant::now();
-        let mut flick = ScrollCoast::default();
-        flick.begin(t0);
-        flick.sample(0.0, p90, t0 + Duration::from_millis(8));
-        flick.sample(0.0, p90, t0 + Duration::from_millis(16));
-        flick.end(t0 + Duration::from_millis(16), true);
-        assert!(flick.next_at().is_some(), "a measured p90 flick must coast");
-
-        let mut slow = ScrollCoast::default();
-        slow.begin(t0);
-        slow.sample(0.0, mean, t0 + Duration::from_millis(8));
-        slow.sample(0.0, mean, t0 + Duration::from_millis(16));
-        slow.end(t0 + Duration::from_millis(16), true);
-        assert!(slow.next_at().is_none(), "ordinary scroll must not coast");
-    }
-
-    #[test]
-    fn evdev_scroll_curve_smooths_a_micro_spike() {
+    fn evdev_scroll_micro_is_fine_and_never_accelerates() {
         let t0 = Instant::now();
         let mut curve = EvdevScrollCurve::default();
         curve.begin(t0);
-        let (_, first) = curve.scale(0.0, -1.5, t0 + Duration::from_millis(8));
+        for i in 1..=3 {
+            let (_, y) = curve.scale(0.0, -0.20, t0 + Duration::from_millis(8 * i));
+            assert!((y + 0.20).abs() < 0.01, "micro must be 1:1, got {y}");
+        }
+        assert!(curve.is_micro());
+        // Speeding up mid-gesture must change the rate, not the scale.
+        let (_, y) = curve.scale(0.0, -5.0, t0 + Duration::from_millis(32));
         assert!(
-            first.abs() < 1.5 * 6.0,
-            "one larger sample must not jump to normal/flick: {first}"
+            (y + 5.0).abs() < 0.01,
+            "micro stayed locked but scaled {y}"
         );
+    }
 
-        let mut steady = EvdevScrollCurve::default();
-        steady.begin(t0);
+    #[test]
+    fn evdev_scroll_classifies_normal_and_flick() {
+        let t0 = Instant::now();
+        let mut normal = EvdevScrollCurve::default();
+        normal.begin(t0);
         let mut last = 0.0;
-        for i in 1..=12 {
-            let (_, y) = steady.scale(0.0, -1.5, t0 + Duration::from_millis(8 * i));
+        for i in 1..=3 {
+            let (_, y) = normal.scale(0.0, -1.0, t0 + Duration::from_millis(8 * i));
             last = y;
         }
-        assert!(
-            last.abs() > 1.5 * 6.5,
-            "sustained fast deltas should reach the plateau: {last}"
-        );
+        assert!(!normal.is_micro());
+        assert!((last + 5.5).abs() < 0.01, "normal scale, got {last}");
+
+        let mut flick = EvdevScrollCurve::default();
+        flick.begin(t0);
+        for i in 1..=3 {
+            let (_, y) = flick.scale(0.0, -3.0, t0 + Duration::from_millis(8 * i));
+            last = y;
+        }
+        assert!(matches!(flick.mode, ScrollMode::Flick));
+        assert!((last + 24.0).abs() < 0.01, "flick scale, got {last}");
     }
 
     #[test]

@@ -614,7 +614,10 @@ impl GestureRecognizer {
                         self.pinch_accum = 1.0;
                         self.rotate_accum = 0.0;
                     }
-                    if dx.abs() + dy.abs() > 0.0005 {
+                    // ~0.06 points at 600 points/unit. The old 0.0005
+                    // (0.3 points) dropped slow micro-scroll frames entirely,
+                    // which read as a stutter or a sudden jump.
+                    if dx.abs() + dy.abs() > 0.0001 {
                         out.push(Gesture::Scroll {
                             dx: dx * SCROLL_PIXELS_PER_UNIT,
                             dy: dy * SCROLL_PIXELS_PER_UNIT,
