@@ -72,10 +72,11 @@ const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
 /// this host is only ~0.4-2.0 points per frame for a normal two-finger scroll.
 /// winit's Wayland PixelDelta on the same target is ~4.7-8.5 points per event,
 /// so raw evdev motion was several times too slow (and never reached the
-/// Momentum 1200 points/s flick threshold). 8.0 makes the mean evdev event
-/// ~6.2 points (winit ~6.6). `--scroll-speed` still multiplies on top inside
-/// `scroll_message`, so the user-facing speed control is unchanged.
-const EVDEV_SCROLL_SCALE: f32 = 8.0;
+/// Momentum 1200 points/s flick threshold). 6.0 makes the mean evdev event
+/// ~4.6 points, slightly slower than winit's ~6.6, after the live feel test
+/// found 8.0 a little too fast/sensitive. `--scroll-speed` still multiplies on
+/// top inside `scroll_message`, so the user-facing speed control is unchanged.
+const EVDEV_SCROLL_SCALE: f32 = 6.0;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
@@ -1226,9 +1227,14 @@ struct ScrollCoast {
 
 /// Only a genuine flick should coast. A normal or micro scroll may still have
 /// a fast final sample, so require both a short gesture with real total travel
-/// and a high average speed.
-const FLICK_MIN_TRAVEL: f32 = 15.0;
-const FLICK_MIN_AVERAGE_SPEED: f32 = 600.0;
+/// and a high average speed. Raised after the 6x evdev scale: an ordinary
+/// two-finger scroll now averages well below 1200 points/s, while a real
+/// flick is above it.
+const FLICK_MIN_TRAVEL: f32 = 20.0;
+const FLICK_MIN_AVERAGE_SPEED: f32 = 1200.0;
+/// Cap the initial glide speed. A flick can release much faster than this; the
+/// owner wants a long, gentle coast rather than a fast one.
+const COAST_MAX_START_SPEED: f32 = 1200.0;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl ScrollCoast {
@@ -1274,6 +1280,13 @@ impl ScrollCoast {
         {
             return;
         }
+        let speed = (vx * vx + vy * vy).sqrt();
+        let (vx, vy) = if speed > COAST_MAX_START_SPEED && speed > 0.0 {
+            let scale = COAST_MAX_START_SPEED / speed;
+            (vx * scale, vy * scale)
+        } else {
+            (vx, vy)
+        };
         let mut momentum = Momentum::new();
         if momentum.start(vx, vy, duration, Instant::now()) {
             self.momentum = Some(momentum);
@@ -2391,6 +2404,14 @@ impl App {
                 self.close_open_scroll();
                 self.evdev_coast.stop();
                 return;
+            }
+            if self.evdev_coast.active() {
+                // A new raw touch must stop a glide immediately, even when the
+                // recogniser's first frame is Changed rather than Began.
+                self.evdev_coast.stop();
+                if self.debug_input {
+                    eprintln!("scroll: coast stopped by new touch");
+                }
             }
             let (dx, dy) = scale_evdev_scroll(dx, dy);
             let gesture = Gesture::Scroll {
@@ -5508,7 +5529,7 @@ mod tests {
         let mut fast = ScrollCoast::default();
         fast.begin(t0);
         fast.sample(0.0, -100.0, t0 + Duration::from_millis(16));
-        fast.end(t0 + Duration::from_millis(100), true);
+        fast.end(t0 + Duration::from_millis(32), true);
         assert!(fast.active(), "a fast flick must glide");
         assert!(fast.next_at().is_some());
         let glide = fast.tick(Instant::now() + Duration::from_millis(20)).expect("glide");
@@ -5533,13 +5554,14 @@ mod tests {
     fn evdev_scroll_scale_matches_winit() {
         // Measured on this host: evdev raw Changed samples were mean 0.77,
         // median 0.39, p90 2.01 points/event; winit's PixelDelta sample was
-        // 4.7-8.5. Scale 8 puts a mean evdev event at ~6.2 points.
+        // 4.7-8.5. Scale 6 puts a mean evdev event at ~4.6 points, slightly
+        // below winit after the live feel test said 8 was too fast.
         let (_, p90) = scale_evdev_scroll(0.0, -2.01);
         let (_, median) = scale_evdev_scroll(0.0, -0.39);
         let (_, mean) = scale_evdev_scroll(0.0, -0.77);
-        assert!((p90 + 16.08).abs() < 0.01);
-        assert!((median + 3.12).abs() < 0.01);
-        assert!((mean + 6.16).abs() < 0.01);
+        assert!((p90 + 12.06).abs() < 0.01);
+        assert!((median + 2.34).abs() < 0.01);
+        assert!((mean + 4.62).abs() < 0.01);
 
         // A fast flick now reaches the coast threshold; an ordinary scroll
         // still does not (this ScrollCoast requires travel and average speed).
@@ -5548,14 +5570,14 @@ mod tests {
         flick.begin(t0);
         flick.sample(0.0, p90, t0 + Duration::from_millis(8));
         flick.sample(0.0, p90, t0 + Duration::from_millis(16));
-        flick.end(t0 + Duration::from_millis(24), true);
+        flick.end(t0 + Duration::from_millis(16), true);
         assert!(flick.next_at().is_some(), "a measured p90 flick must coast");
 
         let mut slow = ScrollCoast::default();
         slow.begin(t0);
         slow.sample(0.0, mean, t0 + Duration::from_millis(8));
         slow.sample(0.0, mean, t0 + Duration::from_millis(16));
-        slow.end(t0 + Duration::from_millis(24), true);
+        slow.end(t0 + Duration::from_millis(16), true);
         assert!(slow.next_at().is_none(), "ordinary scroll must not coast");
     }
 
