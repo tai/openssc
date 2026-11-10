@@ -84,15 +84,53 @@ const EVDEV_MICRO_THRESHOLD: f32 = 1.5;
 const EVDEV_MICRO_SCALE: f32 = 2.5;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
-fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
-    let magnitude = (dx * dx + dy * dy).sqrt();
-    let factor = if magnitude >= EVDEV_MICRO_THRESHOLD {
+fn evdev_scroll_factor(magnitude: f32) -> f32 {
+    if magnitude >= EVDEV_MICRO_THRESHOLD {
         EVDEV_SCROLL_SCALE
     } else {
         EVDEV_MICRO_SCALE
             + (EVDEV_SCROLL_SCALE - EVDEV_MICRO_SCALE) * magnitude / EVDEV_MICRO_THRESHOLD
-    };
+    }
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
+    let factor = evdev_scroll_factor((dx * dx + dy * dy).sqrt());
     (dx * factor, dy * factor)
+}
+
+/// Smoothed per-event magnitude for the micro/flick response. A single larger
+/// sample must not turn a slow micro scroll into a normal one: the EMA needs
+/// sustained motion before the scale ramps up, while the steady normal/flick
+/// speeds stay at the measured plateau.
+#[derive(Default)]
+struct EvdevScrollCurve {
+    last: Option<Instant>,
+    magnitude: f32,
+}
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl EvdevScrollCurve {
+    fn begin(&mut self, at: Instant) {
+        self.last = Some(at);
+        self.magnitude = 0.0;
+    }
+
+    fn scale(&mut self, dx: f32, dy: f32, at: Instant) -> (f32, f32) {
+        let magnitude = (dx * dx + dy * dy).sqrt();
+        let dt = self
+            .last
+            .map(|last| at.saturating_duration_since(last).as_secs_f32())
+            .unwrap_or(0.008)
+            .clamp(0.001, 0.05);
+        // ~50 ms: a deliberate micro scroll stays low; a sustained flick
+        // reaches the plateau in a few frames.
+        let alpha = 1.0 - (-dt / 0.05).exp();
+        self.magnitude += alpha * (magnitude - self.magnitude);
+        self.last = Some(at);
+        let factor = evdev_scroll_factor(self.magnitude);
+        (dx * factor, dy * factor)
+    }
 }
 
 /// `--scroll-speed`: multiplier on scroll distance, for feel calibration.
@@ -1743,6 +1781,8 @@ struct App {
     scroll_open: bool,
     /// Post-lift glide from the evdev release velocity.
     evdev_coast: ScrollCoast,
+    /// Smoothed evdev scroll response (micro vs normal/flick).
+    evdev_scroll_curve: EvdevScrollCurve,
     /// Drop winit momentum while our glide replaces it.
     suppress_winit_scroll: bool,
     /// `--grab-trackpad`: grab on focus, release on blur/exit.
@@ -1921,6 +1961,7 @@ impl App {
             evdev_gate: EvdevGestureGate::default(),
             scroll_open: false,
             evdev_coast: ScrollCoast::default(),
+            evdev_scroll_curve: EvdevScrollCurve::default(),
             suppress_winit_scroll: false,
             grab_trackpad,
             evdev_keyboard,
@@ -2425,7 +2466,7 @@ impl App {
                     eprintln!("scroll: coast stopped by new touch");
                 }
             }
-            let (dx, dy) = scale_evdev_scroll(dx, dy);
+            let (dx, dy) = self.evdev_scroll_curve.scale(dx, dy, at);
             let gesture = Gesture::Scroll {
                 dx,
                 dy,
@@ -2439,6 +2480,7 @@ impl App {
                     self.suppress_winit_scroll = false;
                     self.evdev_coast.stop();
                     self.evdev_coast.begin(at);
+                    self.evdev_scroll_curve.begin(at);
                 }
                 Phase::Changed => self.evdev_coast.sample(dx, dy, at),
                 Phase::Ended => {
@@ -5600,6 +5642,30 @@ mod tests {
         slow.sample(0.0, mean, t0 + Duration::from_millis(16));
         slow.end(t0 + Duration::from_millis(16), true);
         assert!(slow.next_at().is_none(), "ordinary scroll must not coast");
+    }
+
+    #[test]
+    fn evdev_scroll_curve_smooths_a_micro_spike() {
+        let t0 = Instant::now();
+        let mut curve = EvdevScrollCurve::default();
+        curve.begin(t0);
+        let (_, first) = curve.scale(0.0, -1.5, t0 + Duration::from_millis(8));
+        assert!(
+            first.abs() < 1.5 * 6.0,
+            "one larger sample must not jump to normal/flick: {first}"
+        );
+
+        let mut steady = EvdevScrollCurve::default();
+        steady.begin(t0);
+        let mut last = 0.0;
+        for i in 1..=12 {
+            let (_, y) = steady.scale(0.0, -1.5, t0 + Duration::from_millis(8 * i));
+            last = y;
+        }
+        assert!(
+            last.abs() > 1.5 * 6.5,
+            "sustained fast deltas should reach the plateau: {last}"
+        );
     }
 
     #[test]
