@@ -125,7 +125,7 @@ neither obvious chord reached that point:
   receives Ctrl+V, which is not paste. (VERIFIED on `mm.local`: TextEdit stayed
   empty even though the remote pasteboard already held the text.)
 
-So ss-gui translates Ctrl+V into the remote's own paste:
+So openssc translates Ctrl+V into the remote's own paste:
 
 - The chord is **Ctrl+V alone** — no Shift, Alt or Super. `Ctrl+Shift+V` stays
   the pull-file shortcut and `Ctrl+Alt+…` stays the gesture-test shortcuts; on
@@ -154,7 +154,7 @@ So ss-gui translates Ctrl+V into the remote's own paste:
 - Repeats and the local key-up are swallowed: the remote never sees a bare
   Ctrl+V or a V-up without its V-down.
 
-Verified with `wtype -M ctrl -P v -p v -m ctrl` into the focused ss-gui window
+Verified with `wtype -M ctrl -P v -p v -m ctrl` into the focused openssc window
 while `--debug-input` was on: the log showed `clipboard -> text …` and `paste:
 remote Cmd+V sent ~205 ms after the clipboard`, the wire showed Ctrl-up,
 `0x06`, `0x1f`, then `Super_L`/`v`/`v`/`Super_L`, and the remote TextEdit
@@ -175,7 +175,7 @@ as lossy UTF-8 text and hid the image path entirely. The text reader now asks
 
 Limitation: without a keyboard grab the compositor's SUPER+V cannot be
 reclaimed. Ctrl+V is the chord that is guaranteed to reach the window; this is
-documented in `ss-gui --help`. The path needs the automatic clipboard:
+documented in `openssc --help`. The path needs the automatic clipboard:
 `--no-clipboard` means no `0x15 AutoPasteboard`, so pushed text would be
 ignored; Ctrl+V then logs that the clipboard is off instead of pretending to
 paste.
@@ -227,7 +227,7 @@ printf 'L2R\n' | pbcopy
 ssh tai@mm.local 'osascript -e "the clipboard as text"'
 ssh tai@mm.local 'pbpaste'      # expect L2R: real data, not a promise
 
-# local -> remote paste: focus ss-gui, then Ctrl+V (Wayland; SUPER+V is the
+# local -> remote paste: focus openssc, then Ctrl+V (Wayland; SUPER+V is the
 # compositor's). Check both the clipboard and the app that received the paste.
 wl-copy 'paste me'
 wtype -M ctrl -P v -p v -m ctrl

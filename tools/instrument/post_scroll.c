@@ -1,7 +1,7 @@
 // Post a synthetic scroll wheel event into the frontmost window owned by a
-// given process name. Used to drive ss-gui without a physical trackpad.
+// given process name. Used to drive openssc without a physical trackpad.
 // Build: clang -framework CoreGraphics -framework CoreFoundation -framework AppKit post_scroll.c -o post_scroll
-// Run:   ./post_scroll ss-gui 5
+// Run:   ./post_scroll openssc 5
 #include <CoreFoundation/CoreFoundation.h>
 #include <CoreGraphics/CoreGraphics.h>
 #include <stdio.h>

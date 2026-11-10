@@ -20,7 +20,7 @@ fn usage() -> &'static str {
                           [gesture opts] --out artifacts/gesture.png
   ss-client demo-input    --x 1000 --y 800 --text hello --out artifacts/input.png
   ss-client clipboard     --text hello [--no-auto]
-  ss-client clipboard-sync --text \"ss-clone sync test\" [--wait-ms 3000]
+  ss-client clipboard-sync --text \"openssc sync test\" [--wait-ms 3000]
   ss-client clipboard-read [--wait-ms 4000] [--no-auto] [--poll-fetch] [--fetch-len N] [--dump] [--quiet]
   ss-client mvs-file      --in artifacts/mvs-fixture.bin [--quant artifacts/mvs-fixture-quant.bin] [--out artifacts/mvs.png]
   ss-client mvs-compare   --out artifacts/cmp-mvs.png [--out-zlib artifacts/cmp-zlib.png] [--timeout-secs 30]
@@ -430,7 +430,7 @@ fn main() -> Result<()> {
                 writer.send(&auto_pasteboard(1))?;
                 std::thread::sleep(Duration::from_millis(200));
             }
-            let text = get(&opts, "text").unwrap_or("ss-clone clipboard test");
+            let text = get(&opts, "text").unwrap_or("openssc clipboard test");
             writer.send(&client_cut_text(text.as_bytes()))?;
             println!("sent clipboard text: {text:?}");
             // The server installs the text as a *promise* on the remote
@@ -445,7 +445,7 @@ fn main() -> Result<()> {
             // the resulting remote pasteboard back.
             session.start_streaming()?;
             let (mut reader, mut writer) = session.split()?;
-            let text = get(&opts, "text").unwrap_or("ss-clone sync test");
+            let text = get(&opts, "text").unwrap_or("openssc sync test");
             writer.send(&auto_pasteboard(1))?;
             std::thread::sleep(Duration::from_millis(300));
             writer.send(&client_cut_text(text.as_bytes()))?;

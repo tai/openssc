@@ -6,6 +6,27 @@ code, then `docs/protocol/*.md`; how to measure it is `docs/testing.md`. The
 top entry is the one to read first, and the one to update at the end of a
 session (template in `AGENTS.md` §10).
 
+## 2026-11-10 — project rename `ss-clone` → `OpenSSC` (binary `openssc`)
+
+- Marketing/identity rename only; no protocol or behaviour change intended.
+- The GUI package `crates/ss-gui` is now `crates/openssc` and its binary is
+  `openssc` (`cargo build --release -p openssc` → `target/release/openssc`).
+  Window titles, usage text (`Usage: openssc [options]`), temp-file names, the
+  udev rule name (`69-openssc-input.rules`), `ss-client` test strings and
+  packaging (Linux `openssc.desktop` / `openssc-launch` /
+  `share/icons/hicolor/scalable/apps/openssc.svg`, macOS
+  `packaging/mac/build_openssc.sh` → `OpenSSC.app`) all follow the new name.
+- Environment/config paths move accordingly: `~/.config/openssc/config`,
+  `$XDG_STATE_HOME/openssc/openssc.log`, lock `/tmp/openssc-gui.lock`. The
+  `SS_HOST` env var is unchanged; `SS_GUI` (launcher binary override) is kept
+  for compatibility.
+- Dated experiment records below (`## YYYY-MM-DD` entries) and
+  `docs/findings/*` keep the spellings that were true on the day — they cite
+  measurements, not current state. Current-state docs (`README.md`,
+  `AGENTS.md`, `docs/testing.md`, `docs/protocol/*`) use the new name.
+- Verified: `cargo test --workspace` green after the rename; macOS bundle
+  built and launched from `packaging/mac/OpenSSC.app`.
+
 ## 2026-11-06 — **v1.5.0**: full-resolution MVS decode throughput and visual-latency parity (VERIFIED on the replay fixture and on camera)
 
 - Phase / milestone: M1/M6 — the client must keep up with the server during a

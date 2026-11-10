@@ -10,6 +10,9 @@ secrets/
 # Rust
 target/
 
+# macOS app bundle output (packaging/mac/OpenSSC.app contains the binary)
+packaging/mac/OpenSSC.app/
+
 # Python
 __pycache__/
 *.pyc

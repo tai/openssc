@@ -11,9 +11,9 @@
 # the window so grim captures a known rectangle. The client itself does not
 # depend on Hyprland. For a compositor-agnostic check use wayland-smoke.sh.
 #
-# The run is serialized on /tmp/ss-clone-gui.lock with `flock -o` (the lock fd
+# The run is serialized on /tmp/openssc-gui.lock with `flock -o` (the lock fd
 # is close-on-exec so wl-copy cannot inherit and hold it), refuses to start if
-# any ss-gui is already running, uses --no-clipboard (clipboard is another
+# any openssc is already running, uses --no-clipboard (clipboard is another
 # agent's test surface), and is bounded by --exit-after-secs plus timeout.
 set -u
 
@@ -26,7 +26,7 @@ OUT=
 WORKSPACE=
 SECS=40
 SKIP_BUILD=0
-BIN=${SS_GUI_BIN:-$ROOT/target/release/ss-gui}
+BIN=${SS_GUI_BIN:-$ROOT/target/release/openssc}
 
 usage() {
   sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'
@@ -62,15 +62,15 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required"
 
 # One client at a time across all agents. -o is important: wl-copy and other
 # children must not inherit the lock fd or the lock can outlive this script.
-exec 9>/tmp/ss-clone-gui.lock
-flock -o -w 600 9 || die "could not acquire /tmp/ss-clone-gui.lock"
-if pgrep -x ss-gui >/dev/null; then
-  die "another ss-gui is already running; wait for it to exit"
+exec 9>/tmp/openssc-gui.lock
+flock -o -w 600 9 || die "could not acquire /tmp/openssc-gui.lock"
+if pgrep -x openssc >/dev/null; then
+  die "another openssc is already running; wait for it to exit"
 fi
 
 if [ "$SKIP_BUILD" -eq 0 ]; then
   command -v cargo >/dev/null 2>&1 || die "cargo not found; export PATH=\"\$HOME/.cargo/bin:\$PATH\""
-  (cd "$ROOT" && cargo build --release -p ss-gui) || die "release build failed"
+  (cd "$ROOT" && cargo build --release -p openssc) || die "release build failed"
 fi
 [ -x "$BIN" ] || die "no client binary at $BIN"
 
@@ -205,7 +205,7 @@ fi
 wait "$pid" 2>/dev/null
 rc=$?
 CLIENT_PID=
-if pgrep -x ss-gui >/dev/null; then
-  echo "note: another ss-gui is running; this script did not start it" >&2
+if pgrep -x openssc >/dev/null; then
+  echo "note: another openssc is running; this script did not start it" >&2
 fi
 exit "$rc"

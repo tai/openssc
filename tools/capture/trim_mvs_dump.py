@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Trim an `SS_DUMP_MVS` capture to an arrival-time window.
 
-The GUI dump (`SS_DUMP_MVS=<path> ss-gui ...`) records every MVS body from
+The GUI dump (`SS_DUMP_MVS=<path> openssc ...`) records every MVS body from
 connect through whatever the client sees, which includes the initial paint and
 any unrelated animation on the remote screen. The decode benchmark wants one
 scroll burst, so this cuts the stream by arrival time:

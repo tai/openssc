@@ -475,9 +475,9 @@ fn text_keysym(c: char) -> u32 {
 /// Keep this in sync with the parser below: `usage_documents_every_flag` scans
 /// this file for flag literals and fails if one is missing here.
 const USAGE: &str = "\
-ss-gui — Apple Screen Sharing client (RFB 003.889 + Apple extensions)
+openssc — Apple Screen Sharing client (RFB 003.889 + Apple extensions)
 
-Usage: ss-gui [options]
+Usage: openssc [options]
 
 Connection:
   --host <host>            server host                         (default mm.local)
@@ -708,7 +708,7 @@ fn local_clipboard_image() -> Option<(&'static str, Vec<u8>)> {
     #[cfg(target_os = "macos")]
     {
         let path = std::env::temp_dir().join(format!(
-            "ss-clone-read-clip-{}.png",
+            "openssc-read-clip-{}.png",
             std::process::id()
         ));
         let script = format!(
@@ -752,7 +752,7 @@ fn set_local_clipboard_image(uti: &str, data: &[u8]) {
         _ => ("png", "PNGf"),
     };
     let path = std::env::temp_dir().join(format!(
-        "ss-clone-clipboard-{}-{}.{ext}",
+        "openssc-clipboard-{}-{}.{ext}",
         std::process::id(),
         now_ms()
     ));
@@ -2249,15 +2249,15 @@ impl App {
         let Some(window) = &self.window else { return };
         match self.keyboard_toggle.mode() {
             KeyboardGrabMode::Grabbed => {
-                window.set_title("ss-clone — keyboard grabbed: Ctrl+Alt+Esc to release")
+                window.set_title("OpenSSC — keyboard grabbed: Ctrl+Alt+Esc to release")
             }
             KeyboardGrabMode::Paused => window.set_title(
-                "ss-clone — keyboard paused: local shortcuts active, Ctrl+Alt+Esc grabs",
+                "OpenSSC — keyboard paused: local shortcuts active, Ctrl+Alt+Esc grabs",
             ),
             KeyboardGrabMode::Plain if self.window_focused => {
-                window.set_title("ss-clone — Apple Screen Sharing")
+                window.set_title("OpenSSC — Apple Screen Sharing")
             }
-            KeyboardGrabMode::Plain => window.set_title("ss-clone — click to focus"),
+            KeyboardGrabMode::Plain => window.set_title("OpenSSC — click to focus"),
         }
     }
 
@@ -2459,7 +2459,7 @@ impl App {
             "pull-from-remote: Cmd/Ctrl+Shift+V -> fetch 1/{PULL_FETCHES}, waiting for its archive"
         );
         if let Some(window) = &self.window {
-            window.set_title("ss-clone — pull: reading remote clipboard…");
+            window.set_title("OpenSSC — pull: reading remote clipboard…");
         }
         self.send(clipboard_fetch());
 
@@ -2505,7 +2505,7 @@ impl App {
                     );
                     let name = cached.rsplit('/').next().unwrap_or("file");
                     let _ = proxy.send_event(UserEvent::PullStatus(format!(
-                        "ss-clone — pulling {name}…"
+                        "OpenSSC — pulling {name}…"
                     )));
                     let _ = tx.send(rfb_proto::filecopy::start_file_send(&cached, session));
                     return;
@@ -2520,7 +2520,7 @@ impl App {
                 state.started.elapsed().as_millis()
             );
             let _ = proxy.send_event(UserEvent::PullStatus(
-                "ss-clone — No path on the remote clipboard - on the remote, put the path on the clipboard as TEXT (e.g. copy it from a Terminal), then press Cmd+Shift+V again; or drop the file on this window."
+                "OpenSSC — No path on the remote clipboard - on the remote, put the path on the clipboard as TEXT (e.g. copy it from a Terminal), then press Cmd+Shift+V again; or drop the file on this window."
                     .to_string(),
             ));
         });
@@ -2545,7 +2545,7 @@ impl App {
                 "paste: the automatic clipboard is off (--no-clipboard); Ctrl+V cannot reach the remote pasteboard"
             );
             if let Some(window) = &self.window {
-                window.set_title("ss-clone — clipboard is off (--no-clipboard)");
+                window.set_title("OpenSSC — clipboard is off (--no-clipboard)");
             }
             return;
         }
@@ -2554,7 +2554,7 @@ impl App {
         // the next real key re-synthesises whatever is still held.
         self.sync_modifiers(ModifiersState::empty());
         if let Some(window) = &self.window {
-            window.set_title("ss-clone — sending local clipboard…");
+            window.set_title("OpenSSC — sending local clipboard…");
         }
         let tx = self.tx.clone();
         let debug = self.debug_input;
@@ -2578,7 +2578,7 @@ impl App {
             } else {
                 eprintln!("paste: local clipboard has no text or image - nothing sent");
                 let _ = proxy.send_event(UserEvent::PasteStatus(
-                    "ss-clone — local clipboard is empty".to_string(),
+                    "OpenSSC — local clipboard is empty".to_string(),
                 ));
                 return;
             };
@@ -2606,7 +2606,7 @@ impl App {
                 );
             }
             let _ = proxy.send_event(UserEvent::PasteStatus(
-                "ss-clone — Apple Screen Sharing".to_string(),
+                "OpenSSC — Apple Screen Sharing".to_string(),
             ));
         });
     }
@@ -3121,7 +3121,7 @@ impl ApplicationHandler<UserEvent> for App {
             UserEvent::Disconnected(reason) => {
                 eprintln!("session disconnected: {reason}");
                 if let Some(w) = &self.window {
-                    w.set_title("ss-clone — disconnected");
+                    w.set_title("OpenSSC — disconnected");
                 }
             }
             UserEvent::PullStatus(status) => {
@@ -3172,7 +3172,7 @@ impl ApplicationHandler<UserEvent> for App {
                     self.modifiers = ModifiersState::empty();
                     self.sync_modifiers(ModifiersState::empty());
                     if let Some(w) = &self.window {
-                        w.set_title("ss-clone — grab released — click away to re-arm");
+                        w.set_title("OpenSSC — grab released — click away to re-arm");
                     }
                 }
                 grab::GrabEvent::HoldCancelled { held } => {
@@ -3237,7 +3237,7 @@ impl ApplicationHandler<UserEvent> for App {
         // first about_to_wait picks the actual monitor and may resize once.
         let (win_w, win_h) = self.window_size.unwrap_or((1280.0, 800.0));
         let attrs = Window::default_attributes()
-            .with_title("ss-clone — Apple Screen Sharing")
+            .with_title("OpenSSC — Apple Screen Sharing")
             .with_inner_size(LogicalSize::new(win_w, win_h));
         let window = Arc::new(event_loop.create_window(attrs).expect("create window"));
         let Some(context) = self.context.as_ref() else {
@@ -3364,7 +3364,7 @@ impl ApplicationHandler<UserEvent> for App {
             WindowEvent::DroppedFile(path) => {
                 note_input();
                 if let Some(window) = &self.window {
-                    window.set_title("ss-clone — Apple Screen Sharing");
+                    window.set_title("OpenSSC — Apple Screen Sharing");
                 }
                 let debug = self.debug_input;
                 let destination = self.file_dest.clone();
@@ -3384,12 +3384,12 @@ impl ApplicationHandler<UserEvent> for App {
                         .file_name()
                         .and_then(|name| name.to_str())
                         .unwrap_or("file");
-                    window.set_title(&format!("ss-clone — drop {name} to send"));
+                    window.set_title(&format!("OpenSSC — drop {name} to send"));
                 }
             }
             WindowEvent::HoveredFileCancelled => {
                 if let Some(window) = &self.window {
-                    window.set_title("ss-clone — Apple Screen Sharing");
+                    window.set_title("OpenSSC — Apple Screen Sharing");
                 }
             }
             WindowEvent::CursorEntered { .. } => {
@@ -4447,7 +4447,7 @@ fn main() -> Result<()> {
                 eprintln!("grab: cannot create the keyboard event tap: {reason}");
                 let exe = std::env::current_exe()
                     .map(|p| p.display().to_string())
-                    .unwrap_or_else(|_| "ss-gui".to_string());
+                    .unwrap_or_else(|_| "openssc".to_string());
                 eprintln!(
                     "grab: grant Accessibility to this binary: System Settings > Privacy & Security > Accessibility -> + -> {exe}"
                 );
@@ -4956,7 +4956,7 @@ fn main() -> Result<()> {
                         );
                         let name = source.path.rsplit('/').next().unwrap_or("file");
                         let _ = reader_proxy.send_event(UserEvent::PullStatus(format!(
-                            "ss-clone — pulling {name}…"
+                            "OpenSSC — pulling {name}…"
                         )));
                         // Keep the cached remote path in step with what was
                         // just pulled.

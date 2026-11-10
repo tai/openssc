@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# wayland-smoke.sh — prove that ss-gui builds, connects, paints and can present
+# wayland-smoke.sh — prove that openssc builds, connects, paints and can present
 # a window on this Linux/Wayland host, without a camera and without eyeballing.
 #
 #   tools/measure/wayland-smoke.sh
@@ -8,7 +8,7 @@
 #   tools/measure/wayland-smoke.sh --no-grim               # headless check only
 #
 # What it does:
-#   1. cargo build --release -p ss-gui
+#   1. cargo build --release -p openssc
 #   2. runs it against the lab server with --mvs and the built-in headless dump
 #      path (--dump/--dump-after/--exit-after-dump) long enough to paint
 #   3. validates the PNG with tools/measure/png_probe.py (stdlib Python only):
@@ -29,7 +29,7 @@
 #
 # It proves: release build, auth + session, MVS decode, at least one painted
 # framebuffer, a non-trivial dumped image of the expected size, a clean exit, and
-# (with grim) that the compositor has a mapped ss-gui window. It does NOT prove
+# (with grim) that the compositor has a mapped openssc window. It does NOT prove
 # input, gestures, clipboard, file copy, frame rate, latency, colour accuracy, or
 # that the image is the current remote screen (a stale frame would pass).
 #
@@ -53,7 +53,7 @@ EXPECT=2560x1600
 MIN_COLOURS=8
 SKIP_BUILD=0
 GRIM=auto                       # auto | off
-BIN=${SS_GUI_BIN:-$ROOT/target/release/ss-gui}
+BIN=${SS_GUI_BIN:-$ROOT/target/release/openssc}
 
 usage() {
   sed -n '2,48p' "$0" | sed 's/^# \{0,1\}//'
@@ -88,22 +88,22 @@ command -v python3 >/dev/null 2>&1 || die "python3 is required (stdlib only)"
 [ -f "$HERE/png_probe.py" ] || die "missing $HERE/png_probe.py"
 
 mkdir -p "$OUT"
-DUMP=$OUT/ss-gui.png
-LOG=$OUT/ss-gui.log
-GRIM_PNG=$OUT/ss-gui-grim.png
+DUMP=$OUT/openssc.png
+LOG=$OUT/openssc.log
+GRIM_PNG=$OUT/openssc-grim.png
 rm -f "$DUMP" "$LOG" "$GRIM_PNG"
 
 # ---------------------------------------------------------------- build
 if [ "$SKIP_BUILD" -eq 0 ]; then
   command -v cargo >/dev/null 2>&1 || \
     die "cargo not found; export PATH=\"\$HOME/.cargo/bin:\$PATH\""
-  echo "== build: cargo build --release -p ss-gui"
-  if ! (cd "$ROOT" && cargo build --release -p ss-gui); then
+  echo "== build: cargo build --release -p openssc"
+  if ! (cd "$ROOT" && cargo build --release -p openssc); then
     cat >&2 <<'EOF'
 FAIL: release build failed.
 
 If the error mentions `grab::` (for example "cannot find module or crate
-`grab`" in crates/ss-gui/src/main.rs), the Linux platform seam has not landed
+`grab`" in crates/openssc/src/main.rs), the Linux platform seam has not landed
 yet. That is a crates/ problem owned by another change, not this harness; do
 not edit crates/ to get the smoke test green. Re-run after it lands.
 
@@ -215,7 +215,7 @@ except Exception:
 for c in clients:
     cls = c.get("class") or c.get("initialClass") or ""
     title = c.get("title") or ""
-    if cls == "ss-gui" or title.startswith("ss-clone"):
+    if cls == "openssc" or title.startswith("openssc"):
         if not c.get("mapped", True) or c.get("hidden", False):
             continue
         addr = c.get("address") or ""
@@ -241,7 +241,7 @@ fi
 addr=       # compositor window address, used for a clean close
 geom=       # grim geometry
 if [ "$do_grim" -eq 1 ]; then
-  echo "== grim: looking for the ss-gui window"
+  echo "== grim: looking for the openssc window"
   info=
   for _ in $(seq 1 50); do
     info=$(window_info 2>/dev/null) && break
@@ -322,7 +322,7 @@ FAIL: the client wrote the dump but segfaulted on exit (status 139, SIGSEGV).
 
 This was a softbuffer Wayland teardown bug, fixed in 4598e4c. If it is back,
 the crash is in drop of WaylandDisplayImpl after winit tears down the
-connection; that is a crates/ss-gui lifetime problem, not the smoke harness.
+connection; that is a crates/openssc lifetime problem, not the smoke harness.
 Do not edit crates/ here; report it to the platform owner.
 EOF
   else
@@ -363,7 +363,7 @@ if [ "$terminated" -eq 1 ]; then
 else
   echo "        one painted frame of $EXPECT with non-trivial content; clean exit;"
 fi
-echo "        (with grim) a mapped ss-gui window seen by the compositor."
+echo "        (with grim) a mapped openssc window seen by the compositor."
 echo "Not proved: input, gestures, clipboard/file copy, frame rate, latency, colour"
 echo "        fidelity, or that the frame is current. No camera is involved."
 exit 0

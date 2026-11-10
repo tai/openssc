@@ -358,7 +358,7 @@ fn permission_help(name: &str, path: &Path) -> io::Error {
         format!(
             "touchpad {name} ({}) is present but cannot be opened: permission denied.\n\
              Grant access to this device only with a udev uaccess rule (preferred):\n\
-             /etc/udev/rules.d/69-ss-clone-input.rules\n\
+             /etc/udev/rules.d/69-openssc-input.rules\n\
              SUBSYSTEM==\"input\", KERNEL==\"event*\", ENV{{ID_INPUT_TOUCHPAD}}==\"1\", TAG+=\"uaccess\"\n\
              then: sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input\n\
              Coarse alternative (grants every input device, including every keyboard): add this\n\

@@ -48,7 +48,7 @@ fn keyboard_permission_help(name: &str, path: &Path) -> io::Error {
         format!(
             "keyboard {name} ({}) is present but cannot be opened: permission denied.\n\
              Grant access to the Apple internal keyboard only with a udev uaccess rule:\n\
-             /etc/udev/rules.d/69-ss-clone-input.rules\n\
+             /etc/udev/rules.d/69-openssc-input.rules\n\
              SUBSYSTEM==\"input\", KERNEL==\"event*\", ENV{{ID_INPUT_KEYBOARD}}==\"1\", ENV{{ID_MODEL_ID}}==\"0274\", ENV{{ID_VENDOR_ID}}==\"05ac\", TAG+=\"uaccess\"\n\
              then: sudo udevadm control --reload-rules && sudo udevadm trigger --subsystem-match=input\n\
              Do not add the user to the `input` group: that exposes every keyboard.",

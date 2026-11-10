@@ -1,16 +1,16 @@
 [Desktop Entry]
 Type=Application
 Version=1.0
-Name=ss-clone
+Name=OpenSSC
 GenericName=Apple Screen Sharing client
 Comment=Apple Screen Sharing client (RFB 003.889 + Apple gestures)
 # --mvs is not optional for a desktop launch: without it the client advertises
 # Zlib (6), which this server produces at 700-880 ms/frame instead of 44-49 ms.
-Exec=ss-clone-launch
-TryExec=ss-clone-launch
-Icon=ss-clone
+Exec=openssc-launch
+TryExec=openssc-launch
+Icon=openssc
 Terminal=false
 Categories=Network;RemoteAccess;
 Keywords=screen sharing;vnc;rfb;apple;remote desktop;
 StartupNotify=true
-StartupWMClass=ss-gui
+StartupWMClass=openssc

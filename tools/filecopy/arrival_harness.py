@@ -2,7 +2,7 @@
 """File-arrival harness for the file-copy milestone (NOT product code).
 
 The file-copy UX is drag-based:
-  * local -> remote: a file dropped on the ss-gui window is sent;
+  * local -> remote: a file dropped on the openssc window is sent;
   * remote -> local: files are saved to a receive directory locally.
 
 This harness verifies the *arrival* half of those checks, independent of the

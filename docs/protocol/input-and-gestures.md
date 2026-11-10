@@ -311,7 +311,7 @@ for chords (`Cmd+Shift+V`) and for named keys; it does not produce uppercase.
 
 ## 7. Keyboard grab (macOS) — local shortcuts belong to the remote
 
-While the ss-gui window is focused, a session-level `CGEventTap`
+While the openssc window is focused, a session-level `CGEventTap`
 (`kCGSessionEventTap`, consume-capable) takes keyDown/keyUp/flagsChanged and
 routes them to the remote instead of letting macOS handle them. Without this,
 global shortcuts are consumed by the window server before any app sees them:
@@ -368,7 +368,7 @@ cargo run -p ss-client -- gesture --host mm.local --kind wheel \
     --dy -10 --point-y 0 --x 1200 --y 800 --out artifacts/s.png
 ```
 
-`ss-gui` maps winit `MouseWheel` and the evdev recogniser onto subtype 11: pixel
+`openssc` maps winit `MouseWheel` and the evdev recogniser onto subtype 11: pixel
 deltas are divided by `SCROLL_POINTS_PER_LINE` (24, tunable with
 `--scroll-speed`), the precise path puts the whole value in `fixedDelta` with
 zero lines and keeps **no** local remainder (the server accumulates), wheel input

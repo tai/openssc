@@ -1,5 +1,5 @@
 [workspace]
-members = ["crates/rfb-proto", "crates/ss-client", "crates/ss-gui", "crates/gesture-input"]
+members = ["crates/rfb-proto", "crates/ss-client", "crates/openssc", "crates/gesture-input"]
 resolver = "2"
 
 [workspace.package]
@@ -13,7 +13,7 @@ opt-level = 1
 [profile.dev.package."*"]
 opt-level = 2
 
-[profile.dev.package.ss-gui]
+[profile.dev.package.openssc]
 opt-level = 3
 
 [profile.dev.package.rfb-proto]

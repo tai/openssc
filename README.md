@@ -1,4 +1,4 @@
-# ss-clone
+# OpenSSC
 
 A protocol-compatible client for Apple Screen Sharing (`RFB 003.889` + Apple
 extensions), targeting **Linux/Wayland** while using the real macOS server as
@@ -34,8 +34,8 @@ rather than judged by eye.
 Requirements: Rust 1.97+, `mm.local` reachable, account `tai` / `$SS_PASSWORD`.
 
 ```sh
-cargo build --release -p ss-gui
-./target/release/ss-gui --host mm.local --mvs
+cargo build --release -p openssc
+./target/release/openssc --host mm.local --mvs
 ```
 
 `--mvs` is the fast path: MultiVariant plus server push. Without it the client
@@ -82,7 +82,7 @@ MVS (0.05-1 MB).
 - Run with `--debug-input` to trace input, keys, clipboard and framebuffer
   timing; `SS_LATDBG=1` adds decode/paint timing
   (`python3 tools/measure/decode_backlog.py <log>`).
-- If the title says `ss-clone — disconnected`, the session reader hit a
+- If the title says `OpenSSC — disconnected`, the session reader hit a
   protocol or socket error; the terminal shows the reason.
 - Pinch and rotate send a full phase series, because macOS ignores a lone
   `phase 2` frame.
@@ -114,7 +114,7 @@ tools/measure/            latency harness: camera A/B, scroll, decode backlog,
 packaging/                .desktop entry, launcher, icon, user installer
 crates/rfb-proto/         portable protocol crate (no I/O, no OS types)
 crates/ss-client/         CLI client (probe/snapshot/input/gestures)
-crates/ss-gui/            winit + softbuffer frontend
+crates/openssc/            winit + softbuffer frontend
 crates/gesture-input/     portable recogniser + Linux evdev backend
 captures/, artifacts/     untracked captures and test fixtures
 ```
@@ -132,7 +132,7 @@ not yet been verified on Linux. Method, numbers and caveats:
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"   # rustup installs user-space
-cargo build --release -p ss-gui
+cargo build --release -p openssc
 cargo test --workspace
 ```
 
@@ -160,7 +160,7 @@ works but local clipboard sync is silently absent.
 ### Run
 
 ```sh
-./target/release/ss-gui --host mm.local --mvs
+./target/release/openssc --host mm.local --mvs
 ```
 
 `--mvs` is the fast path; without it the client advertises Zlib (6), the slow
@@ -215,10 +215,10 @@ tools/measure/render-capture.sh --filter auto --size 1600x1000 \
 ./packaging/install.sh --no-build       # install the existing release binary
 ```
 
-The entry launches `ss-clone-launch`, which always passes `--mvs`, logs stderr to
-`${XDG_STATE_HOME:-~/.local/state}/ss-clone/ss-gui.log`, and notifies on a
+The entry launches `openssc-launch`, which always passes `--mvs`, logs stderr to
+`${XDG_STATE_HOME:-~/.local/state}/openssc/openssc.log`, and notifies on a
 failed connect. Set `SS_HOST` in the environment or in
-`~/.config/ss-clone/config`.
+`~/.config/openssc/config`.
 
 ### Not on Wayland yet
 

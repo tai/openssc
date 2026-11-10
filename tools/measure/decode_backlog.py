@@ -1,14 +1,14 @@
 #!/usr/bin/env python3
 """Turn `SS_LATDBG=1` client logs into a decode-backlog report.
 
-`SS_LATDBG=1 ss-gui ...` makes the session reader stamp each update's arrival
+`SS_LATDBG=1 openssc ...` makes the session reader stamp each update's arrival
 (`ARR`) and the decoder stamp each finished batch (`DEC updates=N ... last_arr=`),
 with `PAINT` lines when the UI presents. The gap between an update arriving and
 the picture being ready is the backlog: if it grows during a scroll, the decoder
 is losing ground and the picture plays the scroll back late, however fast the
 network is.
 
-    SS_LATDBG=1 ./target/release/ss-gui --host mm.local --mvs > /tmp/dbg.log 2>&1 &
+    SS_LATDBG=1 ./target/release/openssc --host mm.local --mvs > /tmp/dbg.log 2>&1 &
     # ... scroll ...
     python3 tools/measure/decode_backlog.py /tmp/dbg.log
 

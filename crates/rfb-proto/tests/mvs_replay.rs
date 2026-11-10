@@ -1,7 +1,7 @@
 //! Replay a captured full-resolution MVS scroll burst through the decoder.
 //!
 //! The fixture is an untracked analysis artifact produced by
-//! `SS_DUMP_MVS=<path> ss-gui ...` (see `dump_mvs` in `crates/ss-gui`); it is
+//! `SS_DUMP_MVS=<path> openssc ...` (see `dump_mvs` in `crates/openssc`); it is
 //! the length-prefixed stream of every `0x3f3` body the client received, in
 //! arrival order:
 //!

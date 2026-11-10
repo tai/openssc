@@ -1,16 +1,16 @@
 #!/bin/sh
-# install.sh — install ss-gui and its desktop entry for one user (default) or a
+# install.sh — install openssc and its desktop entry for one user (default) or a
 # prefix such as /usr/local.
 #
 #   ./packaging/install.sh                  # ~/.local, builds release first
-#   ./packaging/install.sh --no-build       # use target/release/ss-gui as is
+#   ./packaging/install.sh --no-build       # use target/release/openssc as is
 #   ./packaging/install.sh --prefix /usr/local   # needs write access
 #
 # Files:
-#   $PREFIX/bin/ss-gui
-#   $PREFIX/bin/ss-clone-launch
-#   $PREFIX/share/applications/ss-clone.desktop  (Exec uses the absolute path)
-#   $PREFIX/share/icons/hicolor/scalable/apps/ss-clone.svg
+#   $PREFIX/bin/openssc
+#   $PREFIX/bin/openssc-launch
+#   $PREFIX/share/applications/openssc.desktop  (Exec uses the absolute path)
+#   $PREFIX/share/icons/hicolor/scalable/apps/openssc.svg
 #
 # Uninstall by removing those four paths. No system service is installed and no
 # extension/plugin is loaded: it is a normal Wayland client, started on demand.
@@ -36,9 +36,9 @@ if [ "$BUILD" -eq 1 ]; then
     echo "cargo not found; export PATH=\"\$HOME/.cargo/bin:\$PATH\"" >&2
     exit 1
   }
-  (cd "$ROOT" && cargo build --release -p ss-gui)
+  (cd "$ROOT" && cargo build --release -p openssc)
 fi
-BIN=$ROOT/target/release/ss-gui
+BIN=$ROOT/target/release/openssc
 [ -x "$BIN" ] || { echo "no built client at $BIN (drop --no-build?)" >&2; exit 1; }
 
 BINDIR=$PREFIX/bin
@@ -46,17 +46,17 @@ APPDIR=$PREFIX/share/applications
 ICONDIR=$PREFIX/share/icons/hicolor/scalable/apps
 mkdir -p "$BINDIR" "$APPDIR" "$ICONDIR"
 
-install -m 0755 "$BIN" "$BINDIR/ss-gui"
-install -m 0755 "$HERE/ss-clone-launch.sh" "$BINDIR/ss-clone-launch"
-install -m 0644 "$HERE/ss-clone.svg" "$ICONDIR/ss-clone.svg"
+install -m 0755 "$BIN" "$BINDIR/openssc"
+install -m 0755 "$HERE/openssc-launch.sh" "$BINDIR/openssc-launch"
+install -m 0644 "$HERE/openssc.svg" "$ICONDIR/openssc.svg"
 
 # The committed .desktop is valid for /usr/bin packaging; a user prefix needs an
 # absolute launcher path because ~/.local/bin is not always on a GUI session's
 # PATH. TryExec must point at the same absolute path or the menu entry is hidden.
-sed -e "s|^Exec=ss-clone-launch$|Exec=$BINDIR/ss-clone-launch|" \
-    -e "s|^TryExec=ss-clone-launch$|TryExec=$BINDIR/ss-clone-launch|" \
-    "$HERE/ss-clone.desktop" >"$APPDIR/ss-clone.desktop"
-chmod 0644 "$APPDIR/ss-clone.desktop"
+sed -e "s|^Exec=openssc-launch$|Exec=$BINDIR/openssc-launch|" \
+    -e "s|^TryExec=openssc-launch$|TryExec=$BINDIR/openssc-launch|" \
+    "$HERE/openssc.desktop" >"$APPDIR/openssc.desktop"
+chmod 0644 "$APPDIR/openssc.desktop"
 
 if command -v update-desktop-database >/dev/null 2>&1; then
   update-desktop-database "$APPDIR" >/dev/null 2>&1 || true
@@ -66,12 +66,12 @@ if command -v gtk-update-icon-cache >/dev/null 2>&1; then
 fi
 
 echo "installed:"
-echo "  $BINDIR/ss-gui"
-echo "  $BINDIR/ss-clone-launch"
-echo "  $APPDIR/ss-clone.desktop"
-echo "  $ICONDIR/ss-clone.svg"
+echo "  $BINDIR/openssc"
+echo "  $BINDIR/openssc-launch"
+echo "  $APPDIR/openssc.desktop"
+echo "  $ICONDIR/openssc.svg"
 echo
-echo "Launch \"ss-clone\" from the application menu, or run:"
-echo "  $BINDIR/ss-clone-launch"
-echo "Host: SS_HOST (default mm.local); see \${XDG_CONFIG_HOME:-\$HOME/.config}/ss-clone/config"
-echo "Log:  \${XDG_STATE_HOME:-\$HOME/.local/state}/ss-clone/ss-gui.log"
+echo "Launch \"openssc\" from the application menu, or run:"
+echo "  $BINDIR/openssc-launch"
+echo "Host: SS_HOST (default mm.local); see \${XDG_CONFIG_HOME:-\$HOME/.config}/openssc/config"
+echo "Log:  \${XDG_STATE_HOME:-\$HOME/.local/state}/openssc/openssc.log"

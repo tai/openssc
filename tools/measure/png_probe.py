@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """png_probe.py — answer "did the client actually paint something?" from a PNG.
 
-`ss-gui --dump` writes an 8-bit RGB PNG of the framebuffer. This checker reads
+`openssc --dump` writes an 8-bit RGB PNG of the framebuffer. This checker reads
 it with the standard library only (no Pillow, no pngcheck, no `file`) and
 reports the facts the Wayland smoke test needs:
 
@@ -122,7 +122,7 @@ def unfilter(raw, width, height, bpp):
 
 
 def main():
-    ap = argparse.ArgumentParser(description="validate an ss-gui --dump PNG")
+    ap = argparse.ArgumentParser(description="validate an openssc --dump PNG")
     ap.add_argument("png")
     ap.add_argument(
         "--expect",

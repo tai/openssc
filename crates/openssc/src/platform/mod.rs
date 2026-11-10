@@ -1,4 +1,4 @@
-//! Platform seam: the only place in `ss-gui` that knows which OS it runs on.
+//! Platform seam: the only place in `openssc` that knows which OS it runs on.
 //!
 //! macOS gets the real implementations — a `CGEventTap` keyboard grab and an
 //! `NSEvent` momentum-phase monitor. Everywhere else the same API is provided

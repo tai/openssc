@@ -136,7 +136,7 @@ and re-frames the transport header.
 
 | direction | trigger | destination |
 |---|---|---|
-| local → remote | drop a file **or a folder** on the ss-gui window (`WindowEvent::DroppedFile`) | `/Users/<remote user>/Downloads` |
+| local → remote | drop a file **or a folder** on the openssc window (`WindowEvent::DroppedFile`) | `/Users/<remote user>/Downloads` |
 | remote → local | incoming transfer | `~/Downloads`, collisions suffixed `" 2"` |
 
 Transfers run on a worker thread, so the UI keeps painting.
@@ -153,7 +153,7 @@ path>` exercise the two directions without a drag.
 ## 8a. Pulling a file or folder FROM the remote (VERIFIED 2026-11-05)
 
 There is no drag-out of the window by decision, so the reverse direction is
-explicit: **Cmd+Shift+V** in `ss-gui` pulls whatever the remote clipboard names.
+explicit: **Cmd+Shift+V** in `openssc` pulls whatever the remote clipboard names.
 
 How it resolves the path:
 1. request a fresh clipboard archive (`0x0b` flags 0) and retry briefly if the

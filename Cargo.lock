@@ -1156,6 +1156,25 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f7c3e4beb33f85d45ae3e3a1792185706c8e16d043238c593331cc7cd313b50"
 
 [[package]]
+name = "openssc"
+version = "1.6.0"
+dependencies = [
+ "anyhow",
+ "block2",
+ "core-foundation",
+ "core-graphics",
+ "gesture-input",
+ "objc2 0.5.3",
+ "objc2-app-kit",
+ "png",
+ "raw-window-handle",
+ "rfb-proto",
+ "sha1",
+ "softbuffer",
+ "winit",
+]
+
+[[package]]
 name = "orbclient"
 version = "0.3.55"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1621,25 +1640,6 @@ dependencies = [
  "png",
  "rfb-proto",
  "sha2",
-]
-
-[[package]]
-name = "ss-gui"
-version = "1.6.0"
-dependencies = [
- "anyhow",
- "block2",
- "core-foundation",
- "core-graphics",
- "gesture-input",
- "objc2 0.5.3",
- "objc2-app-kit",
- "png",
- "raw-window-handle",
- "rfb-proto",
- "sha1",
- "softbuffer",
- "winit",
 ]
 
 [[package]]

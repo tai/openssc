@@ -7,7 +7,7 @@
 # place, scroll the page to the top, film four identical scroll bursts, and
 # convert the recording to the raw grayscale stream parity.py reads.
 #
-#   ./camera_ab.sh --client clone --label c1      # ss-gui
+#   ./camera_ab.sh --client clone --label c1      # openssc
 #   ./camera_ab.sh --client app   --label a1      # Screen Sharing.app
 #
 # Then compare the runs:
@@ -71,14 +71,14 @@ fi
 
 if [[ -z $BIN ]]; then
   case $CLIENT in
-    clone) BIN=${SS_GUI_BIN:-./target/release/ss-gui};;
+    clone) BIN=${SS_GUI_BIN:-./target/release/openssc};;
     app) BIN="";;                     # started through the vnc:// URL scheme
     *) echo "--client must be clone or app"; exit 2;;
   esac
 fi
 
 stop_clients() {
-  pkill -f 'ss-gui' 2>/dev/null
+  pkill -f 'openssc' 2>/dev/null
   osascript -e 'tell application "Screen Sharing" to quit' >/dev/null 2>&1
   sleep 2
 }
@@ -113,8 +113,8 @@ else
   ( "$BIN" --host ${SS_HOST:-mm.local} --mvs --exit-after-secs $((SECS + 25)) \
       > "$OUT/$LABEL.log" 2>&1 & )
   sleep 9
-  focus "ss-gui"
-  pin "ss-gui" 800
+  focus "openssc"
+  pin "openssc" 800
 fi
 
 "$SCROLL" $SCROLL_X $SCROLL_Y 6000 40 1     # page to the top

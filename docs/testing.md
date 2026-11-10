@@ -43,12 +43,12 @@ These are the only tests that block a commit. They come in four groups:
 - protocol layouts in `rfb-proto/src/lib.rs` (11) — message layouts (clipboard fetch is
   exactly 8 bytes, gesture begin/end, key and pointer events, pasteboard
   archives, record cipher statefulness).
-- **`filecopy`** (18 = 3 framing tests in `rfb-proto` + 15 in `ss-gui`) —
+- **`filecopy`** (18 = 3 framing tests in `rfb-proto` + 15 in `openssc`) —
   `NewItem` layout, chunking, DFS ordering, path safety, collision handling, and
   which clipboard shapes may be pulled at all.
 - **`gesture-input`** (14) — axis filter behaviour (5), momentum budget and
   decay (4), the portable recogniser (5).
-- **`ss-gui`** (25 = 8 in `main.rs`, 15 in `filecopy.rs`, `grab.rs`,
+- **`openssc`** (25 = 8 in `main.rs`, 15 in `filecopy.rs`, `grab.rs`,
   `momentum.rs`) — key mapping (US/JIS), scroll synthesis and the sub-line
   invariant, the `--coast` default, grab-chord parsing, the momentum
   classification queue, and `usage_documents_every_flag`, which fails if a flag
@@ -81,7 +81,7 @@ documented at the top of `crates/rfb-proto/tests/mvs_replay.rs`.
 ## 3. Client-internal timing: is the decoder keeping up?
 
 ```sh
-SS_LATDBG=1 ./target/release/ss-gui --host mm.local --mvs > /tmp/dbg.log 2>&1 &
+SS_LATDBG=1 ./target/release/openssc --host mm.local --mvs > /tmp/dbg.log 2>&1 &
 # scroll for a few seconds, then quit
 python3 tools/measure/decode_backlog.py /tmp/dbg.log
 ```
@@ -155,8 +155,8 @@ Recorded result, same page, like-for-like, four bursts per run, medians:
 
 | | runs | remote | client | stretch | head | tail | envelope |
 |---|---:|---:|---:|---:|---:|---:|---:|
-| ss-gui before (`2d0ea47`) | 2 | 617 ms | 733 ms | ×1.38 | 300 ms | 533 ms | 483 ms |
-| ss-gui v1.5.0 | 3 | 600 ms | 483 ms | ×0.97 | 167 ms | 150 ms | 158 ms |
+| openssc before (`2d0ea47`) | 2 | 617 ms | 733 ms | ×1.38 | 300 ms | 533 ms | 483 ms |
+| openssc v1.5.0 | 3 | 600 ms | 483 ms | ×0.97 | 167 ms | 150 ms | 158 ms |
 | Screen Sharing.app | 3 | 433 ms | 467 ms | ×1.08 | 233 ms | 267 ms | 266 ms |
 
 Those are `parity.py` runs with auto-derived crops. The recorded finding used
@@ -194,7 +194,7 @@ and how fast it arrives, which is how the receive path was found to be capped at
 48–85 Mbit/s against a 114 Mbit/s link (40 MB over ssh in 2.9 s) — the
 socket-reading thread was decoding inline. It cannot show decode or paint cost,
 and **byte counts are not comparable across clients**: Screen Sharing.app runs a
-scaled 2400×1500 Zlib stream (~1.6 MB per burst) while ss-gui runs 2560×1600 MVS
+scaled 2400×1500 Zlib stream (~1.6 MB per burst) while openssc runs 2560×1600 MVS
 (0.05–1 MB). Use the camera for cross-client claims.
 
 ## 6. The native client as an oracle
@@ -316,16 +316,16 @@ layers above; it does not replace the camera for latency claims.
 
 ```sh
 export PATH="$HOME/.cargo/bin:$PATH"
-cargo build --release -p ss-gui
+cargo build --release -p openssc
 cargo test --workspace
 ```
 
 Measured: `cargo check --workspace` and `cargo test --workspace` pass on Linux
-(73 tests: 14 `gesture-input`, 33 `rfb-proto`, 1 replay, 25 `ss-gui`). rustc
+(73 tests: 14 `gesture-input`, 33 `rfb-proto`, 1 replay, 25 `openssc`). rustc
 1.99.1 was used; the project's floor is 1.97.
 
 **Build dependencies are smaller than the old README claimed.** Measured with
-`cargo tree -p ss-gui -e build`: there is no `pkg-config`, `cc` build script,
+`cargo tree -p openssc -e build`: there is no `pkg-config`, `cc` build script,
 `bindgen` or `cmake` in the build graph. `wayland-backend` is built with
 `dlopen`, and `xkbcommon-dl` / `x11-dl` load their libraries at runtime, so no
 `-dev` headers are needed to compile. A C linker and glibc are still needed for
@@ -335,7 +335,7 @@ Debian, `base-devel` on Arch). The old list (`libwayland-dev`,
 as build dependencies.
 
 If the build fails with `cannot find module or crate 'grab'`, the tree predates
-the Linux platform seam (`6582290`); that is a `crates/ss-gui` problem, not a
+the Linux platform seam (`6582290`); that is a `crates/openssc` problem, not a
 harness problem. Do not patch around it in `tools/`.
 
 ### 9.2 Run
@@ -343,7 +343,7 @@ harness problem. Do not patch around it in `tools/`.
 From the Hyprland session:
 
 ```sh
-./target/release/ss-gui --host mm.local --mvs
+./target/release/openssc --host mm.local --mvs
 ```
 
 Over ssh, the Wayland session variables must be exported or winit finds no
@@ -352,7 +352,7 @@ display:
 ```sh
 export WAYLAND_DISPLAY=wayland-1
 export XDG_RUNTIME_DIR=/run/user/1000
-./target/release/ss-gui --host mm.local --mvs
+./target/release/openssc --host mm.local --mvs
 ```
 
 `--mvs` is the fast path on this server; without it the client advertises Zlib
@@ -372,8 +372,8 @@ env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
 
 The script:
 
-1. builds `cargo build --release -p ss-gui`;
-2. runs `ss-gui --mvs --dump <png> --dump-after 6` against `mm.local` with
+1. builds `cargo build --release -p openssc`;
+2. runs `openssc --mvs --dump <png> --dump-after 6` against `mm.local` with
    `tai` / `$SS_PASSWORD` (plus `--exit-after-dump` when grim is off, and
    `--exit-after-secs 30` as the backstop);
 3. waits for the log line `wrote <png>` (printed only after `write_png` returns,
@@ -384,7 +384,7 @@ The script:
    reader. It checks the decoded IHDR geometry, a byte floor of
    `max(10 KiB, 0.5% of raw RGB)`, at least 8 distinct colours, and that not
    every pixel equals the first. No `pngcheck`, `file(1)`, Pillow or camera;
-5. if `$WAYLAND_DISPLAY` names a live socket, finds the mapped `ss-gui` window
+5. if `$WAYLAND_DISPLAY` names a live socket, finds the mapped `openssc` window
    through `hyprctl -j clients` and captures it with `grim -g`. If geometry is
    unavailable it falls back to a full-output `grim`, and if grim fails it warns
    rather than failing the run. With no real session it starts a private
@@ -416,7 +416,7 @@ to §4 and no Linux visual-latency number.
 
 ### 9.4 Runtime dependencies (measured, not guessed)
 
-`ldd target/release/ss-gui` and `readelf -d` show the direct dependencies:
+`ldd target/release/openssc` and `readelf -d` show the direct dependencies:
 
 ```text
 linux-vdso.so.1
@@ -482,20 +482,20 @@ protocol side is still trying. `--no-clipboard` disables the 700 ms poll.
 
 ### 9.5 Packaging
 
-`packaging/ss-clone.desktop` used to call `ss-gui` without `--mvs`, silently
-selecting the slow Zlib path. It now launches `ss-clone-launch`, which always
-passes `--mvs`, keeps stderr in `$XDG_STATE_HOME/ss-clone/ss-gui.log` and sends a
+`packaging/openssc.desktop` used to call `openssc` without `--mvs`, silently
+selecting the slow Zlib path. It now launches `openssc-launch`, which always
+passes `--mvs`, keeps stderr in `$XDG_STATE_HOME/openssc/openssc.log` and sends a
 desktop notification if the client exits non-zero. `SS_HOST` can be set in the
-environment or in `$XDG_CONFIG_HOME/ss-clone/config`.
+environment or in `$XDG_CONFIG_HOME/openssc/config`.
 
 ```sh
 ./packaging/install.sh                  # ~/.local, builds release first
-./packaging/install.sh --no-build       # use target/release/ss-gui
+./packaging/install.sh --no-build       # use target/release/openssc
 ./packaging/install.sh --prefix /usr/local
 ```
 
-The installer copies `ss-gui`, `ss-clone-launch`, the desktop entry and
-`ss-clone.svg`, and rewrites `Exec=`/`TryExec=` to absolute paths because
+The installer copies `openssc`, `openssc-launch`, the desktop entry and
+`openssc.svg`, and rewrites `Exec=`/`TryExec=` to absolute paths because
 `~/.local/bin` is not always on a GUI session's `PATH`. Installed to a temporary
 prefix on 2026-11-06 and the generated entry inspected; launching it from a
 desktop menu was not automated.
@@ -515,7 +515,7 @@ desktop menu was not automated.
   that step has no Wayland equivalent. `--dump` sidesteps it for correctness
   checks, and grim captures whatever the compositor presents, which is enough to
   prove presentation but not to compare two clients on screen geometry.
-- **Raw evdev is partial and unexercised.** `--evdev` in `ss-gui` does spawn
+- **Raw evdev is partial and unexercised.** `--evdev` in `openssc` does spawn
   the `gesture-input` MT-protocol-B reader on Linux and does **not** grab the
   device, but it could not be run here: this user has no access to
   `/dev/input/event*` (no `input` group, no seat ACL). It also discovers devices
@@ -551,7 +551,7 @@ Before/after grim captures and 2x text crops are in the gitignored
 
 ### 10.2 What the client does now
 
-`crates/ss-gui/src/render.rs` owns the resampler and `draw()` calls it:
+`crates/openssc/src/render.rs` owns the resampler and `draw()` calls it:
 
 - **1:1 whole-frame memcpy** is unchanged and still the first branch.
 - **`auto`** (default): exact integer downscale -> area/box averaging; every
@@ -610,11 +610,11 @@ perceived gain is the larger window, because 1600x1000 keeps more source pixels
 than 1280x800 even before the filter.
 
 Reproduce with the committed capture harness (Hyprland lab; it serializes on
-`/tmp/ss-clone-gui.lock`, uses `--no-clipboard`, bounds the run and verifies the
+`/tmp/openssc-gui.lock`, uses `--no-clipboard`, bounds the run and verifies the
 process is gone):
 
 ```sh
-cargo build --release -p ss-gui
+cargo build --release -p openssc
 tools/measure/render-capture.sh --filter nearest --size 1280x800 --workspace 12 \
     --out artifacts/render-quality/nearest-1280
 tools/measure/render-capture.sh --filter auto --size 1280x800 --workspace 12 \

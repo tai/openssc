@@ -11,7 +11,7 @@ recorded numbers live there; this is just the inventory.
 | `decode_backlog.py` | turns `SS_LATDBG=1` client logs into a decode-backlog report (handles both the per-batch and older per-update log shapes) |
 | `wayland-smoke.sh` | Linux/Wayland smoke test: release build, connect to the lab server, MVS dump, PNG validation, optional grim window capture, required clean exit |
 | `png_probe.py` | stdlib-only PNG reader used by the smoke test: geometry, byte floor, decoded distinct colours, non-background fraction |
-| `render-capture.sh` | present one filter at one window size, dump the 1:1 framebuffer, grim-capture the actual window and report p50/p95 draw time (Hyprland placement; serialized on `/tmp/ss-clone-gui.lock`) |
+| `render-capture.sh` | present one filter at one window size, dump the 1:1 framebuffer, grim-capture the actual window and report p50/p95 draw time (Hyprland placement; serialized on `/tmp/openssc-gui.lock`) |
 
 Typical sequence:
 

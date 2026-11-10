@@ -1,9 +1,16 @@
-# AGENTS.md — `ss-clone` — **v1.5.0**
+# AGENTS.md — `OpenSSC` — **v1.6.0**
 
 Canonical operating guide for AI agents working on this repository.
 **Read this file completely before running anything.** If you learn something that
 contradicts this document, update this document in the same change.
 
+> **2026-11-10 — rename.** The project is now **OpenSSC** and the GUI binary is
+> `openssc` (was `ss-clone` / `ss-gui`). Crate, usage text, window titles,
+> temp files, udev rule, config/state paths, desktop entry and macOS
+> `OpenSSC.app` follow the new name; the protocol, message vocabulary and
+> behaviour do not change. Dated entries in `STATUS.md` and
+> `docs/findings/` keep the spellings that were true on that day.
+>
 > **v1.5.0 — 2026-11-06.** The picture now keeps up with the remote. Filming
 > both screens at 30 fps and aligning their motion envelopes showed the client
 > presenting a scroll over 1.4x the remote's duration and finishing half a
@@ -20,7 +27,7 @@ contradicts this document, update this document in the same change.
 > longer releases itself when the screen sits still.
 
 > **v1.4.1 — 2026-11-05.** Local shortcuts now go to the remote. While the
-> ss-gui window is focused a session-level `CGEventTap` captures the keyboard, so
+> openssc window is focused a session-level `CGEventTap` captures the keyboard, so
 > `Ctrl+Space` (input source), `Cmd+Space`, `Cmd+Tab` and the rest reach the
 > remote instead of being eaten by macOS. Hold **Left Cmd+Shift for 350 ms** to
 > give them back — a modifier-only chord needs the hold, or `Cmd+Shift+V` would
@@ -38,7 +45,7 @@ contradicts this document, update this document in the same change.
 > have no keysym in the server's tables at all and are logged as unsupported.
 
 > **v1.3.0 — 2026-11-05.** Pulling files back from the remote. `Cmd+Shift+V` in
-> ss-gui pulls whatever the remote clipboard names into `~/Downloads`. Getting
+> openssc pulls whatever the remote clipboard names into `~/Downloads`. Getting
 > there exposed an input bug that had nothing to do with the clipboard: Option
 > was forwarded as `0xFFE9` (Alt_L), which this server accepts as a key but never
 > treats as Option, so the remote saw a plain `Cmd+C` and copied only the item
@@ -433,7 +440,7 @@ scripts/                  # reproducible lab commands
 crates/
   rfb-proto/              # pure protocol types, codecs, no I/O
   ss-client/              # transport + session state machine + CLI
-  ss-gui/                 # winit + softbuffer frontend
+  openssc/                # winit + softbuffer frontend
   gesture-input/          # portable recogniser + Linux evdev backend
 captures/                 # UNTRACKED: pcaps, logs, screenshots
 artifacts/                # UNTRACKED test fixtures; pruned, see docs/testing.md
@@ -537,8 +544,8 @@ cargo run -p ss-client -- gesture --host mm.local --kind magnify \
 # full frame against 44-49 ms for MVS — almost all of it server-side, not our
 # decode. --release matters for feel testing; the dev profile is already
 # optimised (opt-level 3 for these crates) but links without LTO.
-cargo run --release -p ss-gui -- --host mm.local --mvs
-cargo run --release -p ss-gui -- --host mm.local --mvs --dump artifacts/gui.png --dump-after 1
+cargo run --release -p openssc -- --host mm.local --mvs
+cargo run --release -p openssc -- --host mm.local --mvs --dump artifacts/gui.png --dump-after 1
 
 # Latency measurement (see docs/testing.md)
 python3 tools/measure/decode_backlog.py /tmp/dbg.log      # from SS_LATDBG=1
@@ -546,7 +553,7 @@ tools/measure/camera_ab.sh --client clone --label c1      # two-screen A/B
 python3 tools/measure/parity.py clone=c1.raw app=a1.raw
 
 # Linux raw multitouch (input group required)
-cargo run -p ss-gui --release -- --host <linux-host> --evdev
+cargo run -p openssc --release -- --host <linux-host> --evdev
 
 # Python reference probes
 python3 tools/probe/apple_client.py --host mm.local
@@ -703,7 +710,7 @@ Answered — do not re-litigate without a measurement:
   deliberately not grabbed. Needs Accessibility/Input Monitoring; without it the
   app logs the pane and runs ungrabbed. The tap re-enables itself if macOS
   disables it, and every release path sends modifier key-ups.
-- **`--help` / `-h`** for ss-gui with grouped usage and a test that fails if a
+- **`--help` / `-h`** for openssc with grouped usage and a test that fails if a
   parser flag is missing from the text. `ss-client` usage updated.
 - Not in v1.4.1: pointer grabbing, JIS-specific keys (no keysym exists), Wayland.
 
@@ -844,7 +851,7 @@ keepalive/rekey hardening for long sessions.
 - **M1:** complete in Python and Rust. `ss-client snapshot` decodes a full
   2560×1600 Zlib frame to PNG (`artifacts/rust.png`).
 - **M2:** complete in Rust, CLI and GUI. `ss-client demo-input` and a local
-  click/keystrokes into the `ss-gui` window both type into remote TextEdit.
+  click/keystrokes into the `openssc` window both type into remote TextEdit.
 - **M4 (gestures):** message 0x17 implemented. **Magnify is verified live**
   (phase series 1/2/2/4, mask 31 zoomed Preview on `mm.local`) and
   **two-finger scroll is verified live** via subtype 11: the 16-bit `dy` line
@@ -853,7 +860,7 @@ keepalive/rekey hardening for long sessions.
   desynchronises. Swipe reaches the agent but has no visible action on this
   host (vertical Mission Control swipes disabled; possibly a single desktop
   space). Rotate still needs app-level calibration.
-- **M5 (GUI):** `ss-gui` (winit + softbuffer) runs on macOS and uses the
+- **M5 (GUI):** `openssc` (winit + softbuffer) runs on macOS and uses the
   native Wayland backend on Linux. It presents BGRX frames, forwards keyboard
   and pointer input, handles pinch/rotate/pan/smart-zoom, and has a headless
   `--dump` path that verifies compositing. Server-driven `0x09` updates with

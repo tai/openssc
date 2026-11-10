@@ -5,4 +5,4 @@
 set -eu
 cd "$(dirname "$0")/.."
 : "${SS_HOST:=mm.local}"
-exec cargo run --release -p ss-gui -- --host "$SS_HOST" "$@"
+exec cargo run --release -p openssc -- --host "$SS_HOST" "$@"
