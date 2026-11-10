@@ -45,14 +45,14 @@ pub const MOMENTUM_MIN_SPEED: f32 = 1200.0;
 pub const MOMENTUM_MAX_GESTURE: std::time::Duration = std::time::Duration::from_millis(280);
 /// Glide tick interval (~60 Hz).
 pub const MOMENTUM_TICK: std::time::Duration = std::time::Duration::from_millis(16);
-/// Velocity e-folding rate: v *= exp(-DECAY * dt). Slower than the first cut:
-/// the owner wants a long, gentle tail, with the initial speed capped by the
-/// GUI so a hard flick does not start too fast.
-pub const MOMENTUM_DECAY_PER_SEC: f32 = 3.5;
+/// Velocity e-folding rate: v *= exp(-DECAY * dt). Slower again: the owner
+/// wants a long, gentle tail, with the initial speed capped by the GUI so a
+/// hard flick does not start too fast.
+pub const MOMENTUM_DECAY_PER_SEC: f32 = 3.0;
 /// Stop the glide when the decaying speed drops below this (points/second).
 pub const MOMENTUM_STOP_SPEED: f32 = 40.0;
 /// Hard stop, so a flick cannot glide forever.
-pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1500);
+pub const MOMENTUM_MAX: std::time::Duration = std::time::Duration::from_millis(1800);
 /// Total distance the glide may cover, whatever the release speed. This is
 /// the only way to guarantee "a few pages": the integral of the decay alone
 /// is v0/decay, which a hard flick pushes past a screen or two.

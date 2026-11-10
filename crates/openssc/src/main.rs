@@ -77,10 +77,22 @@ const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
 /// found 8.0 a little too fast/sensitive. `--scroll-speed` still multiplies on
 /// top inside `scroll_message`, so the user-facing speed control is unchanged.
 const EVDEV_SCROLL_SCALE: f32 = 6.0;
+/// Below this per-event magnitude (raw points) the scale ramps down toward
+/// `EVDEV_MICRO_SCALE`: a small deliberate finger movement must stay a micro
+/// scroll, not become a line step. At/above it the full flick scale applies.
+const EVDEV_MICRO_THRESHOLD: f32 = 1.5;
+const EVDEV_MICRO_SCALE: f32 = 2.5;
 
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
-    (dx * EVDEV_SCROLL_SCALE, dy * EVDEV_SCROLL_SCALE)
+    let magnitude = (dx * dx + dy * dy).sqrt();
+    let factor = if magnitude >= EVDEV_MICRO_THRESHOLD {
+        EVDEV_SCROLL_SCALE
+    } else {
+        EVDEV_MICRO_SCALE
+            + (EVDEV_SCROLL_SCALE - EVDEV_MICRO_SCALE) * magnitude / EVDEV_MICRO_THRESHOLD
+    };
+    (dx * factor, dy * factor)
 }
 
 /// `--scroll-speed`: multiplier on scroll distance, for feel calibration.
@@ -5554,14 +5566,16 @@ mod tests {
     fn evdev_scroll_scale_matches_winit() {
         // Measured on this host: evdev raw Changed samples were mean 0.77,
         // median 0.39, p90 2.01 points/event; winit's PixelDelta sample was
-        // 4.7-8.5. Scale 6 puts a mean evdev event at ~4.6 points, slightly
-        // below winit after the live feel test said 8 was too fast.
+        // 4.7-8.5. The curve keeps a flick event at 6x, but pulls the mean
+        // normal event down to ~3.3 and micro events down to ~2.5-3x.
         let (_, p90) = scale_evdev_scroll(0.0, -2.01);
         let (_, median) = scale_evdev_scroll(0.0, -0.39);
         let (_, mean) = scale_evdev_scroll(0.0, -0.77);
         assert!((p90 + 12.06).abs() < 0.01);
-        assert!((median + 2.34).abs() < 0.01);
-        assert!((mean + 4.62).abs() < 0.01);
+        assert!((median + 1.33).abs() < 0.01);
+        assert!((mean + 3.31).abs() < 0.01);
+        let (_, micro) = scale_evdev_scroll(0.0, -0.10);
+        assert!(micro.abs() < mean.abs() * 0.30);
 
         // A fast flick now reaches the coast threshold; an ordinary scroll
         // still does not (this ScrollCoast requires travel and average speed).
