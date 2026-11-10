@@ -68,6 +68,20 @@ const SCROLL_INTERVAL: Duration = Duration::from_millis(4);
 /// own acceleration to multi-line deltas, so this is a 1:1 tracking choice.
 const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
 
+/// The evdev recogniser reports points as normalized pad delta * 600, which on
+/// this host is only ~0.4-2.0 points per frame for a normal two-finger scroll.
+/// winit's Wayland PixelDelta on the same target is ~4.7-8.5 points per event,
+/// so raw evdev motion was several times too slow (and never reached the
+/// Momentum 1200 points/s flick threshold). 8.0 makes the mean evdev event
+/// ~6.2 points (winit ~6.6). `--scroll-speed` still multiplies on top inside
+/// `scroll_message`, so the user-facing speed control is unchanged.
+const EVDEV_SCROLL_SCALE: f32 = 8.0;
+
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
+    (dx * EVDEV_SCROLL_SCALE, dy * EVDEV_SCROLL_SCALE)
+}
+
 /// `--scroll-speed`: multiplier on scroll distance, for feel calibration.
 /// Stored as f32 bits so it can be set from the CLI without threading it
 /// through every constructor.
@@ -2364,7 +2378,11 @@ impl App {
         }
         note_input();
         if let Gesture::Scroll {
-            dx, dy, phase, ..
+            dx,
+            dy,
+            phase,
+            precise,
+            momentum,
         } = g
         {
             if self.evdev_gesture_state.scroll_suppressed() {
@@ -2374,6 +2392,14 @@ impl App {
                 self.evdev_coast.stop();
                 return;
             }
+            let (dx, dy) = scale_evdev_scroll(dx, dy);
+            let gesture = Gesture::Scroll {
+                dx,
+                dy,
+                phase,
+                precise,
+                momentum,
+            };
             match phase {
                 Phase::Began => {
                     self.scroll_open = true;
@@ -2384,7 +2410,7 @@ impl App {
                 Phase::Changed => self.evdev_coast.sample(dx, dy, at),
                 Phase::Ended => {
                     self.scroll_open = false;
-                    self.queue_scroll(g);
+                    self.queue_scroll(gesture);
                     self.suppress_winit_scroll = true;
                     self.evdev_coast.end(at, self.coast);
                     if self.debug_input && self.evdev_coast.active() {
@@ -2399,7 +2425,7 @@ impl App {
                 }
             }
             // Same queue, axis filter and cursor anchor as the winit path.
-            self.queue_scroll(g);
+            self.queue_scroll(gesture);
             return;
         }
         let starts_non_scroll = !self.evdev_gesture_state.scroll_suppressed()
@@ -5501,6 +5527,36 @@ mod tests {
         no_coast.sample(0.0, -100.0, t0 + Duration::from_millis(16));
         no_coast.end(t0 + Duration::from_millis(100), false);
         assert!(!no_coast.active(), "--no-coast must not glide");
+    }
+
+    #[test]
+    fn evdev_scroll_scale_matches_winit() {
+        // Measured on this host: evdev raw Changed samples were mean 0.77,
+        // median 0.39, p90 2.01 points/event; winit's PixelDelta sample was
+        // 4.7-8.5. Scale 8 puts a mean evdev event at ~6.2 points.
+        let (_, p90) = scale_evdev_scroll(0.0, -2.01);
+        let (_, median) = scale_evdev_scroll(0.0, -0.39);
+        let (_, mean) = scale_evdev_scroll(0.0, -0.77);
+        assert!((p90 + 16.08).abs() < 0.01);
+        assert!((median + 3.12).abs() < 0.01);
+        assert!((mean + 6.16).abs() < 0.01);
+
+        // A fast flick now reaches the coast threshold; an ordinary scroll
+        // still does not (this ScrollCoast requires travel and average speed).
+        let t0 = Instant::now();
+        let mut flick = ScrollCoast::default();
+        flick.begin(t0);
+        flick.sample(0.0, p90, t0 + Duration::from_millis(8));
+        flick.sample(0.0, p90, t0 + Duration::from_millis(16));
+        flick.end(t0 + Duration::from_millis(24), true);
+        assert!(flick.next_at().is_some(), "a measured p90 flick must coast");
+
+        let mut slow = ScrollCoast::default();
+        slow.begin(t0);
+        slow.sample(0.0, mean, t0 + Duration::from_millis(8));
+        slow.sample(0.0, mean, t0 + Duration::from_millis(16));
+        slow.end(t0 + Duration::from_millis(24), true);
+        assert!(slow.next_at().is_none(), "ordinary scroll must not coast");
     }
 
     #[test]
