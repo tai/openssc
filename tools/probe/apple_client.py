@@ -5,7 +5,7 @@ M0: connect, authenticate, and print ServerInit.
 The reusable `authenticate()` is also used by the record-layer probes.
 
 Usage:
-    python3 tools/probe/apple_client.py --host mm.local --user tai --password <password>
+    python3 tools/probe/apple_client.py --host mm.local --user tai --password "$SS_PASSWORD"
 
 SRP recipe (recovered by matching the real client's M1 against a fake server
 with a known verifier):
