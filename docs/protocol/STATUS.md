@@ -6,6 +6,24 @@ code, then `docs/protocol/*.md`; how to measure it is `docs/testing.md`. The
 top entry is the one to read first, and the one to update at the end of a
 session (template in `AGENTS.md` §10).
 
+## 2026-11-10 — **v1.7.0**: Linux/Wayland input and scroll fidelity
+
+- Verified on the lab Linux host (Hyprland/Wayland):
+  - evdev pinch/rotate is anchored at the live remote pointer, including
+    after scrolling. The open scroll is closed with a zero-length Begin/End
+    before the gesture, matching the macOS capture.
+  - keyboard grab with the runtime pause/resume chord (LeftCtrl+LeftAlt+Esc)
+    works without restarting the client.
+  - local clipboard text can be pasted into the remote (`Ctrl+V`), and the
+    automatic clipboard is duplex; remote→local was already verified.
+  - presentation uses box/bilinear resampling and a sharp default window.
+- Scroll: evdev is the single source (`--evdev`); a gesture is classified once
+  as micro (1.0x), normal (5.5x) or flick (8x) and keeps that scale for the
+  whole gesture, so micro never accelerates. Only a flick coasts; the glide is
+  capped at 1200 points/s, decays at 2.5/s and stops on a new two-finger touch.
+- `--evdev` remains opt-in at the CLI; the Linux launcher enables it.
+- Version: 1.7.0. Full test suite green before the release.
+
 ## 2026-11-10 — project rename `ss-clone` → `OpenSSC` (binary `openssc`)
 
 - Marketing/identity rename only; no protocol or behaviour change intended.

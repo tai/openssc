@@ -27,7 +27,7 @@ rather than judged by eye.
 | File copy both directions | verified (drop to send, `Cmd+Shift+V` to pull) |
 | Keyboard grab so local shortcuts reach the remote | verified |
 | Visual latency vs `Screen Sharing.app` | on par (measured, see below) |
-| Linux/Wayland | builds, connects, decodes and paints end to end (smoke test, 2026-11-06); input/gestures/clipboard not yet verified on Linux |
+| Linux/Wayland | builds, connects, decodes and paints; evdev pinch/rotate, keyboard grab + pause/resume, clipboard paste and sharp rendering verified on the lab host (2026-11-10); scroll micro/normal/flick feel tuned |
 
 ## Quick start (macOS lab)
 
@@ -67,9 +67,11 @@ MVS (0.05-1 MB).
 
 - Keyboard grab with a release chord; US and JIS layouts (`--keymap`).
 - Pointer, drag, and scroll; scroll axis switches between vertical and both
-  automatically from recent motion, with no acceleration.
-- Momentum: the OS momentum tail is forwarded by default, as the real client
-  does (`--no-coast` turns it off).
+  automatically from recent motion. On Linux the evdev scroll is classified
+  once per gesture (micro / normal / flick) and uses a constant scale, so a
+  micro scroll never accelerates.
+- Momentum: the OS tail is forwarded on macOS; on Linux evdev a flick-only
+  glide is synthesized (`--no-coast` disables both).
 - Clipboard: automatic and duplex, text and images.
 - File copy: drop a file on the window to send it to the remote's `~/Downloads`;
   `Cmd+Shift+V` pulls whatever the remote clipboard names into `~/Downloads`.
