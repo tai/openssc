@@ -491,7 +491,8 @@ Display and codec:
                            (default auto: box for integer downscale, else bilinear)
   --window-size <WxH>      initial logical window size (default: fit the
                            window's monitor, 1:1 when the framebuffer fits)
-  --mvs                    advertise MultiVariant (0x3f3); server push by default
+  --mvs                    accepted no-op (MultiVariant 0x3f3 is the default)
+  --no-mvs                 advertise Zlib (6) instead of MultiVariant; no server push
   --poll                   MVS request loop instead of server push
   --push                   accepted no-op (push is the default with --mvs)
   --encoding <id>          advertise a single framebuffer encoding (6 = Zlib)
@@ -4145,8 +4146,10 @@ fn main() -> Result<()> {
     let mut encoding: Option<i32> = None;
     let mut ime = false;
     // MultiVariant (0x3f3): GPU-encoded tiles, ~40 ms per full frame instead
-    // of the ~640 ms Zlib round trip.
-    let mut mvs = false;
+    // of the ~640 ms Zlib round trip. Default on: this Apple server dialect is
+    // the project's only supported target, so MVS is always the first choice.
+    // `--no-mvs` opts out (Zlib), `--mvs` remains the explicit opt-in.
+    let mut mvs = true;
     // Server push is the default for MVS; `--poll` forces the request loop.
     // `--push` is kept as an accepted no-op alias for the default.
     let mut poll = false;
@@ -4331,11 +4334,18 @@ fn main() -> Result<()> {
                 i += 2;
             }
             "--mvs" => {
+                // Explicit opt-in; MVS is already the default.
                 mvs = true;
                 i += 1;
             }
+            "--no-mvs" => {
+                // Opt out: advertise Zlib (6) and skip the push arming, for
+                // servers or captures that need the old slow path.
+                mvs = false;
+                i += 1;
+            }
             "--push" => {
-                // Accepted for compatibility: push is the default for --mvs.
+                // Accepted for compatibility: push is the default for MVS.
                 i += 1;
             }
             "--demo-cursor" => {

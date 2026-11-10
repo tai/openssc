@@ -81,7 +81,7 @@ documented at the top of `crates/rfb-proto/tests/mvs_replay.rs`.
 ## 3. Client-internal timing: is the decoder keeping up?
 
 ```sh
-SS_LATDBG=1 ./target/release/openssc --host mm.local --mvs > /tmp/dbg.log 2>&1 &
+SS_LATDBG=1 ./target/release/openssc --host mm.local > /tmp/dbg.log 2>&1 &
 # scroll for a few seconds, then quit
 python3 tools/measure/decode_backlog.py /tmp/dbg.log
 ```
@@ -343,7 +343,7 @@ harness problem. Do not patch around it in `tools/`.
 From the Hyprland session:
 
 ```sh
-./target/release/openssc --host mm.local --mvs
+./target/release/openssc --host mm.local
 ```
 
 Over ssh, the Wayland session variables must be exported or winit finds no
@@ -352,10 +352,10 @@ display:
 ```sh
 export WAYLAND_DISPLAY=wayland-1
 export XDG_RUNTIME_DIR=/run/user/1000
-./target/release/openssc --host mm.local --mvs
+./target/release/openssc --host mm.local
 ```
 
-`--mvs` is the fast path on this server; without it the client advertises Zlib
+MVS is the default (2026-11-10); `--no-mvs` advertises Zlib
 (6). The Linux log line `grab: not available on this platform` is expected: the
 macOS keyboard grab has no Linux counterpart yet (see §9.6).
 
@@ -373,7 +373,7 @@ env -u WAYLAND_DISPLAY -u XDG_RUNTIME_DIR \
 The script:
 
 1. builds `cargo build --release -p openssc`;
-2. runs `openssc --mvs --dump <png> --dump-after 6` against `mm.local` with
+2. runs `openssc --dump <png> --dump-after 6` against `mm.local` with
    `tai` / `$SS_PASSWORD` (plus `--exit-after-dump` when grim is off, and
    `--exit-after-secs 30` as the backstop);
 3. waits for the log line `wrote <png>` (printed only after `write_png` returns,
@@ -483,8 +483,9 @@ protocol side is still trying. `--no-clipboard` disables the 700 ms poll.
 ### 9.5 Packaging
 
 `packaging/openssc.desktop` used to call `openssc` without `--mvs`, silently
-selecting the slow Zlib path. It now launches `openssc-launch`, which always
-passes `--mvs`, keeps stderr in `$XDG_STATE_HOME/openssc/openssc.log` and sends a
+selecting the slow Zlib path. MVS is the binary default since 2026-11-10, and
+`openssc-launch` now relies on it (`--no-mvs` opts out), keeps stderr in
+`$XDG_STATE_HOME/openssc/openssc.log` and sends a
 desktop notification if the client exits non-zero. `SS_HOST` can be set in the
 environment or in `$XDG_CONFIG_HOME/openssc/config`.
 

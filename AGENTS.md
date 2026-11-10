@@ -89,9 +89,10 @@ contradicts this document, update this document in the same change.
   correct modifier forwarding), gesture backend, remote cursor, automatic duplex
   clipboard (text + images), file copy both ways (drop to send, Cmd+Shift+V to
   pull), JIS keyboard support with layout tables, keyboard grab so local
-  shortcuts reach the remote, and MVS with server push, selected with `--mvs`
-  (push is the default inside MVS; `--poll` opts out), including the full push
-  vocabulary. Without `--mvs` the GUI advertises Zlib (6), which is the slow
+  shortcuts reach the remote, and MVS with server push as the **default**
+  since 2026-11-10 (`--poll` opts out to the request loop, `--no-mvs` to Zlib),
+  including the full push
+  vocabulary. Zlib (6) without MVS is the slow
   path. Visual latency is measurably on par with
   `Screen Sharing.app` (envelope lag 157 ms against 237 ms) because the decoder
   now keeps up at full 2560x1600 resolution. Next: **Linux/Wayland packaging** — still the actual target
@@ -539,13 +540,14 @@ cargo run -p ss-client -- gesture --host mm.local --kind swipe \
 cargo run -p ss-client -- gesture --host mm.local --kind magnify \
     --value 0.2 --mask 31 --series --out artifacts/magnify.png
 
-# Live GUI. --mvs is the fast path: MultiVariant plus server push. Without it the
-# client advertises Zlib (6), where this server takes ~700-880 ms to *produce* a
-# full frame against 44-49 ms for MVS — almost all of it server-side, not our
-# decode. --release matters for feel testing; the dev profile is already
-# optimised (opt-level 3 for these crates) but links without LTO.
-cargo run --release -p openssc -- --host mm.local --mvs
-cargo run --release -p openssc -- --host mm.local --mvs --dump artifacts/gui.png --dump-after 1
+# Live GUI. MVS (MultiVariant plus server push) is the default since
+# 2026-11-10; `--no-mvs` advertises Zlib (6), where this server takes ~700-880 ms
+# to *produce* a full frame against 44-49 ms for MVS — almost all of it
+# server-side, not our decode. --release matters for feel testing; the dev
+# profile is already optimised (opt-level 3 for these crates) but links without
+# LTO. `--poll` switches MVS to the request loop.
+cargo run --release -p openssc -- --host mm.local
+cargo run --release -p openssc -- --host mm.local --dump artifacts/gui.png --dump-after 1
 
 # Latency measurement (see docs/testing.md)
 python3 tools/measure/decode_backlog.py /tmp/dbg.log      # from SS_LATDBG=1
@@ -624,7 +626,7 @@ Answered — do not re-litigate without a measurement:
 | Auth key derivation and AES framing, MITM-able? | SRP-6a + `SHA-256(K)[0:16]`; record layer `0x44f`, AES-128-CBC, SHA-1 | `authentication.md`, `record-layer.md` |
 | Gesture message numbers, layouts, field mapping | type `0x17`, subtypes 1-8/11, documented field by field | `input-and-gestures.md` §2 |
 | One message per phase or a whole event? | either; a lone `phase = 2` scroll frame is enough, and the native client sends one per trackpad event | `input-and-gestures.md` §8.1 |
-| Which encodings do we advertise, and what does the server pick? | Zlib (6) by default; MVS `0x3f3` + push with `--mvs`, which is what the native client uses | `main.rs` (SetEncodings), `framebuffer.md`, `codecs.md` |
+| Which encodings do we advertise, and what does the server pick? | MVS `0x3f3` + push by default (2026-11-10), which is what the native client uses; `--no-mvs` advertises Zlib (6) | `main.rs` (SetEncodings), `framebuffer.md`, `codecs.md` |
 | How are MVS tiles framed and decoded? | two streams, 8x8 tiles, DCT/copy/fill commands, 99-byte coefficient ring; decoded to <=1 channel of the native oracle | `codecs.md` §2.19/2.20, `mvs.rs` |
 | How are Retina/HiDPI scale and layout changes communicated? | `0x451` carries point+pixel geometry; `0x453` vendor keysyms | `framebuffer.md`, `input-and-gestures.md` |
 

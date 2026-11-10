@@ -26,6 +26,12 @@ session (template in `AGENTS.md` §10).
   `AGENTS.md`, `docs/testing.md`, `docs/protocol/*`) use the new name.
 - Verified: `cargo test --workspace` green after the rename; macOS bundle
   built and launched from `packaging/mac/OpenSSC.app`.
+- **MVS is now the default** (no flag needed): `openssc` arms server push at
+  connect with no arguments, so `open OpenSSC.app` gets the fast path. `--mvs`
+  is an accepted explicit no-op, `--no-mvs` advertises Zlib (6) without push,
+  `--poll` keeps the MVS request loop. Verified live on `mm.local`
+  (default: `mvs: server push` on connect; `--no-mvs`: Zlib connect, no arms).
+  Dated docs/commands above keep `--mvs` where it was the recorded opt-in.
 
 ## 2026-11-06 — **v1.5.0**: full-resolution MVS decode throughput and visual-latency parity (VERIFIED on the replay fixture and on camera)
 

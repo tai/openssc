@@ -35,11 +35,11 @@ Requirements: Rust 1.97+, `mm.local` reachable, account `tai` / `$SS_PASSWORD`.
 
 ```sh
 cargo build --release -p openssc
-./target/release/openssc --host mm.local --mvs
+./target/release/openssc --host mm.local
 ```
 
-`--mvs` is the fast path: MultiVariant plus server push. Without it the client
-advertises Zlib (6), which decodes roughly ten times slower on this server.
+MVS (MultiVariant + server push) is the default and the fast path; `--no-mvs`
+opts out to plain Zlib (6), which decodes roughly ten times slower on this server.
 
 Holding **Left Cmd+Shift for ~350 ms** releases the keyboard grab so local
 shortcuts work again. The grab needs Accessibility/Input Monitoring permission;
@@ -160,11 +160,10 @@ works but local clipboard sync is silently absent.
 ### Run
 
 ```sh
-./target/release/openssc --host mm.local --mvs
+./target/release/openssc --host mm.local
 ```
 
-`--mvs` is the fast path; without it the client advertises Zlib (6), the slow
-path. A Wayland session started from ssh needs both variables exported:
+MVS is the default; `--no-mvs` runs the Zlib (6) slow path. A Wayland session started from ssh needs both variables exported:
 
 ```sh
 export WAYLAND_DISPLAY=wayland-1
@@ -215,7 +214,7 @@ tools/measure/render-capture.sh --filter auto --size 1600x1000 \
 ./packaging/install.sh --no-build       # install the existing release binary
 ```
 
-The entry launches `openssc-launch`, which always passes `--mvs`, logs stderr to
+The entry launches `openssc-launch` (MVS is the binary default; `--no-mvs` opts out), logs stderr to
 `${XDG_STATE_HOME:-~/.local/state}/openssc/openssc.log`, and notifies on a
 failed connect. Set `SS_HOST` in the environment or in
 `~/.config/openssc/config`.

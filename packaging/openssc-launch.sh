@@ -2,7 +2,7 @@
 # openssc-launch — desktop launcher for openssc.
 #
 # A desktop session has no terminal, so a failed connect would otherwise leave
-# no trace. This wrapper always uses the fast path (--mvs), keeps stderr in a
+# no trace. MVS is the binary default (--no-mvs opts out); the wrapper keeps stderr in a
 # per-user log, and puts the last line in a desktop notification when the client
 # exits non-zero. Host selection: SS_HOST from the environment, or a file
 # $XDG_CONFIG_HOME/openssc/config containing a line such as
@@ -31,7 +31,7 @@ STATE=${XDG_STATE_HOME:-$HOME/.local/state}/openssc
 mkdir -p "$STATE" 2>/dev/null || true
 LOG=$STATE/openssc.log
 
-"$BIN" --host "$HOST" --mvs "$@" 2>>"$LOG"
+"$BIN" --host "$HOST" "$@" 2>>"$LOG"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "$(date -Is) openssc exited $rc" >>"$LOG" 2>/dev/null || true
