@@ -27,6 +27,13 @@ if [ -r "$CONFIG" ]; then
 fi
 HOST=${SS_HOST:-mm.local}
 
+# Raw evdev is the only Linux backend that delivers pinch/rotate (winit's
+# Wayland backend exposes no pinch gesture). macOS has its native winit path
+# and --evdev is Linux-only, so add it there only.
+if [ "$(uname -s)" = "Linux" ]; then
+  set -- --evdev "$@"
+fi
+
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/openssc
 mkdir -p "$STATE" 2>/dev/null || true
 LOG=$STATE/openssc.log
