@@ -72,11 +72,11 @@ const PIXELS_PER_LINE: f32 = SCROLL_POINTS_PER_LINE;
 /// this host is only ~0.4-2.0 points per frame for a normal two-finger scroll.
 /// winit's Wayland PixelDelta on the same target is ~4.7-8.5 points per event,
 /// so raw evdev motion was several times too slow (and never reached the
-/// Momentum 1200 points/s flick threshold). 6.0 makes the mean evdev event
-/// ~4.6 points, slightly slower than winit's ~6.6, after the live feel test
-/// found 8.0 a little too fast/sensitive. `--scroll-speed` still multiplies on
-/// top inside `scroll_message`, so the user-facing speed control is unchanged.
-const EVDEV_SCROLL_SCALE: f32 = 6.0;
+/// Momentum 1200 points/s flick threshold). The plateau is 8.0 for flick-sized
+/// deltas; below the 1.5-point knee the scale ramps down so a deliberate micro
+/// scroll does not become a line step. `--scroll-speed` still multiplies on top
+/// inside `scroll_message`, so the user-facing speed control is unchanged.
+const EVDEV_SCROLL_SCALE: f32 = 8.0;
 /// Below this per-event magnitude (raw points) the scale ramps down toward
 /// `EVDEV_MICRO_SCALE`: a small deliberate finger movement must stay a micro
 /// scroll, not become a line step. At/above it the full flick scale applies.
@@ -3517,6 +3517,13 @@ impl ApplicationHandler<UserEvent> for App {
                 self.flush_pointer(true);
             }
             WindowEvent::MouseWheel { delta, phase, .. } => {
+                if self.evdev_grab.is_some() {
+                    // When the raw evdev reader opened, it is the single scroll
+                    // source: winit would deliver the same gesture a second
+                    // time, unscaled and without the micro-scroll curve. A
+                    // mouse wheel is ignored in --evdev mode.
+                    return;
+                }
                 if self.suppress_winit_scroll {
                     if phase == TouchPhase::Started {
                         self.suppress_winit_scroll = false;
@@ -5566,14 +5573,14 @@ mod tests {
     fn evdev_scroll_scale_matches_winit() {
         // Measured on this host: evdev raw Changed samples were mean 0.77,
         // median 0.39, p90 2.01 points/event; winit's PixelDelta sample was
-        // 4.7-8.5. The curve keeps a flick event at 6x, but pulls the mean
-        // normal event down to ~3.3 and micro events down to ~2.5-3x.
+        // 4.7-8.5. The curve keeps a flick event at 8x, pulls the mean normal
+        // event to ~4.1 and micro events down to ~2.5-3x.
         let (_, p90) = scale_evdev_scroll(0.0, -2.01);
         let (_, median) = scale_evdev_scroll(0.0, -0.39);
         let (_, mean) = scale_evdev_scroll(0.0, -0.77);
-        assert!((p90 + 12.06).abs() < 0.01);
-        assert!((median + 1.33).abs() < 0.01);
-        assert!((mean + 3.31).abs() < 0.01);
+        assert!((p90 + 16.08).abs() < 0.01);
+        assert!((median + 1.53).abs() < 0.01);
+        assert!((mean + 4.10).abs() < 0.01);
         let (_, micro) = scale_evdev_scroll(0.0, -0.10);
         assert!(micro.abs() < mean.abs() * 0.30);
 
