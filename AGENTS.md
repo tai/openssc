@@ -441,7 +441,7 @@ scripts/                  # reproducible lab commands
 crates/
   rfb-proto/              # pure protocol types, codecs, no I/O
   ss-client/              # transport + session state machine + CLI
-  openssc/                # winit + softbuffer frontend
+  openssc/                # winit + softbuffer frontend (session + manager)
   gesture-input/          # portable recogniser + Linux evdev backend
 captures/                 # UNTRACKED: pcaps, logs, screenshots
 artifacts/                # UNTRACKED test fixtures; pruned, see docs/testing.md
@@ -466,6 +466,12 @@ Lab topology, accounts and permissions live in §2 of this file; that is the
   or OpenSSL bindings; do not hand-roll primitives.
 - GUI: `winit` (native Wayland) + `softbuffer` for the first framebuffer
   milestone, then `wgpu` for scaling/colour conversion if needed.
+- Connection manager (`--manager`, Linux/Wayland): its own module under
+  `crates/openssc/src/manager/` on the same winit + softbuffer stack, with an
+  embedded 5x7 bitmap font rather than a GUI toolkit. Targets are stored in
+  `~/.config/openssc/targets.conf` (`0600`, name/host/port/user only); the
+  password is held for the current form and passed to the spawned client as
+  `SS_PASSWORD`, never written to disk or logged.
 - Keep `rfb-proto` free of OS and async dependencies so it can be unit-tested
   against captured byte fixtures.
 

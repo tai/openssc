@@ -6,6 +6,33 @@ code, then `docs/protocol/*.md`; how to measure it is `docs/testing.md`. The
 top entry is the one to read first, and the one to update at the end of a
 session (template in `AGENTS.md` §10).
 
+## 2026-11-10 — connection manager (`feat/connection-manager`, not main)
+
+- Scope: an optional Linux/Wayland connection-manager window in front of the
+  unchanged direct CLI. `openssc --host ...` still connects immediately;
+  `openssc --manager` opens the list/form window, and `openssc-launch` now
+  opens it by default on Linux.
+- Changed: new `crates/openssc/src/manager/` module (`mod.rs` window/layout,
+  `state.rs` transitions, `targets.rs` persistence/validation, `font.rs`
+  embedded 5x7 ASCII font), one `--manager` parse arm plus an early return in
+  `main.rs`, and the packaging launcher/desktop/install text. No new
+  dependencies: same winit 0.30 + softbuffer stack, no GUI toolkit.
+- Targets: `<config>/openssc/targets.conf` (`0600`, directory `0700`),
+  `name/host/port/user` blocks; one `mm.local`/5900/`tai` seed when absent.
+  Passwords are not part of the model, the file, argv or logs. Connect spawns
+  `current_exe()` with `--host/--port/--user` (+ `--evdev` on Linux) and sets
+  `SS_PASSWORD` in the child environment; the manager stays open.
+- Verified: `cargo test --workspace` 138 tests green (22 manager); release
+  build passes. Hyprland run on od: window painted at a tiled 457x599 logical
+  (reflowed list and 2x2 buttons), grim capture 914x1198; a Connect spawned a
+  child that connected and painted 2560x1600 while the manager stayed open.
+  Target file was `-rw-------`. See `docs/testing.md` §9.7.
+- Open: manager is Linux-scoped; no target reordering/import, no drag-out
+  connection, password-field authentication was not driven end to end in the
+  smoke run, and long-list wheel scrolling is untested at the compositor level.
+- Lab state: no test manager left running; the existing direct `openssc` session
+  on od was left alone.
+
 ## 2026-11-10 — **v1.7.0**: Linux/Wayland input and scroll fidelity
 
 - Verified on the lab Linux host (Hyprland/Wayland):
