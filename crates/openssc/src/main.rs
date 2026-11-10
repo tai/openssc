@@ -93,7 +93,8 @@ fn evdev_scroll_factor(magnitude: f32) -> f32 {
     }
 }
 
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+/// Test/helper wrapper around the stateless factor.
+#[allow(dead_code)]
 fn scale_evdev_scroll(dx: f32, dy: f32) -> (f32, f32) {
     let factor = evdev_scroll_factor((dx * dx + dy * dy).sqrt());
     (dx * factor, dy * factor)
