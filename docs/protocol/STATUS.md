@@ -6,7 +6,7 @@ code, then `docs/protocol/*.md`; how to measure it is `docs/testing.md`. The
 top entry is the one to read first, and the one to update at the end of a
 session (template in `AGENTS.md` §10).
 
-## 2026-11-10 — connection manager (`feat/connection-manager`, not main)
+## 2026-11-10 — **v1.8.0**: connection manager (Linux)
 
 - Scope: an optional Linux/Wayland connection-manager window in front of the
   unchanged direct CLI. `openssc --host ...` still connects immediately;
@@ -30,6 +30,7 @@ session (template in `AGENTS.md` §10).
 - Open: manager is Linux-scoped; no target reordering/import, no drag-out
   connection, password-field authentication was not driven end to end in the
   smoke run, and long-list wheel scrolling is untested at the compositor level.
+- Version: 1.8.0.
 - Lab state: no test manager left running; the existing direct `openssc` session
   on od was left alone.
 
