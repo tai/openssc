@@ -3,9 +3,9 @@ Type=Application
 Version=1.0
 Name=OpenSSC
 GenericName=Apple Screen Sharing client
-Comment=Apple Screen Sharing client (RFB 003.889 + Apple gestures)
-# --mvs is not optional for a desktop launch: without it the client advertises
-# Zlib (6), which this server produces at 700-880 ms/frame instead of 44-49 ms.
+Comment=Apple Screen Sharing client with a saved-target connection manager
+# The launcher opens the connection manager on Linux; MVS and evdev are the
+# child defaults, so a manager Connect gets the fast path with no extra flags.
 Exec=openssc-launch
 TryExec=openssc-launch
 Icon=openssc

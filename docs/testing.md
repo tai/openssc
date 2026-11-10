@@ -29,12 +29,12 @@ Layers, cheapest first. Use the lowest layer that can answer the question.
 ## 1. Unit and contract tests
 
 ```sh
-cargo test --workspace          # 73 tests; no lab, no network
+cargo test --workspace          # 138 tests; no lab, no network
 ```
 
 These are the only tests that block a commit. They come in four groups:
 
-- **`rfb-proto`** (33 = `mvs` 19 + protocol 11 + `filecopy` 3) — the MultiVariant decoder against recorded
+- **`rfb-proto`** (34) — the MultiVariant decoder against recorded
   bodies: header/command-stream totals, block sizes and values, quant tables,
   cache-ring wrap and type-0/type-1 interaction, and the renderer. Two of them
   are the safety net for the fixed-point IDCT: `integer_idct_matches_reference_on_random_blocks`
@@ -46,13 +46,16 @@ These are the only tests that block a commit. They come in four groups:
 - **`filecopy`** (18 = 3 framing tests in `rfb-proto` + 15 in `openssc`) —
   `NewItem` layout, chunking, DFS ordering, path safety, collision handling, and
   which clipboard shapes may be pulled at all.
-- **`gesture-input`** (14) — axis filter behaviour (5), momentum budget and
-  decay (4), the portable recogniser (5).
-- **`openssc`** (25 = 8 in `main.rs`, 15 in `filecopy.rs`, `grab.rs`,
-  `momentum.rs`) — key mapping (US/JIS), scroll synthesis and the sub-line
-  invariant, the `--coast` default, grab-chord parsing, the momentum
-  classification queue, and `usage_documents_every_flag`, which fails if a flag
-  is parsed but not described in `USAGE`.
+- **`gesture-input`** (31) — axis filter behaviour, momentum budget and decay,
+  the portable recogniser, evdev code mapping and the chord parser.
+- **`openssc`** (72 = 22 in `manager/`, 8 in `main.rs`, and the rest in
+  `filecopy.rs`, `grab.rs`, `momentum.rs`, `render.rs`) — key mapping (US/JIS),
+  scroll synthesis and the sub-line invariant, the `--coast` default, grab-chord
+  parsing, the momentum classification queue, render resampling, and
+  `usage_documents_every_flag`, which fails if a flag is parsed but not described
+  in `USAGE`. The 22 manager tests cover target parse/serialise/validation,
+  `0600` file creation, focus/selection/edit/save/delete transitions, password
+  masking and non-persistence, and the child argv/env.
 - **integration** (1) — `tests/mvs_replay.rs`, the decode benchmark below (it
   asserts nothing on time; it prints).
 
@@ -321,7 +324,7 @@ cargo test --workspace
 ```
 
 Measured: `cargo check --workspace` and `cargo test --workspace` pass on Linux
-(73 tests: 14 `gesture-input`, 33 `rfb-proto`, 1 replay, 25 `openssc`). rustc
+(138 tests: 31 `gesture-input`, 34 `rfb-proto`, 1 replay, 72 `openssc`). rustc
 1.99.1 was used; the project's floor is 1.97.
 
 **Build dependencies are smaller than the old README claimed.** Measured with
@@ -483,11 +486,14 @@ protocol side is still trying. `--no-clipboard` disables the 700 ms poll.
 ### 9.5 Packaging
 
 `packaging/openssc.desktop` used to call `openssc` without `--mvs`, silently
-selecting the slow Zlib path. MVS is the binary default since 2026-11-10, and
-`openssc-launch` now relies on it (`--no-mvs` opts out), keeps stderr in
-`$XDG_STATE_HOME/openssc/openssc.log` and sends a
-desktop notification if the client exits non-zero. `SS_HOST` can be set in the
-environment or in `$XDG_CONFIG_HOME/openssc/config`.
+selecting the slow Zlib path. MVS is the binary default since 2026-11-10; the
+launcher now opens the connection manager on Linux (`--manager`), and each
+Connect child gets MVS and `--evdev` by default (`--no-mvs` still opts out on a
+direct CLI run). It keeps stderr in
+`$XDG_STATE_HOME/openssc/openssc.log` and sends a desktop notification if the
+manager exits non-zero. Saved targets are in
+`$XDG_CONFIG_HOME/openssc/targets.conf`; `SS_HOST` is no longer consulted by
+the launcher, because the target list owns host selection now.
 
 ```sh
 ./packaging/install.sh                  # ~/.local, builds release first
@@ -499,7 +505,8 @@ The installer copies `openssc`, `openssc-launch`, the desktop entry and
 `openssc.svg`, and rewrites `Exec=`/`TryExec=` to absolute paths because
 `~/.local/bin` is not always on a GUI session's `PATH`. Installed to a temporary
 prefix on 2026-11-06 and the generated entry inspected; launching it from a
-desktop menu was not automated.
+desktop menu was not automated. The manager launch path itself was exercised
+directly (§9.7).
 
 ### 9.6 Known gaps on Wayland
 
@@ -654,3 +661,34 @@ chosen filter and the draw cost.
 5. When a measurement disagrees with the docs, believe the measurement, fix the
    docs, and record the number and the date in §8.
 6. Prune `artifacts/` afterwards to the keep-list in §7.
+
+### 9.7 Connection manager (`--manager`)
+
+The manager is deliberately a separate window and state machine
+(`crates/openssc/src/manager/`) rather than part of the session `App`. Its unit
+tests cover the target file format, validation, `0600` creation, focus and
+selection, add/save/delete, password masking and the refusal to persist it, and
+the exact child argv/env. The abstract layout is tested at the requested size
+and at two tiled sizes.
+
+Smoke test on od (Arch/Hyprland, 2026-11-10):
+
+```sh
+export WAYLAND_DISPLAY=wayland-1 XDG_RUNTIME_DIR=/run/user/1000
+cargo build --release -p openssc
+SS_TARGETS_FILE=/tmp/openssc-targets.conf ./target/release/openssc --manager
+```
+
+Measured: the window presented and painted at a tiled 457x599 logical (Hyprland
+ignored the 900x560 request); a grim capture at 914x1198 showed the title, list,
+five fields, all four buttons and the status line. The layout reflows at that
+width (47% list, 2x2 buttons) rather than drawing off the surface. A Connect
+action spawned `target/release/openssc --host mm.local --port 5900 --user tai
+--evdev`; the child connected and painted 2560x1600 while the manager stayed
+open. The target file was `-rw-------` and contained only name/host/port/user;
+no password appeared in argv or the log.
+
+What this does not prove: scripted mouse input, a successful password
+authentication through the field (the smoke run's password field was empty),
+or a long-list scroll. Those paths are covered by the unit tests, not by a
+compositor-level harness.

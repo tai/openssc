@@ -1,16 +1,18 @@
 #!/bin/sh
 # openssc-launch — desktop launcher for openssc.
 #
-# A desktop session has no terminal, so a failed connect would otherwise leave
-# no trace. MVS is the binary default (--no-mvs opts out); the wrapper keeps stderr in a
-# per-user log, and puts the last line in a desktop notification when the client
-# exits non-zero. Host selection: SS_HOST from the environment, or a file
-# $XDG_CONFIG_HOME/openssc/config containing a line such as
+# On Linux a desktop launch opens the connection manager: pick a saved target,
+# edit its host/port/user if needed, type the password (never stored) and press
+# Connect. The manager spawns the same binary in direct-connect mode and stays
+# open for the next target. The targets live in
+# ${XDG_CONFIG_HOME:-$HOME/.config}/openssc/targets.conf.
 #
-#     SS_HOST=192.168.3.114
+# A desktop session has no terminal, so stderr goes to a per-user log and the
+# last line of a failed manager/child session becomes a notification.
 #
-# Extra arguments are passed through, for example:
-#     openssc-launch --scale 0.5
+# Direct CLI use is unchanged: `openssc --host mm.local` connects immediately.
+# Extra arguments go to the manager's own parser; a Connect child uses the
+# manager defaults (MVS is the binary default, plus --evdev on Linux).
 set -u
 
 SELF_DIR=$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)
@@ -20,25 +22,17 @@ else
   BIN=${SS_GUI:-openssc}
 fi
 
-CONFIG=${XDG_CONFIG_HOME:-$HOME/.config}/openssc/config
-if [ -r "$CONFIG" ]; then
-  # shellcheck disable=SC1090
-  . "$CONFIG"
-fi
-HOST=${SS_HOST:-mm.local}
-
-# Raw evdev is the only Linux backend that delivers pinch/rotate (winit's
-# Wayland backend exposes no pinch gesture). macOS has its native winit path
-# and --evdev is Linux-only, so add it there only.
-if [ "$(uname -s)" = "Linux" ]; then
-  set -- --evdev "$@"
-fi
-
 STATE=${XDG_STATE_HOME:-$HOME/.local/state}/openssc
 mkdir -p "$STATE" 2>/dev/null || true
 LOG=$STATE/openssc.log
 
-"$BIN" --host "$HOST" "$@" 2>>"$LOG"
+# Linux/Wayland is the manager target. macOS uses its own bundle and keeps the
+# direct CLI path; this wrapper is not installed there.
+if [ "$(uname -s)" = "Linux" ]; then
+  set -- --manager "$@"
+fi
+
+"$BIN" "$@" 2>>"$LOG"
 rc=$?
 if [ "$rc" -ne 0 ]; then
   echo "$(date -Is) openssc exited $rc" >>"$LOG" 2>/dev/null || true

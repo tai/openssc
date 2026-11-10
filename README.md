@@ -28,6 +28,7 @@ rather than judged by eye.
 | Keyboard grab so local shortcuts reach the remote | verified |
 | Visual latency vs `Screen Sharing.app` | on par (measured, see below) |
 | Linux/Wayland | builds, connects, decodes and paints; evdev pinch/rotate, keyboard grab + pause/resume, clipboard paste and sharp rendering verified on the lab host (2026-11-10); scroll micro/normal/flick feel tuned |
+| Connection manager (Linux) | saved targets, edit form, no password on disk; `openssc --manager` |
 
 ## Quick start (macOS lab)
 
@@ -44,6 +45,31 @@ opts out to plain Zlib (6), which decodes roughly ten times slower on this serve
 Holding **Left Cmd+Shift for ~350 ms** releases the keyboard grab so local
 shortcuts work again. The grab needs Accessibility/Input Monitoring permission;
 without it the client says so and runs ungrabbed.
+
+### Connection manager (Linux/Wayland)
+
+```sh
+./target/release/openssc --manager
+```
+
+The manager is an optional window in front of the same direct client. The left
+list holds saved targets and the right form edits **Name**, **Host**, **Port**,
+**User** and a **Password**; **Add/Save/Delete/Connect** manage the list and
+start a session. **Tab**/Shift+Tab move the focus, **Enter** activates the
+focused button (Connect from a field), **Backspace** edits, arrows move the
+selection/focus and **Esc** closes the manager. Mouse clicks work on the same
+controls.
+
+Targets are stored in `${XDG_CONFIG_HOME:-$HOME/.config}/openssc/targets.conf`
+as a small `key=value` block file, created `0600` with one seed target
+(`mm.local`, 5900, `tai`) when the file is absent. Only name/host/port/user are
+written: **the password is never persisted**. Connect spawns
+`std::env::current_exe()` with `--host/--port/--user` (plus `--evdev` on Linux),
+passes the password in `SS_PASSWORD`, and leaves the manager open for the next
+target. The manager never grabs input.
+
+The direct CLI path is unchanged: `openssc --host mm.local` still connects
+immediately. A desktop launch through `openssc-launch` opens the manager.
 
 ## Performance
 
@@ -162,7 +188,8 @@ works but local clipboard sync is silently absent.
 ### Run
 
 ```sh
-./target/release/openssc --host mm.local
+./target/release/openssc --manager      # saved targets and Connect
+./target/release/openssc --host mm.local # direct, unchanged
 ```
 
 MVS is the default; `--no-mvs` runs the Zlib (6) slow path. A Wayland session started from ssh needs both variables exported:
@@ -216,10 +243,12 @@ tools/measure/render-capture.sh --filter auto --size 1600x1000 \
 ./packaging/install.sh --no-build       # install the existing release binary
 ```
 
-The entry launches `openssc-launch` (MVS is the binary default; `--no-mvs` opts out), logs stderr to
-`${XDG_STATE_HOME:-~/.local/state}/openssc/openssc.log`, and notifies on a
-failed connect. Set `SS_HOST` in the environment or in
-`~/.config/openssc/config`.
+The entry launches `openssc-launch`, which opens the connection manager on
+Linux (MVS and evdev are the child defaults; `--no-mvs` opts out). It logs
+stderr to `${XDG_STATE_HOME:-~/.local/state}/openssc/openssc.log` and notifies
+on a failed launch. Saved targets live in
+`${XDG_CONFIG_HOME:-~/.config}/openssc/targets.conf`; the direct CLI is still
+`openssc --host mm.local`.
 
 ### Not on Wayland yet
 
