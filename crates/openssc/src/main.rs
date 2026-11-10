@@ -36,6 +36,7 @@ use winit::window::{Window, WindowId};
 use raw_window_handle::{DisplayHandle, HasDisplayHandle};
 
 mod filecopy;
+mod manager;
 mod platform;
 mod render;
 
@@ -572,6 +573,9 @@ Connection:
   --port <port>            server port                         (default 5900)
   --user <name>            account on the remote                (default tai)
   --password <password>    password for that account            (or SS_PASSWORD)
+  --manager                open the connection manager instead of connecting
+                           (Linux/Wayland; targets live in
+                           ~/.config/openssc/targets.conf)
 
 Display and codec:
   --scale <f>              present the framebuffer at this scale (default 1.0)
@@ -4326,6 +4330,9 @@ fn main() -> Result<()> {
     let mut no_grab = false;
     let mut release_chord: Option<String> = None;
     let mut exit_after_secs: Option<f64> = None;
+    // `--manager`: the optional connection-manager window on Linux/Wayland.
+    // It is handled before any session work so the direct CLI path is untouched.
+    let mut manager = false;
     let args: Vec<String> = std::env::args().skip(1).collect();
     let mut i = 0;
     while i < args.len() {
@@ -4511,11 +4518,22 @@ fn main() -> Result<()> {
                 exit_after_secs = Some(args[i + 1].parse()?);
                 i += 2;
             }
+            "--manager" => {
+                manager = true;
+                i += 1;
+            }
             other => {
                 eprintln!("unknown argument {other}");
                 std::process::exit(2);
             }
         }
+    }
+
+    // Manager mode is a separate window and must not touch the session path:
+    // it loads saved targets, spawns this binary for a chosen target, and stays
+    // open. The direct CLI (`openssc --host ...`) below is unchanged.
+    if manager {
+        return manager::run();
     }
 
     // Apple's client is push-based, so `--mvs` arms server push by default.
